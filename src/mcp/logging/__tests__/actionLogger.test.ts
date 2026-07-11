@@ -4,7 +4,7 @@ import * as path from 'path';
 
 import { HarnessRuntimeStateService } from '../../../harness/adapters/out/runtimeState/runtimeStateService';
 import { WorkflowService } from '../../../harness/application/workflow/workflowService';
-import { clearMcpActionSessionCache, getMcpActionSessionCacheSize, logMcpAction } from '../actionLogger';
+import { clearMcpActionSessionCache, getMcpActionSessionCacheMetrics, getMcpActionSessionCacheSize, logMcpAction } from '../actionLogger';
 
 describe('logMcpAction', () => {
   let tempDir: string;
@@ -87,5 +87,24 @@ describe('logMcpAction', () => {
     const traces = await state.listTraces(after!.session.id);
     expect(traces.some((trace) => trace.event === 'mcp.tool.succeeded')).toBe(true);
     expect(await fs.pathExists(path.join(tempDir, '.context', 'workflow', 'actions.jsonl'))).toBe(false);
+  });
+
+  it('applies the repository MCP session TTL and expires without cross-repo cache keys', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+      version: 1,
+      caches: { mcpSessions: { maxEntries: 1, ttlMs: 1000 } },
+    });
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    const entry = { tool: 'context', action: 'check', status: 'success' as const };
+    await logMcpAction(tempDir, entry);
+    await logMcpAction(tempDir, entry);
+    expect(getMcpActionSessionCacheMetrics(tempDir)?.hits).toBe(1);
+    now.mockReturnValue(2_001);
+    await logMcpAction(tempDir, entry);
+    expect(getMcpActionSessionCacheMetrics(tempDir)?.evictions.expired).toBe(1);
+    expect(getMcpActionSessionCacheSize()).toBe(1);
+    now.mockRestore();
+    clearMcpActionSessionCache();
+    expect(getMcpActionSessionCacheSize()).toBe(0);
   });
 });

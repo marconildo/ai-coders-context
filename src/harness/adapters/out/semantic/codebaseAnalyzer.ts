@@ -8,6 +8,7 @@
 import { glob } from 'glob';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
 import { TreeSitterLayer } from './treeSitter/treeSitterLayer';
 import { LSPLayer } from './lsp/lspLayer';
 import {
@@ -36,16 +37,26 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   include: [],
   maxFiles: 5000,
   cacheEnabled: true,
+  fileAnalysisCacheMaxEntries: 5_000,
+  fileAnalysisCacheMaxBytes: 128 * 1024 * 1024,
 };
 
 export class CodebaseAnalyzer {
   private treeSitter: TreeSitterLayer;
   private lspLayer?: LSPLayer;
   private options: Required<AnalyzerOptions>;
+  private readonly fileCacheEntriesExplicit: boolean;
+  private readonly fileCacheBytesExplicit: boolean;
 
   constructor(options: AnalyzerOptions = {}) {
+    this.fileCacheEntriesExplicit = options.fileAnalysisCacheMaxEntries !== undefined;
+    this.fileCacheBytesExplicit = options.fileAnalysisCacheMaxBytes !== undefined;
     this.options = { ...DEFAULT_OPTIONS, ...options };
-    this.treeSitter = new TreeSitterLayer({ cacheEnabled: this.options.cacheEnabled });
+    this.treeSitter = new TreeSitterLayer({
+      cacheEnabled: this.options.cacheEnabled,
+      maxEntries: this.options.fileAnalysisCacheMaxEntries,
+      maxBytes: this.options.fileAnalysisCacheMaxBytes,
+    });
 
     // Create LSPLayer if LSP mode is enabled
     if (this.options.useLSP) {
@@ -55,6 +66,14 @@ export class CodebaseAnalyzer {
 
   async analyze(projectPath: string): Promise<SemanticContext> {
     const startTime = Date.now();
+    if (this.options.cacheEnabled) {
+      const { config } = await loadRuntimeRetentionConfig(projectPath);
+      this.treeSitter.configureCache?.({
+        maxEntries: this.fileCacheEntriesExplicit ? this.options.fileAnalysisCacheMaxEntries : config.caches.fileAnalysis.maxEntries,
+        maxBytes: this.fileCacheBytesExplicit ? this.options.fileAnalysisCacheMaxBytes : config.caches.fileAnalysis.maxBytes,
+        scope: path.resolve(projectPath),
+      });
+    }
 
     // 1. Find all code files
     const files = await this.findCodeFiles(projectPath);
@@ -591,6 +610,10 @@ export class CodebaseAnalyzer {
 
   clearCache(): void {
     this.treeSitter.clearCache();
+  }
+
+  fileAnalysisCacheMetrics() {
+    return this.treeSitter.cacheMetrics();
   }
 
   /**

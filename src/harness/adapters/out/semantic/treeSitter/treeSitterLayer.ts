@@ -23,22 +23,36 @@ interface CacheEntry {
 }
 
 export class TreeSitterLayer {
-  private readonly cache: BoundedLruCache<string, CacheEntry>;
+  private cache: BoundedLruCache<string, CacheEntry>;
   private readonly cacheEnabled: boolean;
+  private cacheSignature: string;
   private treeSitterAvailable: boolean = false;
   private parsers: Map<string, any> = new Map();
   public readonly ready: Promise<void>;
 
   constructor(options: { cacheEnabled?: boolean; maxEntries?: number; maxBytes?: number } = {}) {
     this.cacheEnabled = options.cacheEnabled ?? true;
-    this.cache = new BoundedLruCache({
-      maxEntries: options.maxEntries ?? 5_000,
-      maxBytes: options.maxBytes ?? 128 * 1024 * 1024,
+    const limits = { maxEntries: options.maxEntries ?? 5_000, maxBytes: options.maxBytes ?? 128 * 1024 * 1024 };
+    this.cacheSignature = JSON.stringify(limits);
+    this.cache = this.createCache(limits);
+    this.ready = this.initializeParsers();
+  }
+
+  private createCache(limits: { maxEntries: number; maxBytes: number }): BoundedLruCache<string, CacheEntry> {
+    return new BoundedLruCache({
+      ...limits,
       // File freshness is mtime-bound; this TTL bounds idle retention for long-lived processes.
       ttlMs: 30 * 60 * 1000,
       estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(entry.analysis)),
     });
-    this.ready = this.initializeParsers();
+  }
+
+  configureCache(options: { maxEntries: number; maxBytes: number; scope: string }): void {
+    const signature = JSON.stringify(options);
+    if (signature === this.cacheSignature) return;
+    this.cache.dispose();
+    this.cache = this.createCache(options);
+    this.cacheSignature = signature;
   }
 
   private async initializeParsers(): Promise<void> {
@@ -580,6 +594,10 @@ export class TreeSitterLayer {
 
   get cacheSize(): number {
     return this.cache.size;
+  }
+
+  cacheMetrics() {
+    return this.cache.metrics();
   }
 
   dispose(): void {

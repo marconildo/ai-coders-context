@@ -17,10 +17,19 @@ export interface RuntimeRetentionConfig {
   };
 }
 
+export interface RuntimeRetentionConfigMetrics {
+  invalidVersion: number;
+  unknownKeys: number;
+  invalidValues: number;
+  clampedValues: number;
+  diagnosticsDropped: number;
+}
+
 export interface RuntimeRetentionConfigResult {
   config: RuntimeRetentionConfig;
   diagnostics: string[];
   clamps: number;
+  metrics: RuntimeRetentionConfigMetrics;
 }
 
 export const DEFAULT_RUNTIME_RETENTION_CONFIG: RuntimeRetentionConfig = {
@@ -39,7 +48,62 @@ export const DEFAULT_RUNTIME_RETENTION_CONFIG: RuntimeRetentionConfig = {
   },
 };
 
-const KNOWN_TOP_LEVEL = new Set(['version', 'traces', 'sessions', 'replays', 'datasets', 'checkpoints', 'bindings', 'caches']);
+const MAX_DIAGNOSTICS = 32;
+const KNOWN_KEYS: Record<string, readonly string[]> = {
+  root: ['version', 'traces', 'sessions', 'replays', 'datasets', 'checkpoints', 'bindings', 'caches'],
+  traces: ['maxBytes'],
+  sessions: ['maxEntries'],
+  replays: ['maxEntries'],
+  datasets: ['maxEntries'],
+  checkpoints: ['maxDataBytes', 'maxArtifactIds'],
+  bindings: ['maxEntries', 'maxAgeMs'],
+  caches: ['context', 'semantic', 'mcpSessions', 'fileAnalysis'],
+  'caches.context': ['maxEntries', 'maxBytes', 'ttlMs'],
+  'caches.semantic': ['maxEntries', 'maxBytes'],
+  'caches.mcpSessions': ['maxEntries', 'ttlMs'],
+  'caches.fileAnalysis': ['maxEntries', 'maxBytes'],
+};
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function safeKey(key: string): string {
+  return /^[A-Za-z0-9_-]{1,64}$/.test(key)
+    ? key
+    : `<omitted:${Buffer.byteLength(key, 'utf8')} bytes>`;
+}
+
+function addDiagnostic(
+  diagnostics: string[],
+  metrics: RuntimeRetentionConfigMetrics,
+  message: string,
+): void {
+  if (diagnostics.length < MAX_DIAGNOSTICS) diagnostics.push(message.slice(0, 200));
+  else metrics.diagnosticsDropped += 1;
+}
+
+function diagnoseShape(
+  value: unknown,
+  section: string,
+  diagnostics: string[],
+  metrics: RuntimeRetentionConfigMetrics,
+): Record<string, unknown> {
+  if (value === undefined) return {};
+  if (!isRecord(value)) {
+    metrics.invalidValues += 1;
+    addDiagnostic(diagnostics, metrics, `${section} must be an object; defaults applied`);
+    return {};
+  }
+  const known = new Set(KNOWN_KEYS[section] ?? []);
+  for (const key of Object.keys(value)) {
+    if (!known.has(key)) {
+      metrics.unknownKeys += 1;
+      addDiagnostic(diagnostics, metrics, `Unknown runtime configuration key ignored: ${section}.${safeKey(key)}`);
+    }
+  }
+  return value;
+}
 
 function boundedNumber(
   value: unknown,
@@ -48,71 +112,110 @@ function boundedNumber(
   absoluteMaximum: number,
   name: string,
   diagnostics: string[],
+  metrics: RuntimeRetentionConfigMetrics,
 ): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value < minimum) {
-    if (value !== undefined) diagnostics.push(`${name} was invalid and reset to ${fallback}`);
+    if (value !== undefined) {
+      metrics.invalidValues += 1;
+      addDiagnostic(diagnostics, metrics, `${name} was invalid; safe default applied`);
+    }
     return fallback;
   }
   if (value > absoluteMaximum) {
-    diagnostics.push(`${name} was clamped to the absolute safety ceiling ${absoluteMaximum}`);
+    metrics.clampedValues += 1;
+    addDiagnostic(diagnostics, metrics, `${name} was clamped to the absolute safety ceiling ${absoluteMaximum}`);
     return absoluteMaximum;
   }
   return Math.floor(value);
 }
 
-/** Load `.context/config/runtime.json`, ignoring unknown keys and clamping unsafe limits. */
+/** Load a repository-scoped, versioned runtime policy without logging caller content. */
 export async function loadRuntimeRetentionConfig(repoPath: string): Promise<RuntimeRetentionConfigResult> {
   const diagnostics: string[] = [];
+  const metrics: RuntimeRetentionConfigMetrics = {
+    invalidVersion: 0,
+    unknownKeys: 0,
+    invalidValues: 0,
+    clampedValues: 0,
+    diagnosticsDropped: 0,
+  };
   const file = path.join(path.resolve(repoPath), '.context', 'config', 'runtime.json');
-  let input: Record<string, any> = {};
+  let input: Record<string, unknown> = {};
+  let fileExists = false;
   if (await fs.pathExists(file)) {
+    fileExists = true;
     try {
-      const parsed = await fs.readJson(file);
-      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) input = parsed;
-      else diagnostics.push('runtime.json root must be an object; defaults applied');
+      const parsed = await fs.readJson(file) as unknown;
+      if (isRecord(parsed)) input = parsed;
+      else {
+        metrics.invalidValues += 1;
+        addDiagnostic(diagnostics, metrics, 'runtime.json root must be an object; defaults applied');
+      }
     } catch {
-      diagnostics.push('runtime.json could not be parsed; defaults applied');
+      metrics.invalidValues += 1;
+      addDiagnostic(diagnostics, metrics, 'runtime.json could not be parsed; defaults applied');
     }
   }
-  for (const key of Object.keys(input)) {
-    if (!KNOWN_TOP_LEVEL.has(key)) diagnostics.push(`Unknown runtime configuration key ignored: ${key}`);
+
+  diagnoseShape(input, 'root', diagnostics, metrics);
+  if (fileExists && input.version !== 1) {
+    metrics.invalidVersion += 1;
+    addDiagnostic(diagnostics, metrics, 'runtime.json version is unsupported; safe defaults applied');
+    return {
+      config: structuredClone(DEFAULT_RUNTIME_RETENTION_CONFIG),
+      diagnostics,
+      clamps: metrics.invalidValues + metrics.clampedValues,
+      metrics,
+    };
   }
+
+  const traces = diagnoseShape(input.traces, 'traces', diagnostics, metrics);
+  const sessions = diagnoseShape(input.sessions, 'sessions', diagnostics, metrics);
+  const replays = diagnoseShape(input.replays, 'replays', diagnostics, metrics);
+  const datasets = diagnoseShape(input.datasets, 'datasets', diagnostics, metrics);
+  const checkpoints = diagnoseShape(input.checkpoints, 'checkpoints', diagnostics, metrics);
+  const bindings = diagnoseShape(input.bindings, 'bindings', diagnostics, metrics);
+  const caches = diagnoseShape(input.caches, 'caches', diagnostics, metrics);
+  const context = diagnoseShape(caches.context, 'caches.context', diagnostics, metrics);
+  const semantic = diagnoseShape(caches.semantic, 'caches.semantic', diagnostics, metrics);
+  const mcpSessions = diagnoseShape(caches.mcpSessions, 'caches.mcpSessions', diagnostics, metrics);
+  const fileAnalysis = diagnoseShape(caches.fileAnalysis, 'caches.fileAnalysis', diagnostics, metrics);
   const d = DEFAULT_RUNTIME_RETENTION_CONFIG;
   const number = (value: unknown, fallback: number, min: number, max: number, name: string) =>
-    boundedNumber(value, fallback, min, max, name, diagnostics);
+    boundedNumber(value, fallback, min, max, name, diagnostics, metrics);
   const config: RuntimeRetentionConfig = {
     version: 1,
-    traces: { maxBytes: number(input.traces?.maxBytes, d.traces.maxBytes, 1_024, 1024 ** 3, 'traces.maxBytes') },
-    sessions: { maxEntries: number(input.sessions?.maxEntries, d.sessions.maxEntries, 1, 100_000, 'sessions.maxEntries') },
-    replays: { maxEntries: number(input.replays?.maxEntries, d.replays.maxEntries, 1, 10_000, 'replays.maxEntries') },
-    datasets: { maxEntries: number(input.datasets?.maxEntries, d.datasets.maxEntries, 1, 10_000, 'datasets.maxEntries') },
+    traces: { maxBytes: number(traces.maxBytes, d.traces.maxBytes, 1_024, 1024 ** 3, 'traces.maxBytes') },
+    sessions: { maxEntries: number(sessions.maxEntries, d.sessions.maxEntries, 1, 100_000, 'sessions.maxEntries') },
+    replays: { maxEntries: number(replays.maxEntries, d.replays.maxEntries, 1, 10_000, 'replays.maxEntries') },
+    datasets: { maxEntries: number(datasets.maxEntries, d.datasets.maxEntries, 1, 10_000, 'datasets.maxEntries') },
     checkpoints: {
-      maxDataBytes: number(input.checkpoints?.maxDataBytes, d.checkpoints.maxDataBytes, 1_024, 1024 ** 2, 'checkpoints.maxDataBytes'),
-      maxArtifactIds: number(input.checkpoints?.maxArtifactIds, d.checkpoints.maxArtifactIds, 1, 1_000, 'checkpoints.maxArtifactIds'),
+      maxDataBytes: number(checkpoints.maxDataBytes, d.checkpoints.maxDataBytes, 1_024, 1024 ** 2, 'checkpoints.maxDataBytes'),
+      maxArtifactIds: number(checkpoints.maxArtifactIds, d.checkpoints.maxArtifactIds, 1, 1_000, 'checkpoints.maxArtifactIds'),
     },
     bindings: {
-      maxEntries: number(input.bindings?.maxEntries, d.bindings.maxEntries, 1, 10_000, 'bindings.maxEntries'),
-      maxAgeMs: number(input.bindings?.maxAgeMs, d.bindings.maxAgeMs, 60_000, 365 * 24 * 60 * 60 * 1000, 'bindings.maxAgeMs'),
+      maxEntries: number(bindings.maxEntries, d.bindings.maxEntries, 1, 10_000, 'bindings.maxEntries'),
+      maxAgeMs: number(bindings.maxAgeMs, d.bindings.maxAgeMs, 60_000, 365 * 24 * 60 * 60 * 1000, 'bindings.maxAgeMs'),
     },
     caches: {
       context: {
-        maxEntries: number(input.caches?.context?.maxEntries, d.caches.context.maxEntries, 1, 256, 'caches.context.maxEntries'),
-        maxBytes: number(input.caches?.context?.maxBytes, d.caches.context.maxBytes, 1_024, 256 * 1024 * 1024, 'caches.context.maxBytes'),
-        ttlMs: number(input.caches?.context?.ttlMs, d.caches.context.ttlMs, 1_000, 24 * 60 * 60 * 1000, 'caches.context.ttlMs'),
+        maxEntries: number(context.maxEntries, d.caches.context.maxEntries, 1, 256, 'caches.context.maxEntries'),
+        maxBytes: number(context.maxBytes, d.caches.context.maxBytes, 1_024, 256 * 1024 * 1024, 'caches.context.maxBytes'),
+        ttlMs: number(context.ttlMs, d.caches.context.ttlMs, 1_000, 24 * 60 * 60 * 1000, 'caches.context.ttlMs'),
       },
       semantic: {
-        maxEntries: number(input.caches?.semantic?.maxEntries, d.caches.semantic.maxEntries, 1, 4, 'caches.semantic.maxEntries'),
-        maxBytes: number(input.caches?.semantic?.maxBytes, d.caches.semantic.maxBytes, 1_024, 256 * 1024 * 1024, 'caches.semantic.maxBytes'),
+        maxEntries: number(semantic.maxEntries, d.caches.semantic.maxEntries, 1, 4, 'caches.semantic.maxEntries'),
+        maxBytes: number(semantic.maxBytes, d.caches.semantic.maxBytes, 1_024, 256 * 1024 * 1024, 'caches.semantic.maxBytes'),
       },
       mcpSessions: {
-        maxEntries: number(input.caches?.mcpSessions?.maxEntries, d.caches.mcpSessions.maxEntries, 1, 1_000, 'caches.mcpSessions.maxEntries'),
-        ttlMs: number(input.caches?.mcpSessions?.ttlMs, d.caches.mcpSessions.ttlMs, 1_000, 24 * 60 * 60 * 1000, 'caches.mcpSessions.ttlMs'),
+        maxEntries: number(mcpSessions.maxEntries, d.caches.mcpSessions.maxEntries, 1, 1_000, 'caches.mcpSessions.maxEntries'),
+        ttlMs: number(mcpSessions.ttlMs, d.caches.mcpSessions.ttlMs, 1_000, 24 * 60 * 60 * 1000, 'caches.mcpSessions.ttlMs'),
       },
       fileAnalysis: {
-        maxEntries: number(input.caches?.fileAnalysis?.maxEntries, d.caches.fileAnalysis.maxEntries, 1, 20_000, 'caches.fileAnalysis.maxEntries'),
-        maxBytes: number(input.caches?.fileAnalysis?.maxBytes, d.caches.fileAnalysis.maxBytes, 1_024, 512 * 1024 * 1024, 'caches.fileAnalysis.maxBytes'),
+        maxEntries: number(fileAnalysis.maxEntries, d.caches.fileAnalysis.maxEntries, 1, 20_000, 'caches.fileAnalysis.maxEntries'),
+        maxBytes: number(fileAnalysis.maxBytes, d.caches.fileAnalysis.maxBytes, 1_024, 512 * 1024 * 1024, 'caches.fileAnalysis.maxBytes'),
       },
     },
   };
-  return { config, diagnostics, clamps: diagnostics.length };
+  return { config, diagnostics, clamps: metrics.invalidValues + metrics.clampedValues, metrics };
 }

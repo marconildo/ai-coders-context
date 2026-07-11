@@ -191,6 +191,8 @@ export interface AnalyzerOptions {
   include?: string[];
   maxFiles?: number;
   cacheEnabled?: boolean;
+  fileAnalysisCacheMaxEntries?: number;
+  fileAnalysisCacheMaxBytes?: number;
 }
 
 export interface LSPServerConfig {

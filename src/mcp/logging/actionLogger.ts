@@ -9,7 +9,8 @@ import * as fs from 'fs-extra';
 import * as path from 'path';
 
 import { HarnessRuntimeStateService } from '../../harness/adapters/out/runtimeState/runtimeStateService';
-import { BoundedLruCache } from '../../harness/domain/retention/boundedLruCache';
+import { BoundedLruCache, type BoundedLruCacheMetrics } from '../../harness/domain/retention/boundedLruCache';
+import { loadRuntimeRetentionConfig } from '../../harness/application/retention/runtimeRetentionConfig';
 import { HarnessWorkflowStateService } from '../../harness/adapters/out/workflowState/workflowStateService';
 import { resolveContextRoot } from '../../shared/context/contextRootResolver';
 
@@ -41,23 +42,66 @@ const MAX_ARRAY = 20;
 const MAX_STRING = 200;
 const MCP_ACTIVITY_NAME = 'mcp-activity';
 
-const sessionCache = new BoundedLruCache<string, string>({
-  maxEntries: 64,
-  maxBytes: 64 * 1024,
-  ttlMs: 30 * 60 * 1000,
-  estimateBytes: (sessionId, repoPath) => Buffer.byteLength(sessionId) + Buffer.byteLength(repoPath),
-});
+const sessionCaches = new Map<string, {
+  cache: BoundedLruCache<string, string>;
+  signature: string;
+  diagnostics: string[];
+}>();
 
 function normalizeRepoPath(repoPath: string): string {
-  return path.resolve(repoPath).toLowerCase();
+  const resolved = path.resolve(repoPath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function sessionCacheForRepo(repoPath: string): Promise<BoundedLruCache<string, string>> {
+  const normalized = normalizeRepoPath(repoPath);
+  for (const [ownerPath, owner] of sessionCaches) {
+    if (owner.cache.size === 0) {
+      owner.cache.dispose();
+      sessionCaches.delete(ownerPath);
+    }
+  }
+  const loaded = await loadRuntimeRetentionConfig(normalized);
+  const limits = loaded.config.caches.mcpSessions;
+  const signature = JSON.stringify(limits);
+  const current = sessionCaches.get(normalized);
+  if (current?.signature === signature) {
+    sessionCaches.delete(normalized);
+    sessionCaches.set(normalized, current);
+    return current.cache;
+  }
+  current?.cache.dispose();
+  const cache = new BoundedLruCache<string, string>({
+    maxEntries: limits.maxEntries,
+    maxBytes: 64 * 1024,
+    ttlMs: limits.ttlMs,
+    estimateBytes: (sessionId, key) => Buffer.byteLength(sessionId) + Buffer.byteLength(key),
+  });
+  sessionCaches.set(normalized, { cache, signature, diagnostics: loaded.diagnostics });
+  while (sessionCaches.size > limits.maxEntries) {
+    const oldest = sessionCaches.keys().next().value as string | undefined;
+    if (!oldest) break;
+    sessionCaches.get(oldest)?.cache.dispose();
+    sessionCaches.delete(oldest);
+  }
+  return cache;
 }
 
 export function clearMcpActionSessionCache(): void {
-  sessionCache.dispose();
+  for (const owner of sessionCaches.values()) owner.cache.dispose();
+  sessionCaches.clear();
 }
 
 export function getMcpActionSessionCacheSize(): number {
-  return sessionCache.size;
+  return [...sessionCaches.values()].reduce((total, owner) => total + owner.cache.size, 0);
+}
+
+export function getMcpActionSessionCacheDiagnostics(repoPath: string): string[] {
+  return [...(sessionCaches.get(normalizeRepoPath(repoPath))?.diagnostics ?? [])];
+}
+
+export function getMcpActionSessionCacheMetrics(repoPath: string): BoundedLruCacheMetrics | undefined {
+  return sessionCaches.get(normalizeRepoPath(repoPath))?.cache.metrics();
 }
 
 async function resolveContextPath(repoPath: string): Promise<string> {
@@ -127,7 +171,8 @@ async function resolveMcpActivitySessionId(
   repoPath: string,
   state: HarnessRuntimeStateService
 ): Promise<string> {
-  const cacheKey = normalizeRepoPath(repoPath);
+  const cacheKey = 'mcp-activity';
+  const sessionCache = await sessionCacheForRepo(repoPath);
   const cached = sessionCache.get(cacheKey);
   if (cached) {
     try {

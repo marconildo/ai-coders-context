@@ -18,6 +18,8 @@ import type {
   AnalyzerOptions,
 } from './types';
 import { DEFAULT_EXCLUDE_PATTERNS } from './types';
+import { BoundedLruCache, type BoundedLruCacheMetrics } from '../../../domain/retention/boundedLruCache';
+import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
 
 export interface ContextBuilderOptions extends AnalyzerOptions {
   /** Maximum symbols to include per category */
@@ -41,6 +43,8 @@ const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
   include: [],
   maxFiles: 5000,
   cacheEnabled: true,
+  fileAnalysisCacheMaxEntries: 5_000,
+  fileAnalysisCacheMaxBytes: 128 * 1024 * 1024,
   maxSymbolsPerCategory: 50,
   includeDocumentation: true,
   includeSignatures: true,
@@ -51,11 +55,18 @@ const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
 export class SemanticContextBuilder {
   private analyzer: CodebaseAnalyzer;
   private options: Required<ContextBuilderOptions>;
-  private cachedContext: SemanticContext | null = null;
-  private cachedProjectPath: string | null = null;
-  private cachedFingerprint: string | null = null;
+  private readonly semanticCacheBytesExplicit: boolean;
+  private readonly semanticCaches = new Map<string, {
+    cache: BoundedLruCache<string, SemanticContext>;
+    signature: string;
+    fingerprint?: string;
+    diagnostics: string[];
+    maxEntries: number;
+    maxBytes: number;
+  }>();
 
   constructor(options: ContextBuilderOptions = {}) {
+    this.semanticCacheBytesExplicit = options.semanticCacheMaxBytes !== undefined;
     this.options = { ...DEFAULT_OPTIONS, ...options };
     this.analyzer = new CodebaseAnalyzer(this.options);
   }
@@ -66,20 +77,23 @@ export class SemanticContextBuilder {
   async analyze(projectPath: string): Promise<SemanticContext> {
     const normalizedProjectPath = path.resolve(projectPath);
     const fingerprint = await this.computeProjectFingerprint(normalizedProjectPath);
-    if (
-      this.options.cacheEnabled &&
-      this.cachedContext &&
-      this.cachedProjectPath === normalizedProjectPath &&
-      this.cachedFingerprint === fingerprint
-    ) {
-      return this.cachedContext;
+    const owner = this.options.cacheEnabled
+      ? await this.semanticCacheForRepo(normalizedProjectPath)
+      : undefined;
+    if (owner?.fingerprint && owner.fingerprint !== fingerprint) {
+      owner.cache.clear();
+    }
+    const cached = owner?.cache.get(fingerprint);
+    if (cached) {
+      owner!.fingerprint = fingerprint;
+      return cached;
     }
 
     const context = await this.analyzer.analyze(normalizedProjectPath);
-    if (this.options.cacheEnabled && this.estimateSemanticContextBytes(context) <= this.options.semanticCacheMaxBytes) {
-      this.cachedContext = context;
-      this.cachedProjectPath = normalizedProjectPath;
-      this.cachedFingerprint = fingerprint;
+    if (owner) {
+      owner.cache.set(fingerprint, context);
+      owner.fingerprint = fingerprint;
+      this.enforceSemanticLimits(owner.maxEntries, owner.maxBytes);
     }
     return context;
   }
@@ -823,9 +837,7 @@ export class SemanticContextBuilder {
    * Clear cached analysis
    */
   clearCache(): void {
-    this.cachedContext = null;
-    this.cachedProjectPath = null;
-    this.cachedFingerprint = null;
+    for (const owner of this.semanticCaches.values()) owner.cache.clear();
     this.analyzer.clearCache();
   }
 
@@ -834,7 +846,64 @@ export class SemanticContextBuilder {
    */
   async shutdown(): Promise<void> {
     this.clearCache();
+    for (const owner of this.semanticCaches.values()) owner.cache.dispose();
+    this.semanticCaches.clear();
     await this.analyzer.shutdown();
+  }
+
+  semanticCacheMetrics(projectPath: string): BoundedLruCacheMetrics | undefined {
+    return this.semanticCaches.get(path.resolve(projectPath))?.cache.metrics();
+  }
+
+  configDiagnostics(projectPath: string): string[] {
+    return [...(this.semanticCaches.get(path.resolve(projectPath))?.diagnostics ?? [])];
+  }
+
+  private async semanticCacheForRepo(projectPath: string) {
+    for (const [ownerPath, owner] of this.semanticCaches) {
+      if (ownerPath !== projectPath && owner.cache.size === 0) {
+        owner.cache.dispose();
+        this.semanticCaches.delete(ownerPath);
+      }
+    }
+    const loaded = await loadRuntimeRetentionConfig(projectPath);
+    const configured = loaded.config.caches.semantic;
+    const limits = {
+      maxEntries: configured.maxEntries,
+      maxBytes: this.semanticCacheBytesExplicit ? this.options.semanticCacheMaxBytes : configured.maxBytes,
+    };
+    const signature = JSON.stringify(limits);
+    const current = this.semanticCaches.get(projectPath);
+    if (current?.signature === signature) {
+      this.semanticCaches.delete(projectPath);
+      this.semanticCaches.set(projectPath, current);
+      return current;
+    }
+    current?.cache.dispose();
+    const cache = new BoundedLruCache<string, SemanticContext>({
+      ...limits,
+      ttlMs: 24 * 60 * 60 * 1000,
+      estimateBytes: context => this.estimateSemanticContextBytes(context),
+    });
+    const owner = { cache, signature, diagnostics: loaded.diagnostics, ...limits, fingerprint: undefined as string | undefined };
+    this.semanticCaches.set(projectPath, owner);
+    return owner;
+  }
+
+  private enforceSemanticLimits(maxEntries: number, maxBytes: number): void {
+    const totalEntries = () => [...this.semanticCaches.values()].reduce((sum, owner) => sum + owner.cache.size, 0);
+    const totalBytes = () => [...this.semanticCaches.values()].reduce((sum, owner) => sum + owner.cache.metrics().estimatedBytes, 0);
+    while (totalEntries() > maxEntries || totalBytes() > maxBytes) {
+      const oldestOwnerPath = this.semanticCaches.keys().next().value as string | undefined;
+      if (!oldestOwnerPath) break;
+      const owner = this.semanticCaches.get(oldestOwnerPath)!;
+      const reason = totalEntries() > maxEntries ? 'entries' : 'bytes';
+      owner.cache.evictLeastRecentlyUsed(reason);
+      if (owner.cache.size === 0) {
+        owner.cache.dispose();
+        this.semanticCaches.delete(oldestOwnerPath);
+      }
+    }
   }
 
   private async computeProjectFingerprint(projectPath: string): Promise<string> {

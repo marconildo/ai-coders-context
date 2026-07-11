@@ -150,6 +150,33 @@ describe('ContextCache', () => {
     });
 
     describe('overwrite behavior', () => {
+        it('applies repository runtime overrides without leaking limits across repositories', async () => {
+            const otherDir = await fs.mkdtemp(path.join(os.tmpdir(), 'context-cache-other-'));
+            await fs.ensureDir(path.join(otherDir, 'src'));
+            await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+                version: 1,
+                caches: { context: { maxEntries: 1, maxBytes: 1024, ttlMs: 1000 } },
+            });
+            const now = jest.spyOn(Date, 'now').mockReturnValue(10_000);
+            const cache = new ContextCache({ sweepIntervalMs: 0 });
+            await cache.set(tempDir, 'compact', 'first');
+            await cache.set(tempDir, 'documentation', 'second');
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            expect(await cache.get(tempDir, 'documentation')).toBe('second');
+            await cache.set(tempDir, 'plan', 'x'.repeat(2_000));
+            expect(await cache.get(tempDir, 'plan')).toBeNull();
+
+            await cache.set(otherDir, 'compact', 'y'.repeat(2_000));
+            expect(await cache.get(otherDir, 'compact')).toBe('y'.repeat(2_000));
+            now.mockReturnValue(11_001);
+            expect(await cache.get(tempDir, 'documentation')).toBeNull();
+            expect(cache.metrics().evictions.expired).toBeGreaterThan(0);
+            now.mockRestore();
+            cache.dispose();
+            expect(cache.size).toBe(0);
+            await fs.remove(otherDir);
+        });
+
         it('evicts least recently used contexts over the entry limit', async () => {
             const cache = new ContextCache({ maxEntries: 2 });
             await cache.set(tempDir, 'compact', 'a');

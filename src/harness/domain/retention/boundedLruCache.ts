@@ -102,6 +102,12 @@ export class BoundedLruCache<K, V> {
     for (const key of [...this.entries.keys()]) this.remove(key, 'cleared');
   }
 
+  evictLeastRecentlyUsed(reason: 'entries' | 'bytes'): boolean {
+    const before = this.entries.size;
+    this.evictOldest(reason);
+    return this.entries.size < before;
+  }
+
   dispose(): void {
     if (this.timer) clearInterval(this.timer);
     this.clear();
