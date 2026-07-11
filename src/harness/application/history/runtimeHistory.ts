@@ -11,6 +11,7 @@ export const RUNTIME_HISTORY_LIMITS = {
   handoffs: { default: 100, maximum: 1000 },
   replays: { default: 25, maximum: 100 },
   datasets: { default: 25, maximum: 100 },
+  exploreFiles: { default: 100, maximum: 1000 },
   replayEvents: { default: 100, maximum: 1000 },
 } as const;
 

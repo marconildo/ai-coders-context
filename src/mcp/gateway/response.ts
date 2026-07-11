@@ -62,7 +62,7 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
     : undefined;
 }
 
-function boundedPayloadBudget(requested?: number): number {
+export function resolveMcpPayloadBudget(requested?: number): number {
   const configured = requested ?? Number(process.env.DOTCONTEXT_MCP_PAYLOAD_BYTES);
   if (!Number.isFinite(configured) || configured <= 0) {
     return DEFAULT_MCP_TEXT_PAYLOAD_BYTES;
@@ -152,7 +152,7 @@ function jsonEnvelope(
   const text = JSON.stringify(value);
   const serializationMs = Math.max(0, performance.now() - started);
   const responseBytes = Buffer.byteLength(text, 'utf8');
-  const budgetBytes = boundedPayloadBudget(options.payloadBudgetBytes);
+  const budgetBytes = resolveMcpPayloadBudget(options.payloadBudgetBytes);
 
   if (!forceError && responseBytes > budgetBytes) {
     const reference = artifactReference(asRecord(value));
@@ -216,7 +216,7 @@ export function createErrorResponse(error: unknown): MCPToolResponse {
 /** Creates a bounded plain text response. */
 export function createTextResponse(text: string): MCPToolResponse {
   const responseBytes = Buffer.byteLength(text, 'utf8');
-  const budgetBytes = boundedPayloadBudget();
+  const budgetBytes = resolveMcpPayloadBudget();
   if (responseBytes > budgetBytes) {
     return jsonEnvelope({
       success: false,

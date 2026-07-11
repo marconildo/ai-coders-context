@@ -55,8 +55,12 @@ Exploração de arquivos e código — ler arquivos, listar caminhos, buscar con
 | `encoding` | enum: `utf-8` \| `ascii` \| `binary` | read | Codificação do arquivo |
 | `symbolTypes` | array | analyze | Extrai `class` \| `interface` \| `function` \| `type` \| `enum` |
 | `ignore` | array | list, search, getStructure | Padrões a excluir |
+| `limit` | inteiro, 1–1.000 | list | Arquivos por página; padrão 100 |
+| `cursor` | string | list | Cursor opaco de continuação retornado em `page.nextCursor` |
 
 **Retorna:** conteúdo de arquivos, arquivos correspondentes, análise de símbolos, resultados de busca ou uma árvore de diretórios.
+
+A action `list` transmite os matches em páginas limitadas, sem materializar todo o glob. Envie o `page.nextCursor` retornado, sem alterá-lo, para continuar.
 
 ### context
 
@@ -225,6 +229,8 @@ Operações explícitas do runtime do harness — sessions, traces, artefatos, c
 
 `listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays` e `listDatasets` são limitadas. Para continuar um resultado parcial, envie o `page.nextCursor` retornado, sem alterá-lo, na próxima chamada. Os cursors são vinculados à query e ficam inválidos quando os segmentos de trace subjacentes rotacionam.
 
+Os máximos específicos por action são validados na fronteira MCP: 200 para sessions e artifacts, 100 para replays e datasets e 1.000 para traces, tasks e handoffs.
+
 O texto JSON MCP é serializado uma vez em formato compacto e tem orçamento padrão de 1 MiB (máximo absoluto de 4 MiB). Uma página que não cabe retorna o erro tipado `MCP_PAGE_TOO_LARGE` com `suggestedLimit`; o JSON nunca é cortado em um byte arbitrário. Os resultados também incluem um envelope de auditoria `_meta.dotcontext`, sem conteúdo do usuário, com tamanho da resposta e métricas de paginação. Clientes podem ignorar `_meta` e continuar lendo `content`.
 
 **Retorna:** linhas do tempo de session, inventários de artefatos, avaliações de tasks, telemetria de sensors, registros de replay, clusters de falhas ou resultados de aplicação de policy.
@@ -328,6 +334,8 @@ Além das tools, o servidor expõe recursos somente leitura que seu cliente pode
 | `context://codebase/{contextType}` | `text/markdown` | Variantes de contexto semântico — `documentation`, `playbook`, `plan` ou `compact`. Atualiza automaticamente na leitura; suporta cache. |
 | `file://{path}` | `text/plain` | Lê o conteúdo de arquivos; os caminhos são validados contra o limite do workspace. |
 | `workflow://status` | `application/json` | Status atual do workflow PREVC — fases, papéis e um snapshot de progresso. |
+
+Todo texto de recurso compartilha o orçamento UTF-8 de resposta MCP: 1 MiB por padrão e no máximo 4 MiB. Um recurso `file://` grande demais retorna a resposta tipada `MCP_RESOURCE_TOO_LARGE` antes da leitura do corpo. O texto nunca é truncado em um byte arbitrário.
 
 ## Fluxos de chamada recomendados
 

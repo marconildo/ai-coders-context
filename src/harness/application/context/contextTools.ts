@@ -1,5 +1,5 @@
 import * as fs from 'fs-extra';
-import { glob } from 'glob';
+import { glob, globIterate } from 'glob';
 import * as path from 'path';
 import { TreeSitterLayer } from '../../adapters/out/semantic/treeSitter/treeSitterLayer';
 import { SemanticContextBuilder } from '../../adapters/out/semantic/contextBuilder';
@@ -28,6 +28,14 @@ import { getUntrackedContextLayoutEntries } from '../../../shared';
 import { resolveRuntimeLayout } from '../../../shared/fs/pathHelpers';
 import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
+import {
+  boundedLimit,
+  decodeHistoryCursor,
+  encodeHistoryCursor,
+  queryBinding,
+  RUNTIME_HISTORY_LIMITS,
+  type RuntimeHistoryPage,
+} from '../history/runtimeHistory';
 
 type ToolContext = unknown;
 
@@ -341,23 +349,74 @@ export const readFileTool = createInternalTool<
 );
 
 export const listFilesTool = createInternalTool<
-  { pattern: string; cwd?: string; ignore?: string[] },
-  { success: boolean; files?: string[]; count?: number; pattern: string; error?: string }
+  { pattern: string; cwd?: string; ignore?: string[]; limit?: number; cursor?: string },
+  {
+    success: boolean;
+    files?: string[];
+    count?: number;
+    pattern: string;
+    page?: Omit<RuntimeHistoryPage<string>, 'items'>;
+    error?: string;
+  }
 >(
   'List files matching a glob pattern in the repository',
   async (input) => {
     const { pattern, cwd, ignore } = input;
     try {
-      const files = (await glob(pattern, {
-        cwd: cwd || process.cwd(),
-        ignore: ignore || ['node_modules/**', '.git/**', 'dist/**'],
-        absolute: false
-      })).map((file) => file.split(path.sep).join('/'));
+      const resolvedCwd = path.resolve(cwd || process.cwd());
+      const resolvedIgnore = ignore || ['node_modules/**', '.git/**', 'dist/**'];
+      const limit = boundedLimit(
+        input.limit,
+        RUNTIME_HISTORY_LIMITS.exploreFiles.default,
+        RUNTIME_HISTORY_LIMITS.exploreFiles.maximum,
+        'explore files'
+      );
+      const binding = queryBinding({ pattern, cwd: resolvedCwd, ignore: resolvedIgnore });
+      const boundary = decodeHistoryCursor<{ offset: number }>(
+        input.cursor,
+        'explore-files',
+        binding
+      );
+      const offset = boundary?.offset ?? 0;
+      const files: string[] = [];
+      let matched = 0;
+      let recordsScanned = 0;
+      let hasMore = false;
+      const startedAt = Date.now();
+      for await (const file of globIterate(pattern, {
+        cwd: resolvedCwd,
+        ignore: resolvedIgnore,
+        absolute: false,
+        nodir: true,
+      })) {
+        recordsScanned += 1;
+        if (matched < offset) {
+          matched += 1;
+          continue;
+        }
+        if (files.length === limit) {
+          hasMore = true;
+          break;
+        }
+        files.push(file.split(path.sep).join('/'));
+        matched += 1;
+      }
       return {
         success: true,
         files,
         count: files.length,
-        pattern
+        pattern,
+        page: {
+          nextCursor: hasMore
+            ? encodeHistoryCursor('explore-files', binding, { offset: offset + files.length })
+            : undefined,
+          hasMore,
+          recordsReturned: files.length,
+          recordsScanned,
+          cursorVersion: 1,
+          partial: hasMore,
+          durationMs: Date.now() - startedAt,
+        },
       };
     } catch (error) {
       return {

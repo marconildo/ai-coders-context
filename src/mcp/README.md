@@ -32,7 +32,11 @@ The MCP tools follow a simple, explicit pattern:
 
 Machine JSON is compact-serialized once and limited to 1 MiB by default (4 MiB absolute maximum). Every tool response includes a content-free `_meta.dotcontext` audit summary with response bytes, serialization time, item count, and partial-page state. Clients that ignore `_meta` continue to read the same JSON text from `content`.
 
+The same UTF-8 budget applies to `context://`, `file://`, and `workflow://` resources. Oversized files are rejected from metadata, before their body is read, with the typed `MCP_RESOURCE_TOO_LARGE` response; resource text is never arbitrarily truncated.
+
 The growing harness lists (`listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays`, and `listDatasets`) return bounded pages. Pass `limit` and the opaque `cursor` returned as `page.nextCursor` to continue; do not inspect or modify cursors. `replaySession.maxEvents` defaults to 100 and cannot exceed 1,000. An oversized page returns `MCP_PAGE_TOO_LARGE` with `suggestedLimit`, never truncated JSON.
+
+`explore` action `list` is also paginated: it defaults to 100 files, accepts at most 1,000, and returns an opaque `page.nextCursor` when more matches exist.
 
 ### Dedicated Workflow Tools (5)
 

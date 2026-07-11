@@ -13,13 +13,17 @@ import { z } from 'zod';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 
-import { readFileTool } from '../../harness/application/context/contextTools';
 import { PathValidator, SecurityError } from '../../utils/pathSecurity';
 import { SemanticContextBuilder, type ContextFormat } from '../../harness/adapters/out/semantic/contextBuilder';
 import { ContextCache } from '../../harness/adapters/out/semantic/contextCache';
 import { VERSION } from '../../version';
 import { WorkflowService } from '../../harness/application/workflow';
 import { logMcpAction } from '../logging/actionLogger';
+import {
+  createBoundedResourceJson,
+  createBoundedResourceText,
+  readBoundedFileResource,
+} from './resourceResponse';
 import {
   PREVC_ROLES,
   getScaleName,
@@ -71,6 +75,28 @@ export interface MCPServerOptions {
 
 export const MCP_LIST_LIMIT_SCHEMA = z.number().int().min(1).max(MCP_INPUT_LIMITS.listMaximum);
 export const MCP_MAX_EVENTS_SCHEMA = z.number().int().min(1).max(MCP_INPUT_LIMITS.maxEventsMaximum);
+const MCP_HARNESS_LIST_MAXIMUMS: Record<string, number> = {
+  listSessions: 200,
+  listTraces: 1000,
+  listArtifacts: 200,
+  listTasks: 1000,
+  listHandoffs: 1000,
+  listReplays: 100,
+  listDatasets: 100,
+};
+export const MCP_HARNESS_ACTION_LIMIT_SCHEMA = z.object({
+  action: z.string(),
+  limit: MCP_LIST_LIMIT_SCHEMA.optional(),
+}).passthrough().superRefine((value, context) => {
+  const maximum = MCP_HARNESS_LIST_MAXIMUMS[value.action];
+  if (maximum !== undefined && value.limit !== undefined && value.limit > maximum) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['limit'],
+      message: `${value.action} limit must be between 1 and ${maximum}`,
+    });
+  }
+});
 const mcpString = () => z.string().max(MCP_INPUT_LIMITS.scalarString);
 const mcpPattern = () => mcpString().max(MCP_INPUT_LIMITS.patternLength);
 const mcpArray = <T extends z.ZodTypeAny>(schema: T) => z.array(schema).max(MCP_INPUT_LIMITS.arrayItems);
@@ -130,7 +156,7 @@ export class AIContextMCPServer {
     this.server.registerTool('explore', {
       description: `File and code exploration. Actions:
 - read: Read file contents (params: filePath, encoding?)
-- list: List files matching pattern (params: pattern, cwd?, ignore?)
+- list: List files matching pattern (params: pattern, cwd?, ignore?, limit?, cursor?)
 - analyze: Analyze symbols in a file (params: filePath, symbolTypes?)
 - search: Search code with regex (params: pattern, fileGlob?, maxResults?, cwd?)
 - getStructure: Get directory structure (params: rootPath?, maxDepth?, includePatterns?)`,
@@ -147,6 +173,10 @@ export class AIContextMCPServer {
           .describe('(read) File encoding'),
         ignore: mcpArray(mcpPattern()).optional()
           .describe('(list) Patterns to ignore'),
+        limit: MCP_LIST_LIMIT_SCHEMA.optional()
+          .describe('(list) Maximum files per page'),
+        cursor: mcpString().max(MCP_INPUT_LIMITS.cursorLength).optional()
+          .describe('(list) Opaque continuation cursor'),
         symbolTypes: mcpArray(z.enum(['class', 'interface', 'function', 'type', 'enum'])).optional()
           .describe('(analyze) Types of symbols to extract'),
         fileGlob: mcpPattern().optional()
@@ -809,13 +839,7 @@ Actions:
           await this.contextCache.set(repoPath, contextType, context);
         }
 
-        return {
-          contents: [{
-            uri: uri.href,
-            mimeType: 'text/markdown',
-            text: context
-          }]
-        };
+        return createBoundedResourceText(uri.href, 'text/markdown', context);
       }
     );
 
@@ -829,22 +853,7 @@ Actions:
       },
       async (uri) => {
         const filePath = uri.pathname;
-        const result = await readFileTool.execute!(
-          { filePath },
-          { toolCallId: '', messages: [] }
-        ) as { success: boolean; content?: string; error?: string };
-
-        if (!result.success) {
-          throw new Error(result.error || 'Failed to read file');
-        }
-
-        return {
-          contents: [{
-            uri: uri.href,
-            mimeType: 'text/plain',
-            text: result.content || ''
-          }]
-        };
+        return readBoundedFileResource(uri.href, filePath);
       }
     );
 
@@ -874,43 +883,27 @@ Actions:
           const service = new WorkflowService(repoPath);
 
           if (!(await service.hasWorkflow())) {
-            return {
-              contents: [{
-                uri: 'workflow://status',
-                mimeType: 'application/json',
-                text: JSON.stringify({ error: 'No workflow found' }, null, 2)
-              }]
-            };
+            return createBoundedResourceJson('workflow://status', {
+              error: 'No workflow found',
+            });
           }
 
           const summary = await service.getSummary();
           const status = await service.getStatus();
 
-          return {
-            contents: [{
-              uri: 'workflow://status',
-              mimeType: 'application/json',
-              text: JSON.stringify({
-                name: summary.name,
-                scale: getScaleName(summary.scale as ProjectScale),
-                currentPhase: summary.currentPhase,
-                progress: summary.progress,
-                isComplete: summary.isComplete,
-                phases: status.phases,
-                roles: status.roles,
-              }, null, 2)
-            }]
-          };
+          return createBoundedResourceJson('workflow://status', {
+            name: summary.name,
+            scale: getScaleName(summary.scale as ProjectScale),
+            currentPhase: summary.currentPhase,
+            progress: summary.progress,
+            isComplete: summary.isComplete,
+            phases: status.phases,
+            roles: status.roles,
+          });
         } catch (error) {
-          return {
-            contents: [{
-              uri: 'workflow://status',
-              mimeType: 'application/json',
-              text: JSON.stringify({
-                error: error instanceof Error ? error.message : String(error)
-              }, null, 2)
-            }]
-          };
+          return createBoundedResourceJson('workflow://status', {
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
     );
@@ -1019,6 +1012,9 @@ Actions:
         : toolName;
 
       try {
+        if (toolName === 'harness') {
+          MCP_HARNESS_ACTION_LIMIT_SCHEMA.parse(params);
+        }
         validateMcpInput(params);
       } catch (error) {
         const resolvedRepoPath = this.getRepoPath();

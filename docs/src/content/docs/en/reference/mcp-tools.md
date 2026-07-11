@@ -55,8 +55,12 @@ File and code exploration — read files, list paths, search content, and extrac
 | `encoding` | enum: `utf-8` \| `ascii` \| `binary` | read | File encoding |
 | `symbolTypes` | array | analyze | Extract `class` \| `interface` \| `function` \| `type` \| `enum` |
 | `ignore` | array | list, search, getStructure | Patterns to exclude |
+| `limit` | integer, 1–1,000 | list | Files per page; defaults to 100 |
+| `cursor` | string | list | Opaque continuation cursor from `page.nextCursor` |
 
 **Returns:** file contents, matched files, symbol analysis, search results, or a directory tree.
+
+The `list` action streams matches into bounded pages instead of materializing the entire glob. Pass the returned `page.nextCursor` unchanged to continue.
 
 ### context
 
@@ -225,6 +229,8 @@ Explicit harness runtime operations — sessions, traces, artifacts, checkpoints
 
 `listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays`, and `listDatasets` are bounded. Continue a partial result by sending the returned `page.nextCursor` unchanged in the next call. Cursors are bound to their query and become invalid when their underlying trace segments rotate.
 
+Action-specific maximums are enforced at the MCP boundary: 200 for sessions and artifacts, 100 for replays and datasets, and 1,000 for traces, tasks, and handoffs.
+
 MCP JSON text is compact-serialized once and has a 1 MiB default budget (4 MiB absolute maximum). A page that does not fit returns the typed `MCP_PAGE_TOO_LARGE` error with `suggestedLimit`; JSON is never cut at an arbitrary byte. Tool results also include a content-free `_meta.dotcontext` audit envelope with response size and page metrics. Clients may ignore `_meta` and continue reading `content`.
 
 **Returns:** session timelines, artifact inventories, task evaluations, sensor telemetry, replay records, failure clusters, or policy enforcement results.
@@ -328,6 +334,8 @@ In addition to tools, the server exposes read-only resources your client can fet
 | `context://codebase/{contextType}` | `text/markdown` | Semantic context variants — `documentation`, `playbook`, `plan`, or `compact`. Auto-refreshes on read; caching supported. |
 | `file://{path}` | `text/plain` | Reads file contents; paths are validated against the workspace boundary. |
 | `workflow://status` | `application/json` | Current PREVC workflow status — phases, roles, and a progress snapshot. |
+
+All resource text shares the MCP UTF-8 response budget: 1 MiB by default and 4 MiB at most. An oversized `file://` resource returns the typed `MCP_RESOURCE_TOO_LARGE` response before its body is read. Resource text is never arbitrarily truncated.
 
 ## Recommended call flows
 
