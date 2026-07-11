@@ -77,6 +77,64 @@ describe('SemanticSnapshotService', () => {
     expect(await fs.pathExists(path.join(outputDir, 'cache', 'semantic', 'manifest.json'))).toBe(true);
   });
 
+  it('verifies and retries an initial write when the repository changes during generation', async () => {
+    await fs.remove(path.join(repoPath, 'src', 'auth.ts'));
+    const repoStructure = await new FileMapper().mapRepository(repoPath);
+    const service = new SemanticSnapshotService();
+    let mutationInjected = false;
+    const originalBuild = (service as any).buildSnapshotArtifacts.bind(service);
+    const buildSpy = jest.spyOn(service as any, 'buildSnapshotArtifacts').mockImplementation(
+      async (...args: unknown[]) => {
+        if (!mutationInjected) {
+          mutationInjected = true;
+          await fs.writeFile(
+            path.join(repoPath, 'src', 'auth.ts'),
+            'export const login = () => "ok";\n'
+          );
+        }
+        return originalBuild(...args);
+      }
+    );
+
+    const result = await service.writeSnapshot(repoStructure, { outputDir });
+
+    expect(buildSpy).toHaveBeenCalledTimes(2);
+    expect(result.metrics.stabilizationAttempts).toBe(2);
+    expect(result.summary.functionalPatterns.hasAuthPattern).toBe(true);
+  });
+
+  it('retains the previous manifest when a direct write cannot stabilize', async () => {
+    const mapper = new FileMapper();
+    const service = new SemanticSnapshotService();
+    const initialStructure = await mapper.mapRepository(repoPath);
+    const initial = await service.writeSnapshot(initialStructure, { outputDir });
+    await fs.writeFile(path.join(repoPath, 'src', 'index.ts'), 'export const run = () => false;\n');
+    const changedStructure = await mapper.mapRepository(repoPath);
+    let mutation = 0;
+    const originalBuild = (service as any).buildSnapshotArtifacts.bind(service);
+    const buildSpy = jest.spyOn(service as any, 'buildSnapshotArtifacts').mockImplementation(
+      async (...args: unknown[]) => {
+        const artifacts = await originalBuild(...args);
+        mutation += 1;
+        await fs.writeFile(
+          path.join(repoPath, 'src', 'auth.ts'),
+          `export const login = () => ${mutation};\n`
+        );
+        return artifacts;
+      }
+    );
+
+    await expect(service.writeSnapshot(changedStructure, { outputDir }))
+      .rejects.toBeInstanceOf(RepositoryChangingError);
+    expect(buildSpy).toHaveBeenCalledTimes(2);
+
+    const retained = await new SemanticSnapshotService().readSummary(repoPath, {
+      outputDir,
+      allowStale: true,
+    });
+    expect(retained?.manifest?.generatedAt).toBe(initial.manifest.generatedAt);
+  });
+
   it('invalidates the snapshot when hidden config files change', async () => {
     const mapper = new FileMapper();
     const repoStructure = await mapper.mapRepository(repoPath);

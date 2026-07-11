@@ -60,7 +60,7 @@ Defaults:
 | single source file | 2 MiB |
 | directories scanned | 10,000 (absolute maximum 50,000) |
 | raw directory entries scanned | 100,000 (absolute maximum 500,000) |
-| file analysis concurrency | 16 |
+| file analysis concurrency | 16 (absolute maximum 64) |
 | fingerprint attempts | 2 |
 
 Skip oversized files with a reason and mark partial=true.

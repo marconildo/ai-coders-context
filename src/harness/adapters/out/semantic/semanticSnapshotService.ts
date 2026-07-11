@@ -282,32 +282,54 @@ export class SemanticSnapshotService {
     const outputDir = this.resolveOutputDir(repoStructure.rootPath, options.outputDir);
     const snapshotDir = this.getSnapshotDir(outputDir);
     const publishedSummaryPath = path.join(snapshotDir, SUMMARY_FILENAME);
+    const fileMapper = new FileMapper([], this.fingerprintLimits);
+    let attemptStructure = repoStructure;
+    let attemptFingerprint = options.repoFingerprint;
+    let generationMs = 0;
 
-    const repoFingerprint =
-      options.repoFingerprint ?? (await this.computeRepoFingerprint(repoStructure.rootPath)).fingerprint;
+    for (let attempt = 1; attempt <= MAX_REFRESH_ATTEMPTS; attempt += 1) {
+      const repoFingerprint = attemptFingerprint ?? (
+        await this.computeRepoFingerprint(repoStructure.rootPath, attemptStructure)
+      ).fingerprint;
+      const attemptOptions: SemanticSnapshotWriteOptions = attempt === 1
+        ? { ...options, repoFingerprint }
+        : {
+          outputDir: options.outputDir,
+          analyzerOptions: options.analyzerOptions,
+          repoFingerprint,
+        };
+      const generationStartedAt = Date.now();
+      const artifacts = await this.buildSnapshotArtifacts(attemptStructure, attemptOptions);
+      generationMs += Date.now() - generationStartedAt;
 
-    const generationStartedAt = Date.now();
-    const artifacts = await this.buildSnapshotArtifacts(repoStructure, {
-      ...options,
-      repoFingerprint,
-    });
-    const generationMs = Date.now() - generationStartedAt;
-    const publicationStartedAt = Date.now();
-    const manifest = await this.publishSnapshotArtifacts({
-      outputDir,
-      snapshotDir,
-      publishedSummaryPath,
-      artifacts,
-    });
-    const publicationMs = Date.now() - publicationStartedAt;
+      const verificationStructure = await fileMapper.mapRepository(repoStructure.rootPath);
+      const verificationFingerprint = (
+        await this.computeRepoFingerprint(repoStructure.rootPath, verificationStructure)
+      ).fingerprint;
+      if (verificationFingerprint !== repoFingerprint) {
+        attemptStructure = verificationStructure;
+        attemptFingerprint = verificationFingerprint;
+        continue;
+      }
 
-    return {
-      summary: artifacts.summary,
-      manifest,
-      snapshotDir,
-      publishedSummaryPath,
-      metrics: { generationMs, publicationMs, stabilizationAttempts: 1 },
-    };
+      const publicationStartedAt = Date.now();
+      const manifest = await this.publishSnapshotArtifacts({
+        outputDir,
+        snapshotDir,
+        publishedSummaryPath,
+        artifacts,
+      });
+      const publicationMs = Date.now() - publicationStartedAt;
+      return {
+        summary: artifacts.summary,
+        manifest,
+        snapshotDir,
+        publishedSummaryPath,
+        metrics: { generationMs, publicationMs, stabilizationAttempts: attempt },
+      };
+    }
+
+    throw new RepositoryChangingError(repoStructure.rootPath, MAX_REFRESH_ATTEMPTS);
   }
 
   async ensureFreshSummary(
@@ -416,45 +438,8 @@ export class SemanticSnapshotService {
 
     const refreshPromise = (async () => {
       const fileMapper = new FileMapper();
-      const snapshotDir = this.getSnapshotDir(outputDir);
-      const publishedSummaryPath = path.join(snapshotDir, SUMMARY_FILENAME);
-
-      for (let attempt = 1; attempt <= MAX_REFRESH_ATTEMPTS; attempt += 1) {
-        const repoStructure = await fileMapper.mapRepository(repoPath);
-        const repoFingerprint = (await this.computeRepoFingerprint(repoPath, repoStructure)).fingerprint;
-        const generationStartedAt = Date.now();
-        const artifacts = await this.buildSnapshotArtifacts(repoStructure, {
-          outputDir,
-          repoFingerprint,
-        });
-        const generationMs = Date.now() - generationStartedAt;
-        const verificationStructure = await fileMapper.mapRepository(repoPath);
-        const currentFingerprint = (
-          await this.computeRepoFingerprint(repoPath, verificationStructure)
-        ).fingerprint;
-
-        if (currentFingerprint !== repoFingerprint) {
-          continue;
-        }
-
-        const publicationStartedAt = Date.now();
-        const manifest = await this.publishSnapshotArtifacts({
-          outputDir,
-          snapshotDir,
-          publishedSummaryPath,
-          artifacts,
-        });
-        const publicationMs = Date.now() - publicationStartedAt;
-        return {
-          summary: artifacts.summary,
-          manifest,
-          snapshotDir,
-          publishedSummaryPath,
-          metrics: { generationMs, publicationMs, stabilizationAttempts: attempt },
-        };
-      }
-
-      throw new RepositoryChangingError(repoPath, MAX_REFRESH_ATTEMPTS);
+      const repoStructure = await fileMapper.mapRepository(repoPath);
+      return this.writeSnapshot(repoStructure, { outputDir });
     })();
 
     SemanticSnapshotService.inFlightRefreshes.set(refreshKey, refreshPromise);

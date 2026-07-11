@@ -2,7 +2,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 
-import { CodebaseAnalyzer } from '../codebaseAnalyzer';
+import { CodebaseAnalyzer, MAX_FILE_ANALYSIS_CONCURRENCY } from '../codebaseAnalyzer';
 import type { SemanticContext, FileAnalysis, ExtractedSymbol } from '../types';
 
 // Mock TreeSitterLayer
@@ -163,6 +163,25 @@ describe('CodebaseAnalyzer', () => {
       expect(bundle.limits.maxEntriesScanned).toBe(500_000);
       expect(bundle.metrics.directoriesScanned).toBeGreaterThan(0);
       expect(bundle.metrics.entriesScanned).toBeGreaterThan(0);
+    });
+
+    it('normalizes invalid concurrency and absolute-clamps extreme direct API values', async () => {
+      const source = path.join(tempDir, 'src', 'index.ts');
+      const cases: Array<{ concurrency: number; expected: number }> = [
+        { concurrency: Number.NaN, expected: 16 },
+        { concurrency: Number.POSITIVE_INFINITY, expected: 16 },
+        { concurrency: 0, expected: 1 },
+        { concurrency: 3.9, expected: 3 },
+        { concurrency: Number.MAX_SAFE_INTEGER, expected: MAX_FILE_ANALYSIS_CONCURRENCY },
+      ];
+
+      for (const testCase of cases) {
+        const bundle = await new CodebaseAnalyzer({ concurrency: testCase.concurrency })
+          .analyzeBundle(tempDir, [source]);
+        expect(bundle.limits.concurrency).toBe(testCase.expected);
+        expect(bundle.metrics.filesParsed).toBe(1);
+        expect(bundle.metrics.maxInFlight).toBeLessThanOrEqual(testCase.expected);
+      }
     });
 
     it('bounds a 3000-file-equivalent analysis and reports maximum in-flight work', async () => {

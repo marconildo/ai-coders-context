@@ -51,6 +51,29 @@ describe('FileMapper bounded discovery', () => {
     await fs.remove(repoPath);
   });
 
+  it('discovers source files under non-standard Python and Go roots', async () => {
+    const expected = [
+      'custompkg/main.py',
+      'cmd/server/main.go',
+      'internal/auth/service.go',
+      'pkg/client/client.go',
+    ];
+    await Promise.all(expected.map(async (relativePath) => {
+      const filePath = path.join(repoPath, relativePath);
+      await fs.ensureDir(path.dirname(filePath));
+      await fs.writeFile(filePath, '# source\n');
+    }));
+    await fs.ensureDir(path.join(repoPath, 'assets', 'nested'));
+    await fs.writeFile(path.join(repoPath, 'assets', 'nested', 'image.bin'), 'ignored');
+
+    const result = await new FileMapper().mapRepository(repoPath);
+
+    expect(result.files.map((file) => file.relativePath)).toEqual([...expected].sort());
+    expect(result.partial).toBe(false);
+    expect(result.discoveryMetrics?.directoriesScanned).toBe(10);
+    expect(result.discoveryMetrics?.statCalls).toBe(expected.length);
+  });
+
   it('stops before statting file candidates beyond the file cap', async () => {
     const directory = fakeDirectory(
       Array.from({ length: 5_100 }, (_, index) => fakeEntry(`file-${index}.ts`))

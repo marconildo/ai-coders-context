@@ -47,6 +47,9 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   cacheEnabled: true,
 };
 
+/** Absolute ceiling for direct API callers to avoid allocating excessive workers. */
+export const MAX_FILE_ANALYSIS_CONCURRENCY = 64;
+
 export interface AnalysisLimits {
   maxFiles: number;
   maxTotalBytes: number;
@@ -122,7 +125,13 @@ export class CodebaseAnalyzer {
       ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxEntriesScanned,
       Math.max(0, Math.floor(this.options.maxEntriesScanned))
     );
-    this.options.concurrency = Math.max(1, this.options.concurrency);
+    const configuredConcurrency = Number.isFinite(this.options.concurrency)
+      ? Math.floor(this.options.concurrency)
+      : DEFAULT_OPTIONS.concurrency;
+    this.options.concurrency = Math.min(
+      MAX_FILE_ANALYSIS_CONCURRENCY,
+      Math.max(1, configuredConcurrency)
+    );
 
     // Create LSPLayer if LSP mode is enabled
     if (this.options.useLSP) {

@@ -77,7 +77,7 @@ describe('contextTools sensors scaffolding', () => {
     }));
   });
 
-  it('performs one discovery per operation and reuses fingerprint reads across operations', async () => {
+  it('performs one bundle discovery plus publication verification per operation', async () => {
     const repositoryDiscovery = jest.spyOn(FileMapper.prototype, 'mapRepository');
 
     const first = await initializeContextTool.execute!(
@@ -105,7 +105,7 @@ describe('contextTools sensors scaffolding', () => {
 
     const firstFingerprint = first._metadata.analysis.metrics.fingerprint;
     const secondFingerprint = second._metadata.analysis.metrics.fingerprint;
-    expect(repositoryDiscovery).toHaveBeenCalledTimes(2);
+    expect(repositoryDiscovery).toHaveBeenCalledTimes(4);
     expect(firstFingerprint.discoveries).toBe(0);
     expect(firstFingerprint.contentReads).toBe(firstFingerprint.files);
     expect(secondFingerprint.discoveries).toBe(0);

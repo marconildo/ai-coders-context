@@ -45,8 +45,6 @@ export const REPOSITORY_ROOT_FILES = [
   '.eslintrc.json', '.prettierrc', '.prettierrc.json', '.nvmrc', '.node-version',
 ] as const;
 
-const RELEVANT_SOURCE_ROOTS = new Set(['src', 'lib', 'bin', 'app', 'packages', 'scripts']);
-
 export function isRepositoryRelevantFile(relativePath: string): boolean {
   const normalized = relativePath.split(path.sep).join('/');
   const basename = path.posix.basename(normalized);
@@ -57,10 +55,7 @@ export function isRepositoryRelevantFile(relativePath: string): boolean {
   if (segments[0] === '.github' && segments[1] === 'workflows') {
     return extension === 'yml' || extension === 'yaml';
   }
-  if (segments.length === 1 || RELEVANT_SOURCE_ROOTS.has(segments[0])) {
-    return (REPOSITORY_RELEVANT_EXTENSIONS as readonly string[]).includes(extension);
-  }
-  return false;
+  return (REPOSITORY_RELEVANT_EXTENSIONS as readonly string[]).includes(extension);
 }
 
 const MAX_RECORDED_SKIPS = 1_000;
@@ -188,9 +183,7 @@ export class FileMapper {
           if (this.isIgnored(relativePath, entry.isDirectory())) continue;
 
           if (entry.isDirectory()) {
-            if (!usesDefaultPatterns || this.shouldTraverseDefaultDirectory(relativePath)) {
-              directoryQueue.push(relativePath);
-            }
+            directoryQueue.push(relativePath);
             continue;
           }
           if (!entry.isFile()) continue;
@@ -290,13 +283,6 @@ export class FileMapper {
   private isIgnored(relativePath: string, isDirectory: boolean): boolean {
     return this.gitIgnoreManager.shouldIgnore(relativePath) ||
       (isDirectory && this.gitIgnoreManager.shouldIgnore(`${relativePath}/`));
-  }
-
-  private shouldTraverseDefaultDirectory(relativePath: string): boolean {
-    const segments = relativePath.split('/');
-    if (RELEVANT_SOURCE_ROOTS.has(segments[0])) return true;
-    if (segments[0] !== '.github') return false;
-    return segments.length === 1 || segments[1] === 'workflows';
   }
 
   private recordSkip(skipped: RepoDiscoverySkip[], skip: RepoDiscoverySkip): void {
