@@ -96,6 +96,38 @@ describe('HookDispatchService session lifecycle', () => {
     expect(traceContent).toContain('tool.use');
   });
 
+  it.each(['claude-code', 'codex'] as const)(
+    'rejects oversized %s stdin without echoing input or blocking the host',
+    async (source) => {
+      const marker = 'must-not-be-echoed';
+      const stdoutChunks: Buffer[] = [];
+      const stdout = new PassThrough();
+      stdout.on('data', (chunk) => stdoutChunks.push(Buffer.from(chunk)));
+      const input = JSON.stringify({
+        cwd: tempDir,
+        hook_event_name: 'PostToolUse',
+        content: `${marker}${'x'.repeat(2048)}`,
+      });
+
+      const result = await runHookDispatch({
+        source,
+        repoPath: tempDir,
+        stdin: PassThrough.from([input.slice(0, 900), input.slice(900)]),
+        stdout,
+        maxInputBytes: 1024,
+      });
+
+      expect(result).toEqual({ exitCode: 0, output: { continue: true } });
+      expect(Buffer.concat(stdoutChunks).toString('utf8')).not.toContain(marker);
+      const diagnostic = await fs.readFile(
+        path.join(tempDir, '.context', 'runtime', 'hooks', 'trace-failures.json'),
+        'utf8'
+      );
+      expect(diagnostic).toContain('hook_stdin_too_large');
+      expect(diagnostic).not.toContain(marker);
+    }
+  );
+
   it('runs context check before binding SessionStart sessions in uninitialized repos', async () => {
     await fs.remove(path.join(tempDir, '.context'));
 
@@ -537,7 +569,10 @@ describe('HookDispatchService session lifecycle', () => {
     const toolTrace = records.find((record) => record.event === 'tool.use');
     expect(toolTrace?.data).toMatchObject({
       classification: 'test',
-      tool_input: { command: 'npm test -- --runInBand' },
+      tool_input: {
+        commandBasename: 'npm',
+        commandPreview: 'npm test -- --runInBand',
+      },
     });
   });
 

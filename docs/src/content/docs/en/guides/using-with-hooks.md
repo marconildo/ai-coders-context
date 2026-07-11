@@ -77,7 +77,7 @@ All supported hosts run the same harness actions; only the event envelope differ
 | Session start (no `.context/`) | `context` → `check` | Return a short JSON-safe hint to configure MCP and run `context init`; does not create `.context/runtime` |
 | Session start (`.context/` partial) | `context` → `check` | List up to three missing setup areas, such as `workflow` or `plans` |
 | Session start (`.context/` ready) | `context` → `check`, then harness session binding and `context` → `getMap` | Inject compact context/navigation, daily no-workflow reminder, or active PREVC preflight |
-| Post tool use (Write / Edit / Bash) | `harness` → `appendTrace` | Append durable trace under `.context/runtime/`; Bash traces get best-effort classification |
+| Post tool use (Write / Edit / Bash) | `harness` → `appendTrace` | Append a bounded, source-body-free trace under `.context/runtime/`; Bash traces get best-effort classification |
 | Stop / session end | `workflow-guide` | Inject compact PREVC next steps, skills, and gate hints only when an active PREVC workflow exists |
 
 Hooks are **non-blocking by default**. Harness errors do not stop your agent session. Stop/session-end hooks also stay silent when no PREVC workflow is active, when workflow state is missing or malformed, and during host reentry. Those cases return successful no-ops so hook feedback cannot create end-of-turn noise.
@@ -87,6 +87,12 @@ Hook dispatch resolves the repository root as `--repo-path` first, then the near
 Bash classification is best-effort and only reads the command already supplied by the host. Examples: `npm test`, `vitest`, and `jest` become `test`; `npm run build` and `tsc` become `build`; `eslint` and `npm run lint` become `lint`; `git status` and `git diff` become `inspection`.
 
 Repeated trace append failures are recorded under `.context/runtime/hooks/trace-failures.json` and are surfaced by `hook doctor`; the first failure remains silent to the host.
+
+### Trace privacy and limits
+
+Hook envelopes are treated as untrusted input. Shell dispatch accepts at most 8 MiB by default and rejects larger stdin without echoing it or blocking the host operation. Write and Edit source bodies, patches, prompts, messages, authorization values, API keys, tokens, secrets, and passwords are never copied into hook traces. Write/Edit metadata includes the file path, byte counts, omission flags, and SHA-256 hashes of source bodies; Bash stores a command basename and a preview capped at 512 bytes.
+
+Hook trace data is capped at 16 KiB and all runtime trace events have a 256 KiB defense-in-depth ceiling. The active `trace.jsonl` rotates at 8 MiB; readers include chronological `trace.*.jsonl` segments, with four closed segments and 32 MiB per session retained by default. Limits can be lowered in `.context/config/hooks.json` (`stdin.maxBytes` and `trace.*`) and `.context/config/runtime.json` (`trace.maxSerializedBytes`). Values above global safety ceilings are clamped.
 
 ## Claude Code
 

@@ -10,6 +10,30 @@ import * as fs from 'fs-extra';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
 import { resolveRuntimeLayout, type RuntimeLayout } from '../../../../shared/fs/pathHelpers';
+import {
+  boundGenericTraceRecord,
+  loadGenericTraceEventMaxBytes,
+  loadHookTracePolicy,
+} from '../../../application/hooks/hookTracePolicy';
+
+const traceWriteQueues = new Map<string, Promise<void>>();
+
+async function withTraceWriteLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = traceWriteQueues.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const tail = previous.catch(() => undefined).then(() => gate);
+  traceWriteQueues.set(key, tail);
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (traceWriteQueues.get(key) === tail) {
+      traceWriteQueues.delete(key);
+    }
+  }
+}
 
 export type HarnessSessionStatus = 'active' | 'paused' | 'completed' | 'failed';
 export type HarnessTraceLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -149,6 +173,10 @@ export class HarnessRuntimeStateService {
     return this.layout.sessionTraceFile(sessionId);
   }
 
+  private traceSegmentPrefix(sessionId: string): string {
+    return path.join(this.layout.sessionDir(sessionId), 'trace.');
+  }
+
   private artifactFile(sessionId: string, artifactId: string): string {
     return this.layout.sessionArtifactFile(sessionId, artifactId);
   }
@@ -182,21 +210,88 @@ export class HarnessRuntimeStateService {
     }
   }
 
-  private async appendTraceLine(sessionId: string, trace: HarnessTraceRecord): Promise<void> {
+  private async listTraceSegmentFiles(sessionId: string): Promise<string[]> {
+    const sessionDir = this.layout.sessionDir(sessionId);
+    if (!(await fs.pathExists(sessionDir))) {
+      return [];
+    }
+    const entries = await fs.readdir(sessionDir);
+    return entries
+      .filter((entry) => /^trace\..+\.jsonl$/.test(entry))
+      .sort()
+      .map((entry) => path.join(sessionDir, entry));
+  }
+
+  private async pruneTraceSegments(sessionId: string): Promise<void> {
+    const policy = loadHookTracePolicy(this.repoPath);
+    const activeFile = this.traceFile(sessionId);
+    const activeBytes = await fs.stat(activeFile).then((stat) => stat.size).catch(() => 0);
+    const segments = await this.listTraceSegmentFiles(sessionId);
+    const segmentStats = await Promise.all(segments.map(async (file) => ({
+      file,
+      bytes: await fs.stat(file).then((stat) => stat.size).catch(() => 0),
+    })));
+    let totalBytes = activeBytes + segmentStats.reduce((sum, item) => sum + item.bytes, 0);
+    let retained = segmentStats.length;
+    for (const segment of segmentStats) {
+      if (retained <= policy.retainedTraceSegments && totalBytes <= policy.maxSessionTraceBytes) {
+        break;
+      }
+      await fs.remove(segment.file);
+      retained -= 1;
+      totalBytes -= segment.bytes;
+    }
+  }
+
+  private async appendTraceLine(
+    sessionId: string,
+    trace: HarnessTraceRecord
+  ): Promise<HarnessTraceRecord | undefined> {
     await this.ensureSessionDir(sessionId);
-    await fs.appendFile(this.traceFile(sessionId), `${JSON.stringify(trace)}\n`, 'utf8');
+    const activeFile = this.traceFile(sessionId);
+    const serialized = `${JSON.stringify(trace)}\n`;
+    const activeBytes = await fs.stat(activeFile).then((stat) => stat.size).catch(() => 0);
+    const policy = loadHookTracePolicy(this.repoPath);
+    let rotationTrace: HarnessTraceRecord | undefined;
+
+    if (activeBytes > 0 && activeBytes + Buffer.byteLength(serialized, 'utf8') > policy.traceRotationBytes) {
+      const rotationId = `${new Date().toISOString().replace(/[:.]/g, '-')}.${randomUUID()}`;
+      const segmentFile = `${this.traceSegmentPrefix(sessionId)}${rotationId}.jsonl`;
+      await fs.rename(activeFile, segmentFile);
+      rotationTrace = boundGenericTraceRecord<HarnessTraceRecord>({
+        id: randomUUID(),
+        sessionId,
+        level: 'info',
+        event: 'trace.rotated',
+        message: 'Trace segment rotated',
+        createdAt: nowIso(),
+        data: {
+          segment: path.basename(segmentFile),
+          rotationCount: (await this.listTraceSegmentFiles(sessionId)).length,
+          quotaStatus: 'within_limit',
+        },
+      }, loadGenericTraceEventMaxBytes(this.repoPath));
+      await fs.appendFile(activeFile, `${JSON.stringify(rotationTrace)}\n`, 'utf8');
+    }
+
+    await fs.appendFile(activeFile, serialized, 'utf8');
+    await this.pruneTraceSegments(sessionId);
+    return rotationTrace;
   }
 
   private async recordTrace(sessionId: string, trace: HarnessTraceRecord): Promise<HarnessTraceRecord> {
-    const session = await this.readSession(sessionId);
-    await this.appendTraceLine(sessionId, trace);
+    return withTraceWriteLock(this.traceFile(sessionId), async () => {
+      const session = await this.readSession(sessionId);
+      const boundedTrace = boundGenericTraceRecord(trace, loadGenericTraceEventMaxBytes(this.repoPath));
+      const rotationTrace = await this.appendTraceLine(sessionId, boundedTrace);
 
-    session.traceCount += 1;
-    session.lastTraceAt = trace.createdAt;
-    session.updatedAt = trace.createdAt;
-    await this.saveSession(session);
+      session.traceCount += rotationTrace ? 2 : 1;
+      session.lastTraceAt = boundedTrace.createdAt;
+      session.updatedAt = boundedTrace.createdAt;
+      await this.saveSession(session);
 
-    return trace;
+      return boundedTrace;
+    });
   }
 
   async createSession(input: CreateSessionInput): Promise<HarnessSessionRecord> {
@@ -332,13 +427,17 @@ export class HarnessRuntimeStateService {
   }
 
   async listTraces(sessionId: string): Promise<HarnessTraceRecord[]> {
-    const file = this.traceFile(sessionId);
-    if (!(await fs.pathExists(file))) {
+    const activeFile = this.traceFile(sessionId);
+    const files = [
+      ...(await this.listTraceSegmentFiles(sessionId)),
+      ...(await fs.pathExists(activeFile) ? [activeFile] : []),
+    ];
+    if (files.length === 0) {
       return [];
     }
 
-    const content = await fs.readFile(file, 'utf8');
-    return content
+    const contents = await Promise.all(files.map((file) => fs.readFile(file, 'utf8')));
+    return contents.join('')
       .split('\n')
       .map((line) => line.trim())
       .filter(Boolean)

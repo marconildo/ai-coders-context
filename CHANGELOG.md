@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Added configurable, globally clamped hook stdin, field, event, rotation, segment-retention, and per-session trace limits.
+
+### Fixed
+
+- Prevented Claude Code, Codex, and Pi Write/Edit hooks from retaining source bodies or sensitive fields by persisting bounded metadata summaries instead.
+- Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
+- Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
+
 ## [1.1.1] - 2026-06-27
 
 ### Fixed

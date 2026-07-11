@@ -30,7 +30,7 @@ npx -y @dotcontext/cli@latest hook install pi
 | Evento Pi | Chamada harness | Efeito |
 | --- | --- | --- |
 | `session_start` | `context` → `check` | Injeta bootstrap ou dica |
-| `tool_execution_end` | `harness` → `appendTrace` | Trace silencioso |
+| `tool_execution_end` | `harness` → `appendTrace` | Trace silencioso e limitado, sem corpos de Write/Edit |
 | `agent_end` | `workflow-guide` | Notificação com próximos passos, skills e dicas de gate PREVC |
 
 `agent_end` fica silencioso sem workflow PREVC ativo, e chamadas marcadas como reentrantes são ignoradas para evitar loops de notificação.
