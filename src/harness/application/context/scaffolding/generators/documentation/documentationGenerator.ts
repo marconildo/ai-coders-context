@@ -22,6 +22,7 @@ import {
 } from '../../../../../../types/scaffoldFrontmatter';
 import { getScaffoldStructure, ScaffoldStructure, serializeStructureAsMarkdown } from '../shared/structures';
 import { AutoFillService, AutoFillContext } from '../../../intelligence/autoFill';
+import type { AnalysisBundle } from '../../../analysisBundle';
 
 /**
  * Category mapping from document name to frontmatter category.
@@ -73,6 +74,8 @@ interface DocumentationGenerationConfig {
     publicationMs: number;
     stabilizationAttempts: number;
   }) => void;
+  /** Preferred operation-scoped input from context init. */
+  analysisBundle?: AnalysisBundle;
 }
 
 export class DocumentationGenerator {
@@ -93,9 +96,9 @@ export class DocumentationGenerator {
       : null;
 
     // Perform semantic analysis if enabled
-    let semantics = config.semanticContext;
-    let functionalPatterns = config.functionalPatterns;
-    let snapshotFingerprint = config.repoFingerprint;
+    let semantics = config.analysisBundle?.semanticContext ?? config.semanticContext;
+    let functionalPatterns = config.analysisBundle?.functionalPatterns ?? config.functionalPatterns;
+    let snapshotFingerprint = config.analysisBundle?.repoFingerprint ?? config.repoFingerprint;
     if (config.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis...', verbose);
       GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
@@ -121,7 +124,7 @@ export class DocumentationGenerator {
     }
 
     // Detect stack info for codebase map and autoFill
-    let stackInfo = config.stackInfo;
+    let stackInfo = config.analysisBundle?.stackInfo ?? config.stackInfo;
     if (!stackInfo && (semantics || config.autoFill)) {
       try {
         const stackDetector = new StackDetector();

@@ -56,12 +56,18 @@ describe('contextTools sensors scaffolding', () => {
 
     expect(analyzeBundle).toHaveBeenCalledTimes(1);
     const analyzed = await analyzeBundle.mock.results[0].value;
-    expect(docs.mock.calls[0][2]).toEqual(expect.objectContaining({
+    const docsConfig = docs.mock.calls[0][2]!;
+    const agentsConfig = agents.mock.calls[0][2]!;
+    expect(docsConfig).toEqual(expect.objectContaining({
       semanticContext: analyzed.context,
       functionalPatterns: analyzed.functionalPatterns,
     }));
-    expect(agents.mock.calls[0][2]).toEqual(expect.objectContaining({
+    expect(docsConfig).toEqual(expect.objectContaining({
+      analysisBundle: expect.objectContaining({ semanticContext: analyzed.context }),
+    }));
+    expect(agentsConfig).toEqual(expect.objectContaining({
       semanticContext: analyzed.context,
+      analysisBundle: docsConfig.analysisBundle,
     }));
     expect(snapshot.mock.calls[0][1]).toEqual(expect.objectContaining({
       semantics: analyzed.context,

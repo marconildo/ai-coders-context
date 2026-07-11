@@ -740,6 +740,7 @@ export const initializeContextTool = createInternalTool<
             stackInfo: detectedStackInfo,
             repoFingerprint: semanticFingerprint,
             cacheEnabled,
+            analysisBundle,
             onSnapshotMetrics: (metrics) => {
               if (analysisBundle) {
                 analysisBundle.metrics.durationsMs.generation = metrics.generationMs;
@@ -797,6 +798,7 @@ export const initializeContextTool = createInternalTool<
             semanticContext: semanticBundle?.context,
             stackInfo: detectedStackInfo,
             cacheEnabled,
+            analysisBundle,
           },
           false
         );

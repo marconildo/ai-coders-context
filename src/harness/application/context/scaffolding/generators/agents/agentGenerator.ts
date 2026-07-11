@@ -15,6 +15,7 @@ import { PrevcPhase } from '../../../../../domain/workflow/types';
 import { getScaffoldStructure, serializeStructureAsMarkdown } from '../shared/structures';
 import { AutoFillService, AutoFillContext } from '../../../intelligence/autoFill';
 import { StackDetector, StackInfo } from '../../../intelligence/stack';
+import type { AnalysisBundle } from '../../../analysisBundle';
 
 interface AgentContext {
   topLevelDirectories: string[];
@@ -44,6 +45,8 @@ interface AgentGenerationConfig {
   semanticContext?: SemanticContext;
   stackInfo?: StackInfo;
   cacheEnabled?: boolean;
+  /** Preferred operation-scoped input from context init. */
+  analysisBundle?: AnalysisBundle;
 }
 
 /**
@@ -120,7 +123,7 @@ export class AgentGenerator {
     await GeneratorUtils.ensureDirectoryAndLog(agentsDir, verbose, 'Generating agent scaffold in');
 
     // Perform semantic analysis if enabled
-    let semantics = normalizedConfig.semanticContext;
+    let semantics = normalizedConfig.analysisBundle?.semanticContext ?? normalizedConfig.semanticContext;
     if (normalizedConfig.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis for agents...', verbose);
       GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
@@ -143,7 +146,7 @@ export class AgentGenerator {
     }
 
     // Detect stack info for autoFill
-    let stackInfo = normalizedConfig.stackInfo;
+    let stackInfo = normalizedConfig.analysisBundle?.stackInfo ?? normalizedConfig.stackInfo;
     if (!stackInfo && normalizedConfig.autoFill) {
       try {
         const stackDetector = new StackDetector();
