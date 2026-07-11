@@ -77,6 +77,22 @@ describe('runAcceptance', () => {
     expect(result.outputTruncated).toBe(true);
   });
 
+  it('clamps an enormous acceptance tail at the domain configuration boundary', async () => {
+    const result = await runAcceptance(
+      {
+        kind: 'shell',
+        command: ['node', '-e', 'process.stdout.write("x".repeat(12 * 1024))'],
+      },
+      { ...ctx, outputLimits: { tailBytes: Number.MAX_SAFE_INTEGER } }
+    );
+
+    expect(result.passed).toBe(true);
+    expect(Buffer.byteLength(result.tailStdout)).toBe(8 * 1024);
+    expect(result.stdoutBytes).toBe(12 * 1024);
+    expect(result.stdoutDroppedBytes).toBe(4 * 1024);
+    expect(result.outputTruncated).toBe(true);
+  });
+
   it('kills and reaps a child that exceeds the combined hard output limit', async () => {
     const result = await runAcceptance(
       {

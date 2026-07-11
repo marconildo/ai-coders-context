@@ -132,6 +132,24 @@ describe('tests-passing sensor', () => {
     expect(result.outputTruncated).toBe(true);
   });
 
+  it('clamps an enormous caller-controlled context tail to the safe default', async () => {
+    const result = await executeTestsPassing(tempDir, {
+      sessionId: 's',
+      context: {
+        kind: 'exit-code',
+        testCommand: nodeScript('process.stdout.write("x".repeat(12 * 1024))'),
+        tailBytes: Number.MAX_SAFE_INTEGER,
+      },
+    });
+
+    expect(result.status).toBe('passed');
+    expect(result.details).toEqual(expect.objectContaining({
+      stdoutBytes: 12 * 1024,
+      stdoutDroppedBytes: 4 * 1024,
+      outputTruncated: true,
+    }));
+  });
+
   it('fails with a stable reason when output exceeds the hard limit', async () => {
     const result = await executeTestsPassing(tempDir, {
       sessionId: 's',

@@ -1,6 +1,8 @@
 import {
   BoundedByteCollector,
+  DEFAULT_SUBPROCESS_TAIL_BYTES,
   MAX_SAFE_SUBPROCESS_HARD_OUTPUT_BYTES,
+  MAX_SUBPROCESS_TAIL_BYTES,
   resolveSubprocessOutputLimits,
 } from '../boundedByteCollector';
 
@@ -48,4 +50,38 @@ describe('BoundedByteCollector', () => {
       unsafeAllowAboveMaximum: true,
     })).toEqual(expect.objectContaining({ hardCombinedOutputBytes: requested }));
   });
+
+  it('allows callers to lower the tail but never increase it', () => {
+    expect(resolveSubprocessOutputLimits({ tailBytes: 128 }).tailBytes).toBe(128);
+    expect(resolveSubprocessOutputLimits({ tailBytes: Number.MAX_SAFE_INTEGER }).tailBytes)
+      .toBe(MAX_SUBPROCESS_TAIL_BYTES);
+    expect(resolveSubprocessOutputLimits({ tailBytes: Number.MAX_VALUE }).tailBytes)
+      .toBe(MAX_SUBPROCESS_TAIL_BYTES);
+    expect(resolveSubprocessOutputLimits({ tailBytes: Number.POSITIVE_INFINITY }).tailBytes)
+      .toBe(DEFAULT_SUBPROCESS_TAIL_BYTES);
+    expect(resolveSubprocessOutputLimits({ tailBytes: Number.NaN }).tailBytes)
+      .toBe(DEFAULT_SUBPROCESS_TAIL_BYTES);
+    expect(resolveSubprocessOutputLimits({ tailBytes: -100 }).tailBytes).toBe(0);
+  });
+
+  it('guards its allocation boundary when constructed directly with an enormous tail', () => {
+    const collector = new BoundedByteCollector(Number.MAX_SAFE_INTEGER);
+    collector.append(Buffer.alloc(DEFAULT_SUBPROCESS_TAIL_BYTES * 2, 'z'));
+
+    expect(collector.tailBytes).toBe(MAX_SUBPROCESS_TAIL_BYTES);
+    expect(collector.totalBytes).toBe(DEFAULT_SUBPROCESS_TAIL_BYTES * 2);
+    expect(collector.retainedBytes).toBe(MAX_SUBPROCESS_TAIL_BYTES);
+    expect(collector.droppedBytes).toBe(DEFAULT_SUBPROCESS_TAIL_BYTES);
+    expect(collector.truncated).toBe(true);
+    expect(collector.tail()).toHaveLength(MAX_SUBPROCESS_TAIL_BYTES);
+  });
+
+  it.each([Number.NaN, Number.POSITIVE_INFINITY, -1])(
+    'rejects invalid direct-constructor tail value %p before allocation',
+    (tailBytes) => {
+      expect(() => new BoundedByteCollector(tailBytes)).toThrow(
+        'tailBytes must be a non-negative safe integer'
+      );
+    }
+  );
 });

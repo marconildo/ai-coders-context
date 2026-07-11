@@ -6,6 +6,12 @@
  */
 
 export const DEFAULT_SUBPROCESS_TAIL_BYTES = 8 * 1024;
+/**
+ * Absolute per-stream capture ceiling. Diagnostic callers may request a
+ * smaller tail, but increasing it would make user-controlled configuration a
+ * memory-allocation primitive.
+ */
+export const MAX_SUBPROCESS_TAIL_BYTES = DEFAULT_SUBPROCESS_TAIL_BYTES;
 export const DEFAULT_SUBPROCESS_SOFT_OUTPUT_BYTES = 1024 * 1024;
 export const DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES = 16 * 1024 * 1024;
 export const MAX_SAFE_SUBPROCESS_HARD_OUTPUT_BYTES = 64 * 1024 * 1024;
@@ -31,7 +37,10 @@ function positiveInteger(value: number | undefined, fallback: number, minimum: n
 export function resolveSubprocessOutputLimits(
   input: SubprocessOutputLimitsInput = {}
 ): SubprocessOutputLimits {
-  const tailBytes = positiveInteger(input.tailBytes, DEFAULT_SUBPROCESS_TAIL_BYTES, 0);
+  const tailBytes = Math.min(
+    positiveInteger(input.tailBytes, DEFAULT_SUBPROCESS_TAIL_BYTES, 0),
+    MAX_SUBPROCESS_TAIL_BYTES
+  );
   const requestedHardLimit = positiveInteger(
     input.hardCombinedOutputBytes,
     DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
@@ -53,16 +62,21 @@ export interface BoundedByteCollectorSnapshot {
 }
 
 export class BoundedByteCollector {
+  readonly tailBytes: number;
   private readonly buffer: Buffer;
   private retainedLength = 0;
   private writeOffset = 0;
   private observedBytes = 0;
 
-  constructor(readonly tailBytes: number = DEFAULT_SUBPROCESS_TAIL_BYTES) {
+  constructor(tailBytes: number = DEFAULT_SUBPROCESS_TAIL_BYTES) {
     if (!Number.isSafeInteger(tailBytes) || tailBytes < 0) {
       throw new Error('tailBytes must be a non-negative safe integer');
     }
-    this.buffer = Buffer.allocUnsafe(tailBytes);
+    // Enforce the invariant at the allocation boundary as defense in depth.
+    // Callers should resolve limits first, but direct construction must never
+    // turn an oversized value into a large allocation.
+    this.tailBytes = Math.min(tailBytes, MAX_SUBPROCESS_TAIL_BYTES);
+    this.buffer = Buffer.allocUnsafe(this.tailBytes);
   }
 
   append(chunk: Buffer): void {
