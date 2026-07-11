@@ -27,6 +27,21 @@ interface HookSessionStoreDocument {
 const mutationTails = new Map<string, Promise<void>>();
 const LOCK_WAIT_MS = 10_000;
 const LOCK_RETRY_MS = 20;
+const LOCK_STALE_MS = 5_000;
+
+interface HookSessionLockOwner {
+  version: 1;
+  pid: number;
+  token: string;
+  createdAt: number;
+}
+
+interface HookSessionLockSnapshot {
+  owner?: HookSessionLockOwner;
+  device: number;
+  inode: number;
+  mtimeMs: number;
+}
 
 export interface HookSessionPruneResult {
   removedExpired: number;
@@ -86,17 +101,118 @@ async function writeStore(repoPath: string, document: HookSessionStoreDocument):
   }
 }
 
+function parseLockOwner(value: string): HookSessionLockOwner | undefined {
+  try {
+    const candidate = JSON.parse(value) as Partial<HookSessionLockOwner>;
+    if (
+      candidate.version !== 1
+      || !Number.isSafeInteger(candidate.pid)
+      || (candidate.pid ?? 0) <= 0
+      || typeof candidate.token !== 'string'
+      || !/^[0-9a-f-]{36}$/i.test(candidate.token)
+      || !Number.isFinite(candidate.createdAt)
+      || (candidate.createdAt ?? 0) <= 0
+    ) return undefined;
+    return candidate as HookSessionLockOwner;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readLockSnapshot(lockPath: string): Promise<HookSessionLockSnapshot> {
+  const handle = await nativeFs.open(lockPath, 'r');
+  try {
+    const [stat, content] = await Promise.all([
+      handle.stat(),
+      handle.readFile('utf8'),
+    ]);
+    return {
+      owner: parseLockOwner(content),
+      device: stat.dev,
+      inode: stat.ino,
+      mtimeMs: stat.mtimeMs,
+    };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+function sameLock(left: HookSessionLockSnapshot, right: HookSessionLockSnapshot): boolean {
+  return left.device === right.device
+    && left.inode === right.inode
+    && left.owner?.token === right.owner?.token
+    && left.owner?.pid === right.owner?.pid
+    && left.owner?.createdAt === right.owner?.createdAt;
+}
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== 'ESRCH';
+  }
+}
+
+async function reclaimStaleLock(lockPath: string): Promise<boolean> {
+  let observed: HookSessionLockSnapshot;
+  try {
+    observed = await readLockSnapshot(lockPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return true;
+    return false;
+  }
+
+  const createdAt = observed.owner?.createdAt ?? observed.mtimeMs;
+  if (Date.now() - createdAt < LOCK_STALE_MS) return false;
+  if (observed.owner && processIsAlive(observed.owner.pid)) return false;
+
+  // Re-open immediately before unlinking. Both inode and the unguessable
+  // owner token must still match, so a replacement lock is never removed on
+  // the basis of an earlier stale observation.
+  let current: HookSessionLockSnapshot;
+  try {
+    current = await readLockSnapshot(lockPath);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+  if (!sameLock(observed, current)) return false;
+
+  try {
+    await nativeFs.unlink(lockPath);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+  }
+}
+
+async function releaseOwnedLock(
+  lockPath: string,
+  owned: HookSessionLockSnapshot,
+): Promise<void> {
+  let current: HookSessionLockSnapshot;
+  try {
+    current = await readLockSnapshot(lockPath);
+  } catch {
+    return;
+  }
+  if (!sameLock(owned, current)) return;
+  await nativeFs.unlink(lockPath).catch(() => undefined);
+}
+
 async function withInterProcessLock<T>(storePath: string, operation: () => Promise<T>): Promise<T> {
   const lockPath = `${storePath}.lock`;
   await fs.ensureDir(path.dirname(lockPath));
   const deadline = Date.now() + LOCK_WAIT_MS;
   let handle: Awaited<ReturnType<typeof nativeFs.open>> | undefined;
+  const token = randomUUID();
 
   while (!handle) {
     try {
       handle = await nativeFs.open(lockPath, 'wx');
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (await reclaimStaleLock(lockPath)) continue;
       if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for hook session store lock: ${path.basename(storePath)}`);
       }
@@ -104,19 +220,42 @@ async function withInterProcessLock<T>(storePath: string, operation: () => Promi
     }
   }
 
+  const owner: HookSessionLockOwner = {
+    version: 1,
+    pid: process.pid,
+    token,
+    createdAt: Date.now(),
+  };
   try {
-    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8');
+    await handle.writeFile(JSON.stringify(owner), 'utf8');
+    await handle.sync();
   } catch (error) {
+    const stat = await handle.stat().catch(() => undefined);
     await handle.close().catch(() => undefined);
-    await nativeFs.unlink(lockPath).catch(() => undefined);
+    if (stat) {
+      await releaseOwnedLock(lockPath, {
+        owner,
+        device: stat.dev,
+        inode: stat.ino,
+        mtimeMs: stat.mtimeMs,
+      });
+    }
     throw error;
   }
+
+  const stat = await handle.stat();
+  const owned: HookSessionLockSnapshot = {
+    owner,
+    device: stat.dev,
+    inode: stat.ino,
+    mtimeMs: stat.mtimeMs,
+  };
 
   try {
     return await operation();
   } finally {
     await handle.close().catch(() => undefined);
-    await nativeFs.unlink(lockPath).catch(() => undefined);
+    await releaseOwnedLock(lockPath, owned);
   }
 }
 

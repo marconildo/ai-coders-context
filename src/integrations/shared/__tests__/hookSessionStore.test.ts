@@ -1,6 +1,9 @@
 import * as fs from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
+import { promises as nativeFs } from 'fs';
+import { randomUUID } from 'crypto';
+import { spawn } from 'child_process';
 
 import { createHarnessHookAdapter } from '../../../harness';
 import {
@@ -136,5 +139,92 @@ describe('hookSessionStore', () => {
       .flatMap(source => Object.values(source as Record<string, unknown>));
     expect(bindings).toHaveLength(30);
     expect(await fs.pathExists(`${storePath}.lock`)).toBe(false);
+  });
+
+  it('reclaims an aged lock whose owner process crashed', async () => {
+    const storePath = path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json');
+    const lockPath = `${storePath}.lock`;
+    await fs.ensureDir(path.dirname(lockPath));
+    const childScript = [
+      "const fs = require('fs');",
+      "const { randomUUID } = require('crypto');",
+      'const lockPath = process.argv[1];',
+      'fs.writeFileSync(lockPath, JSON.stringify({',
+      '  version: 1,',
+      '  pid: process.pid,',
+      '  token: randomUUID(),',
+      '  createdAt: Date.now() - 60000',
+      '}));',
+      'process.exit(73);',
+    ].join('\n');
+    const child = spawn(process.execPath, ['-e', childScript, lockPath], { stdio: 'ignore' });
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', () => resolve());
+    });
+    expect(await fs.pathExists(lockPath)).toBe(true);
+
+    const now = new Date().toISOString();
+    await saveHookHarnessSession({
+      repoPath: tempDir,
+      source: 'codex',
+      hostSessionId: 'after-crash',
+      harnessSessionId: 'replacement-session',
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(await getHookHarnessSessionId({
+      repoPath: tempDir,
+      source: 'codex',
+      hostSessionId: 'after-crash',
+    })).toBe('replacement-session');
+    expect(await fs.pathExists(lockPath)).toBe(false);
+  });
+
+  it('does not unlink a replacement lock with a different inode and token', async () => {
+    const storePath = path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json');
+    const lockPath = `${storePath}.lock`;
+    await fs.outputJson(storePath, { bindings: {} });
+    let unblockRead!: () => void;
+    const readUnblocked = new Promise<void>(resolve => { unblockRead = resolve; });
+    let lockAcquired!: () => void;
+    const acquired = new Promise<void>(resolve => { lockAcquired = resolve; });
+    const fsExtraModule = require('fs-extra') as typeof fs;
+    const originalReadJson = fsExtraModule.readJson.bind(fsExtraModule);
+    let blocked = false;
+    const readSpy = jest.spyOn(fsExtraModule, 'readJson').mockImplementation(async (...args: Parameters<typeof fs.readJson>) => {
+      if (!blocked && path.resolve(String(args[0])) === storePath) {
+        blocked = true;
+        lockAcquired();
+        await readUnblocked;
+      }
+      return originalReadJson(...args);
+    });
+
+    const now = new Date().toISOString();
+    const saving = saveHookHarnessSession({
+      repoPath: tempDir,
+      source: 'claude-code',
+      hostSessionId: 'replacement-race',
+      harnessSessionId: 'replacement-race-session',
+      createdAt: now,
+      updatedAt: now,
+    });
+    await acquired;
+    const replacement = {
+      version: 1,
+      pid: process.pid,
+      token: randomUUID(),
+      createdAt: Date.now(),
+    };
+    await nativeFs.unlink(lockPath);
+    await nativeFs.writeFile(lockPath, JSON.stringify(replacement), 'utf8');
+    unblockRead();
+    await saving;
+    readSpy.mockRestore();
+
+    expect(await fs.readJson(lockPath)).toEqual(replacement);
+    await nativeFs.unlink(lockPath);
   });
 });
