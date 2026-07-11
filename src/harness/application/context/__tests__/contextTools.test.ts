@@ -1,4 +1,5 @@
 import * as fs from 'fs-extra';
+import { promises as nativeFs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -78,10 +79,6 @@ describe('contextTools sensors scaffolding', () => {
 
   it('performs one discovery per operation and reuses fingerprint reads across operations', async () => {
     const repositoryDiscovery = jest.spyOn(FileMapper.prototype, 'mapRepository');
-    const fingerprintDiscovery = jest.spyOn(
-      SemanticSnapshotService.prototype as any,
-      'discoverFingerprintFiles'
-    );
 
     const first = await initializeContextTool.execute!(
       {
@@ -109,13 +106,38 @@ describe('contextTools sensors scaffolding', () => {
     const firstFingerprint = first._metadata.analysis.metrics.fingerprint;
     const secondFingerprint = second._metadata.analysis.metrics.fingerprint;
     expect(repositoryDiscovery).toHaveBeenCalledTimes(2);
-    expect(fingerprintDiscovery).not.toHaveBeenCalled();
     expect(firstFingerprint.discoveries).toBe(0);
     expect(firstFingerprint.contentReads).toBe(firstFingerprint.files);
     expect(secondFingerprint.discoveries).toBe(0);
     expect(secondFingerprint.contentReads).toBe(0);
     expect(secondFingerprint.bytesRead).toBe(0);
     expect(secondFingerprint.cacheHits).toBe(secondFingerprint.files);
+  });
+
+  it('propagates discovery skips and partial state without reading oversized source files', async () => {
+    const hugePath = path.join(tempDir, 'src', 'huge.ts');
+    const handle = await nativeFs.open(hugePath, 'w');
+    await handle.truncate(3 * 1024 * 1024);
+    await handle.close();
+
+    const result = await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'agents',
+        semantic: true,
+        generateQA: false,
+        generateSkills: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    ) as Record<string, any>;
+
+    expect(result._metadata.analysis.partial).toBe(true);
+    expect(result._metadata.analysis.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: hugePath, reason: 'file-too-large' }),
+    ]));
+    expect(result._metadata.analysis.metrics.fingerprint.bytesRead)
+      .toBeLessThan(3 * 1024 * 1024);
   });
 
   it('includes bootstrap sensors.json in pending writes and listToFill', async () => {

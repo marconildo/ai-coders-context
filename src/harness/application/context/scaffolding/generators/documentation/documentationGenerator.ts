@@ -109,7 +109,7 @@ export class DocumentationGenerator {
         snapshotFingerprint = await snapshotService!.captureRepoFingerprint(repoStructure.rootPath);
         const bundle = await this.analyzer.analyzeBundle(
           repoStructure.rootPath,
-          repoStructure.files.map((file) => file.path)
+          repoStructure.files
         );
         semantics = bundle.context;
         functionalPatterns = bundle.functionalPatterns;

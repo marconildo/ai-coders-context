@@ -1,4 +1,5 @@
 import * as fs from 'fs-extra';
+import { promises as nativeFs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -31,6 +32,7 @@ describe('SemanticSnapshotService', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await fs.remove(tempDir);
   });
 
@@ -200,6 +202,59 @@ describe('SemanticSnapshotService', () => {
     expect(repeated.contentReads).toBe(repeated.files);
     expect(repeated.cacheHits).toBe(0);
     expect(cache.size).toBe(0);
+  });
+
+  it('stats but never opens an oversized sparse source file', async () => {
+    const hugePath = path.join(repoPath, 'src', 'huge.ts');
+    const handle = await nativeFs.open(hugePath, 'w');
+    await handle.truncate(3 * 1024 * 1024);
+    await handle.close();
+    const discovery = await new FileMapper().mapRepository(repoPath);
+    expect(discovery.files.some((file) => file.path === hugePath)).toBe(false);
+    expect(discovery.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: hugePath, reason: 'file-too-large' }),
+    ]));
+
+    // Defense in depth: even a caller-provided discovery containing the huge
+    // record is checked before the content stream is opened.
+    const stats = await fs.stat(hugePath);
+    discovery.files.push({
+      path: hugePath,
+      relativePath: 'src/huge.ts',
+      extension: '.ts',
+      size: stats.size,
+      type: 'file',
+    });
+    const open = jest.spyOn(nativeFs, 'open');
+    const result = await new SemanticSnapshotService()
+      .captureRepoFingerprintWithMetrics(repoPath, discovery);
+
+    expect(open.mock.calls.some(([file]) => file === hugePath)).toBe(false);
+    expect(result.partial).toBe(true);
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: hugePath, reason: 'file-too-large' }),
+    ]));
+  });
+
+  it('stops fingerprint content reads at the aggregate byte budget', async () => {
+    await fs.remove(path.join(repoPath, 'package.json'));
+    await fs.remove(path.join(repoPath, 'src', 'auth.ts'));
+    await fs.writeFile(path.join(repoPath, 'src', 'a.ts'), '123456');
+    await fs.writeFile(path.join(repoPath, 'src', 'b.ts'), '123456');
+    await fs.remove(path.join(repoPath, 'src', 'index.ts'));
+    const discovery = await new FileMapper().mapRepository(repoPath);
+    const result = await new SemanticSnapshotService(
+      true,
+      new SemanticFingerprintCache(),
+      { maxTotalBytes: 10, maxFileBytes: 100 }
+    ).captureRepoFingerprintWithMetrics(repoPath, discovery);
+
+    expect(result.contentReads).toBe(1);
+    expect(result.bytesRead).toBe(6);
+    expect(result.partial).toBe(true);
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reason: 'total-byte-limit' }),
+    ]));
   });
 
   it('bounds shared cache entries, expires them, and supports explicit disposal', () => {

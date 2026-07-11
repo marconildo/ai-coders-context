@@ -16,6 +16,26 @@ export interface TopLevelDirectoryStats {
   totalSize: number;
 }
 
+export type RepoDiscoverySkipReason =
+  | 'file-limit'
+  | 'total-byte-limit'
+  | 'file-too-large'
+  | 'stat-failed';
+
+export interface RepoDiscoverySkip {
+  file: string;
+  reason: RepoDiscoverySkipReason;
+  size?: number;
+  mtimeMs?: number;
+  ctimeMs?: number;
+}
+
+export interface RepoDiscoveryMetrics {
+  entriesVisited: number;
+  statCalls: number;
+  stoppedEarly: boolean;
+}
+
 export interface RepoStructure {
   rootPath: string;
   files: FileInfo[];
@@ -23,6 +43,9 @@ export interface RepoStructure {
   totalFiles: number;
   totalSize: number;
   topLevelDirectoryStats: TopLevelDirectoryStats[];
+  partial?: boolean;
+  skipped?: RepoDiscoverySkip[];
+  discoveryMetrics?: RepoDiscoveryMetrics;
 }
 
 export type AIProvider = 'openrouter' | 'openai' | 'anthropic' | 'google';

@@ -5,9 +5,10 @@
  * for deeper semantic understanding.
  */
 
-import { glob } from 'glob';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import type { FileInfo } from '../../../../types';
+import { FileMapper } from '../../../../utils/fileMapper';
 import { TreeSitterLayer } from './treeSitter/treeSitterLayer';
 import { LSPLayer } from './lsp/lspLayer';
 import {
@@ -88,6 +89,8 @@ export interface SemanticAnalysisBundle {
   metrics: AnalysisMetrics;
 }
 
+type DiscoveredAnalysisFile = string | Pick<FileInfo, 'path' | 'size'>;
+
 export class CodebaseAnalyzer {
   private treeSitter: TreeSitterLayer;
   private lspLayer?: LSPLayer;
@@ -111,7 +114,10 @@ export class CodebaseAnalyzer {
     return (await this.analyzeProject(projectPath)).context;
   }
 
-  async analyzeBundle(projectPath: string, discoveredFiles?: string[]): Promise<SemanticAnalysisBundle> {
+  async analyzeBundle(
+    projectPath: string,
+    discoveredFiles?: DiscoveredAnalysisFile[]
+  ): Promise<SemanticAnalysisBundle> {
     const result = await this.analyzeProject(projectPath, discoveredFiles);
     const functionalStartedAt = Date.now();
     const functionalPatterns = this.detectFunctionalPatternsFromAnalyses(
@@ -131,7 +137,7 @@ export class CodebaseAnalyzer {
     };
   }
 
-  private async analyzeProject(projectPath: string, discoveredFiles?: string[]): Promise<{
+  private async analyzeProject(projectPath: string, discoveredFiles?: DiscoveredAnalysisFile[]): Promise<{
     context: SemanticContext;
     files: string[];
     fileAnalyses: Map<string, FileAnalysis>;
@@ -160,11 +166,15 @@ export class CodebaseAnalyzer {
 
     // 1. Select source files once, applying byte and count budgets before parsing.
     const discoveryStartedAt = Date.now();
-    const candidates = discoveredFiles
-      ? this.filterCodeFiles(projectPath, discoveredFiles)
+    const discovery = discoveredFiles
+      ? { files: this.filterCodeFiles(projectPath, discoveredFiles), skipped: [] }
       : await this.findCodeFiles(projectPath);
+    const candidates = discovery.files;
     metrics.filesDiscovered = candidates.length;
-    const { files, skipped, bytes } = await this.selectFilesWithinLimits(candidates);
+    const selected = await this.selectFilesWithinLimits(candidates);
+    const files = selected.files;
+    const skipped = [...discovery.skipped, ...selected.skipped];
+    const bytes = selected.bytes;
     metrics.bytesRead = bytes;
     metrics.durationsMs.discovery = Date.now() - discoveryStartedAt;
 
@@ -217,57 +227,57 @@ export class CodebaseAnalyzer {
     };
   }
 
-  private async findCodeFiles(projectPath: string): Promise<string[]> {
-    const enabledLanguages = new Set(this.options.languages);
-    const extensions = Object.entries(LANGUAGE_EXTENSIONS)
-      .filter(([, language]) => enabledLanguages.has(language))
-      .map(([extension]) => extension);
-    if (extensions.length === 0) {
-      return [];
-    }
-    const pattern = `**/*{${extensions.join(',')}}`;
-
-    const ignorePatterns = this.options.exclude.map((p) => `**/${p}/**`);
-
-    let allFiles: string[] = [];
+  private async findCodeFiles(projectPath: string): Promise<{
+    files: Array<{ path: string; size?: number }>;
+    skipped: SkippedAnalysisFile[];
+  }> {
     try {
-      allFiles = await glob(pattern, {
-        cwd: projectPath,
-        ignore: ignorePatterns,
-        absolute: true,
-        nodir: true,
-      });
+      const structure = await new FileMapper(this.options.exclude, {
+        maxFiles: this.options.maxFiles,
+        maxTotalBytes: this.options.maxTotalBytes,
+        maxFileBytes: this.options.maxFileBytes,
+      }).mapRepository(projectPath);
+      return {
+        files: this.filterCodeFiles(projectPath, structure.files),
+        skipped: (structure.skipped ?? []).map((skip) => ({
+          file: skip.file,
+          reason: skip.reason,
+          size: skip.size,
+        })),
+      };
     } catch {
-      // A repository that cannot be enumerated produces an empty, valid bundle.
+      return { files: [], skipped: [] };
     }
-
-    // Apply include filter if specified
-    let filteredFiles = [...new Set(allFiles)].sort();
-    if (this.options.include.length > 0) {
-      filteredFiles = filteredFiles.filter((file) =>
-        this.options.include.some((pattern) => file.includes(pattern))
-      );
-    }
-
-    return filteredFiles;
   }
 
-  private filterCodeFiles(projectPath: string, discoveredFiles: string[]): string[] {
+  private filterCodeFiles(
+    projectPath: string,
+    discoveredFiles: DiscoveredAnalysisFile[]
+  ): Array<{ path: string; size?: number }> {
     const supported = new Set(Object.keys(LANGUAGE_EXTENSIONS));
-    return [...new Set(discoveredFiles.map((file) =>
-      path.isAbsolute(file) ? file : path.resolve(projectPath, file)
-    ))]
+    const unique = new Map<string, { path: string; size?: number }>();
+    for (const discovered of discoveredFiles) {
+      const file = typeof discovered === 'string' ? discovered : discovered.path;
+      const absolutePath = path.isAbsolute(file) ? file : path.resolve(projectPath, file);
+      unique.set(absolutePath, {
+        path: absolutePath,
+        size: typeof discovered === 'string' ? undefined : discovered.size,
+      });
+    }
+    return [...unique.values()]
       .filter((file) => {
-        const extension = path.extname(file).toLowerCase();
+        const extension = path.extname(file.path).toLowerCase();
         return supported.has(extension) &&
           this.options.languages.includes(LANGUAGE_EXTENSIONS[extension]);
       })
       .filter((file) => this.options.include.length === 0 ||
-        this.options.include.some((pattern) => file.includes(pattern)))
-      .sort();
+        this.options.include.some((pattern) => file.path.includes(pattern)))
+      .sort((left, right) => left.path.localeCompare(right.path));
   }
 
-  private async selectFilesWithinLimits(files: string[]): Promise<{
+  private async selectFilesWithinLimits(
+    candidates: Array<{ path: string; size?: number }>
+  ): Promise<{
     files: string[];
     skipped: SkippedAnalysisFile[];
     bytes: number;
@@ -276,13 +286,16 @@ export class CodebaseAnalyzer {
     const skipped: SkippedAnalysisFile[] = [];
     let bytes = 0;
 
-    for (const file of files) {
-      let size: number;
-      try {
-        size = (await fs.stat(file)).size;
-      } catch {
-        skipped.push({ file, reason: 'stat-failed' });
-        continue;
+    for (const candidate of candidates) {
+      const file = candidate.path;
+      let size = candidate.size;
+      if (size === undefined) {
+        try {
+          size = (await fs.stat(file)).size;
+        } catch {
+          skipped.push({ file, reason: 'stat-failed' });
+          continue;
+        }
       }
 
       if (size > this.options.maxFileBytes) {

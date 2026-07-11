@@ -1,16 +1,19 @@
 import { createHash } from 'crypto';
 import { promises as nativeFs } from 'fs';
 import * as fs from 'fs-extra';
-import { glob } from 'glob';
 import * as path from 'path';
 
-import { RepoStructure } from '../../../../types';
+import { RepoStructure, type RepoDiscoverySkip } from '../../../../types';
 import { CodebaseMapGenerator } from '../../../application/context/scaffolding/generators/documentation/codebaseMapGenerator';
 import type {
   CodebaseMap,
   SemanticSnapshotMetadata,
 } from '../../../application/context/scaffolding/generators/documentation/codebaseMapGenerator';
-import { FileMapper } from '../../../../utils/fileMapper';
+import {
+  DEFAULT_FILE_MAPPING_LIMITS,
+  FileMapper,
+  type FileMappingLimits,
+} from '../../../../utils/fileMapper';
 import { CodebaseAnalyzer } from './codebaseAnalyzer';
 import type { AnalyzerOptions, DetectedFunctionalPatterns, SemanticContext } from './types';
 import { StackDetector } from '../../../application/context/intelligence/stack/stackDetector';
@@ -115,57 +118,6 @@ const SECTION_FILENAMES: Record<SnapshotFileSection, string> = {
 
 const LEGACY_CODEBASE_MAP_PATH = path.join('docs', 'codebase-map.json');
 
-const FINGERPRINT_IGNORE_PATTERNS = [
-  'node_modules/**',
-  '.git/**',
-  'dist/**',
-  'build/**',
-  'coverage/**',
-  '.context/**',
-  'vendor/**',
-  '__pycache__/**',
-];
-
-const FINGERPRINT_ROOT_FILES = new Set([
-  'package.json',
-  'package-lock.json',
-  'pnpm-lock.yaml',
-  'yarn.lock',
-  'bun.lockb',
-  'tsconfig.json',
-  'tsconfig.build.json',
-  'jest.config.js',
-  'jest.config.ts',
-  'vitest.config.ts',
-  'vite.config.ts',
-  'webpack.config.js',
-  'next.config.js',
-  'next.config.ts',
-  'nest-cli.json',
-  '.eslintrc',
-  '.eslintrc.js',
-  '.eslintrc.json',
-  '.prettierrc',
-  '.prettierrc.json',
-  '.nvmrc',
-  '.node-version',
-]);
-
-const FINGERPRINT_CODE_EXTENSIONS = new Set([
-  '.ts',
-  '.tsx',
-  '.js',
-  '.jsx',
-  '.mjs',
-  '.cjs',
-  '.py',
-  '.go',
-  '.json',
-  '.yaml',
-  '.yml',
-  '.toml',
-]);
-
 interface FingerprintCacheEntry {
   metadata: string;
   contentHash: string;
@@ -244,6 +196,8 @@ export interface RepoFingerprintResult {
   contentReads: number;
   cacheHits: number;
   discoveries: number;
+  partial: boolean;
+  skipped: RepoDiscoverySkip[];
   durationMs: number;
 }
 
@@ -264,8 +218,32 @@ export class SemanticSnapshotService {
 
   constructor(
     private readonly cacheEnabled = true,
-    private readonly fingerprintCache = new SemanticFingerprintCache()
-  ) {}
+    private readonly fingerprintCache = new SemanticFingerprintCache(),
+    fingerprintLimits: Partial<FileMappingLimits> = {}
+  ) {
+    this.fingerprintLimits = {
+      maxFiles: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxFiles,
+        Math.max(0, Math.floor(fingerprintLimits.maxFiles ?? DEFAULT_FILE_MAPPING_LIMITS.maxFiles))
+      ),
+      maxTotalBytes: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxTotalBytes,
+        Math.max(
+          0,
+          Math.floor(fingerprintLimits.maxTotalBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxTotalBytes)
+        )
+      ),
+      maxFileBytes: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxFileBytes,
+        Math.max(
+          0,
+          Math.floor(fingerprintLimits.maxFileBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxFileBytes)
+        )
+      ),
+    };
+  }
+
+  private readonly fingerprintLimits: FileMappingLimits;
 
   async captureRepoFingerprint(repoPath: string, discovery?: RepoStructure): Promise<string> {
     return (await this.computeRepoFingerprint(repoPath, discovery)).fingerprint;
@@ -431,7 +409,10 @@ export class SemanticSnapshotService {
           repoFingerprint,
         });
         const generationMs = Date.now() - generationStartedAt;
-        const currentFingerprint = (await this.computeRepoFingerprint(repoPath, repoStructure)).fingerprint;
+        const verificationStructure = await fileMapper.mapRepository(repoPath);
+        const currentFingerprint = (
+          await this.computeRepoFingerprint(repoPath, verificationStructure)
+        ).fingerprint;
 
         if (currentFingerprint !== repoFingerprint) {
           continue;
@@ -541,7 +522,7 @@ export class SemanticSnapshotService {
         analyzer = new CodebaseAnalyzer(options.analyzerOptions);
         const bundle = await analyzer.analyzeBundle(
           repoStructure.rootPath,
-          repoStructure.files.map((file) => file.path)
+          repoStructure.files
         );
         semantics ??= bundle.context;
         functionalPatterns ??= bundle.functionalPatterns;
@@ -847,27 +828,61 @@ export class SemanticSnapshotService {
     discovery?: RepoStructure
   ): Promise<RepoFingerprintResult> {
     const startedAt = Date.now();
-    const files = discovery
-      ? discovery.files.map((file) => file.relativePath)
-      : await this.discoverFingerprintFiles(repoPath);
+    const boundedDiscovery = discovery ?? await new FileMapper([], this.fingerprintLimits)
+      .mapRepository(repoPath);
     const discoveries = discovery ? 0 : 1;
-    const relevantFiles = [...new Set(files.map((file) => file.split(path.sep).join('/')))]
-      .filter((filePath) => this.isFingerprintRelevant(filePath))
-      .sort();
-    const relevantDirectories = this.fingerprintDirectoriesForFiles(relevantFiles);
-
+    const relevantFiles = [...boundedDiscovery.files]
+      .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    const skipped = [...(boundedDiscovery.skipped ?? [])];
+    let partial = !!boundedDiscovery.partial;
     const hash = createHash('sha256');
     let bytesRead = 0;
     let contentReads = 0;
     let cacheHits = 0;
+    let filesHashed = 0;
+    let selectedBytes = 0;
     const liveCacheKeys = new Set<string>();
     const repoPrefix = `${path.resolve(repoPath).toLowerCase()}\0`;
-    for (const relativePath of relevantFiles) {
-      const absolutePath = path.join(repoPath, relativePath);
+    for (const discoveredFile of relevantFiles) {
+      const relativePath = discoveredFile.relativePath.split(path.sep).join('/');
+      if (filesHashed >= this.fingerprintLimits.maxFiles) {
+        partial = true;
+        this.recordFingerprintSkip(skipped, {
+          file: discoveredFile.path,
+          reason: 'file-limit',
+          size: discoveredFile.size,
+        });
+        break;
+      }
+      const absolutePath = discoveredFile.path;
       const cacheKey = `${repoPrefix}${relativePath}`;
-      liveCacheKeys.add(cacheKey);
       try {
         const stats = await nativeFs.stat(absolutePath, { bigint: true });
+        const size = Number(stats.size);
+        if (stats.size > BigInt(this.fingerprintLimits.maxFileBytes)) {
+          partial = true;
+          this.recordFingerprintSkip(skipped, {
+            file: absolutePath,
+            reason: 'file-too-large',
+            size,
+            mtimeMs: Number(stats.mtimeNs) / 1_000_000,
+            ctimeMs: Number(stats.ctimeNs) / 1_000_000,
+          });
+          hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0skipped:file-too-large\n`);
+          continue;
+        }
+        if (selectedBytes + size > this.fingerprintLimits.maxTotalBytes) {
+          partial = true;
+          this.recordFingerprintSkip(skipped, {
+            file: absolutePath,
+            reason: 'total-byte-limit',
+            size,
+          });
+          hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0skipped:total-byte-limit\n`);
+          break;
+        }
+
+        liveCacheKeys.add(cacheKey);
         const metadata = `${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
         let contentHash: string;
         const cachedHash = this.cacheEnabled
@@ -877,41 +892,42 @@ export class SemanticSnapshotService {
           contentHash = cachedHash;
           cacheHits += 1;
         } else {
-          const content = await fs.readFile(absolutePath);
-          bytesRead += content.byteLength;
+          const boundedHash = await this.hashFileContentBounded(
+            absolutePath,
+            Math.min(
+              this.fingerprintLimits.maxFileBytes,
+              this.fingerprintLimits.maxTotalBytes - selectedBytes
+            )
+          );
+          bytesRead += boundedHash.bytesRead;
           contentReads += 1;
-          contentHash = createHash('sha256').update(content).digest('hex');
+          if (boundedHash.exceeded) {
+            partial = true;
+            const reason = selectedBytes + boundedHash.bytesRead > this.fingerprintLimits.maxTotalBytes
+              ? 'total-byte-limit'
+              : 'file-too-large';
+            this.recordFingerprintSkip(skipped, { file: absolutePath, reason, size });
+            hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0skipped:${reason}\n`);
+            continue;
+          }
+          contentHash = boundedHash.contentHash!;
           if (this.cacheEnabled) {
             this.fingerprintCache.set(cacheKey, metadata, contentHash);
           }
         }
         hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0${contentHash}\n`);
+        filesHashed += 1;
+        selectedBytes += size;
       } catch {
         hash.update(`${relativePath}:missing\n`);
+        partial = true;
+        this.recordFingerprintSkip(skipped, { file: absolutePath, reason: 'stat-failed' });
       }
     }
 
-    // Directory metadata detects files created during stabilization without a
-    // second enumeration. A retry remaps the repository and includes them.
-    for (const relativePath of relevantDirectories) {
-      try {
-        const absoluteDirectory = relativePath === '.'
-          ? repoPath
-          : path.join(repoPath, relativePath);
-        const entriesHash = await this.hashRelevantDirectoryEntries(repoPath, relativePath);
-        if (relativePath === '.') {
-          // Root metadata also changes for ignored entries such as .context;
-          // its filtered entry signature is the stable relevant signal.
-          hash.update(`dir:.\0${entriesHash}\n`);
-        } else {
-          const stats = await nativeFs.stat(absoluteDirectory, { bigint: true });
-          hash.update(
-            `dir:${relativePath}\0${stats.size}\0${stats.mtimeNs}\0${stats.ctimeNs}\0${entriesHash}\n`
-          );
-        }
-      } catch {
-        hash.update(`dir:${relativePath}:missing\n`);
-      }
+    for (const skip of skipped) {
+      const relativePath = path.relative(repoPath, skip.file).split(path.sep).join('/');
+      hash.update(`discovery-skip:${relativePath}:${skip.reason}:${skip.size ?? 'unknown'}\n`);
     }
 
     // Git index identity is an additional signal only; dirty files are still
@@ -929,95 +945,49 @@ export class SemanticSnapshotService {
 
     return {
       fingerprint: hash.digest('hex'),
-      files: relevantFiles.length,
+      files: filesHashed,
       bytesRead,
       contentReads,
       cacheHits,
       discoveries,
+      partial,
+      skipped,
       durationMs: Date.now() - startedAt,
     };
   }
 
-  private async discoverFingerprintFiles(repoPath: string): Promise<string[]> {
-    const extensionPattern = `**/*.{${[...FINGERPRINT_CODE_EXTENSIONS]
-      .map((extension) => extension.slice(1))
-      .join(',')}}`;
-    return glob([
-      extensionPattern,
-      '{src,lib,bin,app,packages,scripts}/**/*',
-      ...FINGERPRINT_ROOT_FILES,
-      '.github/workflows/**/*.{yml,yaml}',
-    ], {
-      cwd: repoPath,
-      nodir: true,
-      dot: true,
-      ignore: FINGERPRINT_IGNORE_PATTERNS,
-    });
+  private recordFingerprintSkip(
+    skipped: RepoDiscoverySkip[],
+    skip: RepoDiscoverySkip
+  ): void {
+    if (skipped.length < 1_000) skipped.push(skip);
   }
 
-  private isFingerprintRelevant(relativePath: string): boolean {
-    if (FINGERPRINT_ROOT_FILES.has(relativePath)) {
-      return true;
-    }
-
-    const topLevel = relativePath.split('/')[0];
-    if (['src', 'lib', 'bin', 'app', 'packages', 'scripts'].includes(topLevel)) {
-      return true;
-    }
-
-    return FINGERPRINT_CODE_EXTENSIONS.has(path.extname(relativePath).toLowerCase());
-  }
-
-  private fingerprintDirectoriesForFiles(relevantFiles: string[]): string[] {
-    const directories = new Set<string>(['.']);
-    for (const file of relevantFiles) {
-      let directory = path.posix.dirname(file);
-      while (directory !== '.') {
-        directories.add(directory);
-        directory = path.posix.dirname(directory);
+  private async hashFileContentBounded(
+    filePath: string,
+    maxBytes: number
+  ): Promise<{ contentHash?: string; bytesRead: number; exceeded: boolean }> {
+    const handle = await nativeFs.open(filePath, 'r');
+    const contentHash = createHash('sha256');
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, maxBytes)));
+    let bytesRead = 0;
+    try {
+      while (bytesRead < maxBytes) {
+        const length = Math.min(chunk.length, maxBytes - bytesRead);
+        const read = await handle.read(chunk, 0, length, null);
+        if (read.bytesRead === 0) {
+          return { contentHash: contentHash.digest('hex'), bytesRead, exceeded: false };
+        }
+        contentHash.update(chunk.subarray(0, read.bytesRead));
+        bytesRead += read.bytesRead;
       }
+      const probe = Buffer.allocUnsafe(1);
+      const extra = await handle.read(probe, 0, 1, null);
+      if (extra.bytesRead > 0) return { bytesRead: bytesRead + 1, exceeded: true };
+      return { contentHash: contentHash.digest('hex'), bytesRead, exceeded: false };
+    } finally {
+      await handle.close();
     }
-    return [...directories].sort();
   }
 
-  private async hashRelevantDirectoryEntries(
-    repoPath: string,
-    relativeDirectory: string
-  ): Promise<string> {
-    const absoluteDirectory = relativeDirectory === '.'
-      ? repoPath
-      : path.join(repoPath, relativeDirectory);
-    const aggregate = Buffer.alloc(32);
-    let count = 0;
-    const directory = await nativeFs.opendir(absoluteDirectory);
-    for await (const entry of directory) {
-      const relativePath = relativeDirectory === '.'
-        ? entry.name
-        : path.posix.join(relativeDirectory, entry.name);
-      if (!this.isFingerprintDirectoryEntryRelevant(relativePath, entry.isDirectory())) continue;
-      const entryHash = createHash('sha256')
-        .update(`${entry.isDirectory() ? 'd' : 'f'}:${entry.name}`)
-        .digest();
-      for (let index = 0; index < aggregate.length; index += 1) {
-        aggregate[index] ^= entryHash[index];
-      }
-      count += 1;
-    }
-    return `${count}:${aggregate.toString('hex')}`;
-  }
-
-  private isFingerprintDirectoryEntryRelevant(
-    relativePath: string,
-    isDirectory: boolean
-  ): boolean {
-    const normalized = relativePath.split(path.sep).join('/');
-    const segments = normalized.split('/');
-    if (segments.some((segment) => [
-      'node_modules', '.git', 'dist', 'build', 'coverage', '.context',
-      'vendor', '__pycache__',
-    ].includes(segment))) return false;
-    if (!isDirectory) return this.isFingerprintRelevant(normalized);
-    if (segments.length > 1) return true;
-    return ['src', 'lib', 'bin', 'app', 'packages', 'scripts', '.github'].includes(segments[0]);
-  }
 }

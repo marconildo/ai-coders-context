@@ -439,7 +439,12 @@ export const getFileStructureTool = createInternalTool<
     const { rootPath, maxDepth = 3, includePatterns } = input;
     try {
       const mapper = new FileMapper([]);
-      const structure = await mapper.mapRepository(rootPath, includePatterns || undefined);
+      // This explicit structure-inspection surface requests all paths, while
+      // context initialization uses the bounded relevant defaults.
+      const structure = await mapper.mapRepository(
+        rootPath,
+        includePatterns?.length ? includePatterns : ['**/*']
+      );
 
       const filterByDepth = (relativePath: string): boolean => relativePath.split('/').length <= maxDepth;
 
@@ -678,7 +683,7 @@ export const initializeContextTool = createInternalTool<
           semanticFingerprint = fingerprintMetrics.fingerprint;
           semanticBundle = await analyzer.analyzeBundle(
             resolvedRepoPath,
-            repoStructure.files.map((file) => file.path)
+            repoStructure.files
           );
         } catch {
           semanticBundle = undefined;
@@ -698,6 +703,7 @@ export const initializeContextTool = createInternalTool<
       }
 
       if (semanticBundle && semanticFingerprint && fingerprintMetrics) {
+        const discoverySkipped = repoStructure.skipped ?? [];
         analysisBundle = {
           repoPath: resolvedRepoPath,
           discoveredFiles: semanticBundle.files,
@@ -707,8 +713,8 @@ export const initializeContextTool = createInternalTool<
           stackInfo: detectedStackInfo,
           repoFingerprint: semanticFingerprint,
           limits: semanticBundle.limits,
-          partial: semanticBundle.partial,
-          skipped: semanticBundle.skipped,
+          partial: !!repoStructure.partial || semanticBundle.partial,
+          skipped: [...discoverySkipped, ...semanticBundle.skipped],
           metrics: {
             ...semanticBundle.metrics,
             fingerprint: {

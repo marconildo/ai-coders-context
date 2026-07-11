@@ -60,20 +60,30 @@ jest.mock('../lsp/lspLayer', () => ({
 }));
 
 // Mock glob
-jest.mock('glob', () => ({
-  glob: jest.fn().mockImplementation(async (pattern: string, options: { cwd: string }) => {
+jest.mock('glob', () => {
+  const glob = jest.fn().mockImplementation(async (pattern: string, options: { cwd: string }) => {
     // Return mock files based on the pattern
-    if (pattern.includes('.ts')) {
+    if (String(pattern).includes('ts')) {
       return [
         path.join(options.cwd, 'src', 'services', 'userService.ts'),
         path.join(options.cwd, 'src', 'controllers', 'userController.ts'),
         path.join(options.cwd, 'src', 'models', 'user.ts'),
         path.join(options.cwd, 'src', 'utils', 'helper.ts'),
+        path.join(options.cwd, 'src', 'index.ts'),
+        path.join(options.cwd, 'src', 'main.ts'),
       ];
     }
     return [];
-  }),
-}));
+  });
+  const globStream = jest.fn((pattern: string, options: { cwd: string }) => {
+    const iterator = (async function* () {
+      for (const file of await glob(pattern, options)) yield file;
+    })() as any;
+    iterator.destroy = jest.fn();
+    return iterator;
+  });
+  return { glob, globStream };
+});
 
 function createTempOutput(prefix: string): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -333,7 +343,7 @@ describe('CodebaseAnalyzer', () => {
       // Override glob to return an entry point file
       const { glob } = require('glob');
       glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        if (pattern.includes('.ts')) {
+        if (String(pattern).includes('ts')) {
           return [
             path.join(options.cwd, 'src', 'index.ts'),
             path.join(options.cwd, 'src', 'main.ts'),
