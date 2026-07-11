@@ -60,9 +60,9 @@ File and code exploration — read files, list paths, search content, and extrac
 
 **Returns:** file contents, matched files, symbol analysis, search results, or a directory tree.
 
-The `list` action streams matches into bounded pages instead of materializing the entire glob. Pass the returned `page.nextCursor` unchanged to continue.
+The `list` action uses a bounded directory walker instead of materializing the entire glob. File, raw-entry, and directory ceilings apply even with `ignore: []`. Pass `page.nextCursor` unchanged when continuation is available; otherwise partial discovery includes `discoveryLimitReason` and `continuationUnavailableReason`.
 
-The `read` action rejects files above 1 MiB with `EXPLORE_FILE_TOO_LARGE` before opening the body. `search` walks directories and reads matching files incrementally under file, raw-entry, directory, per-file, and result-byte ceilings. Its `page` reports partial discovery and oversized-file skips; pass `page.nextCursor` unchanged to continue result pagination.
+The `read` action rejects files above 1 MiB with `EXPLORE_FILE_TOO_LARGE` before opening the body. `search` walks directories and reads matching files incrementally under file, raw-entry, directory, per-file, and result-byte ceilings. Caller regexes execute outside the MCP event loop under a hard CPU deadline; `EXPLORE_REGEX_TIMEOUT` reports a timed-out partial search. Its `page` reports partial discovery and oversized-file skips; pass `page.nextCursor` unchanged to continue result pagination.
 
 ### context
 

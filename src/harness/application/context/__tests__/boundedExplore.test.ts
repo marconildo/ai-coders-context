@@ -4,6 +4,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import {
+  listBoundedExploreFiles,
   readBoundedExploreFile,
   searchBoundedCode,
 } from '../boundedExplore';
@@ -103,6 +104,36 @@ describe('bounded explore I/O', () => {
     });
   });
 
+  it('bounds list traversal and reports unavailable continuation when ignore is explicitly empty', async () => {
+    for (let index = 0; index < 40; index += 1) {
+      await fsExtra.outputFile(
+        path.join(repo, 'node_modules', `package-${index}`, 'README.md'),
+        'irrelevant'
+      );
+    }
+
+    const result = await listBoundedExploreFiles({
+      cwd: repo,
+      pattern: '**/*.ts',
+      ignore: [],
+      limit: 10,
+    }, {
+      maxEntries: 12,
+      maxDirectories: 8,
+      maxFiles: 8,
+    });
+
+    expect(result.files).toEqual([]);
+    expect(result.page).toMatchObject({
+      partial: true,
+      recordsScanned: 12,
+      entriesScanned: 12,
+      discoveryLimitReason: 'entry-limit',
+      continuationAvailable: false,
+      continuationUnavailableReason: 'discovery-limit-reached',
+    });
+  });
+
   it('skips a huge matching file without whole-file reads', async () => {
     const file = path.join(repo, 'src', 'huge.ts');
     await fsExtra.ensureDir(path.dirname(file));
@@ -144,5 +175,40 @@ describe('bounded explore I/O', () => {
     expect((first.page as any).resultBytes).toBeLessThanOrEqual(1024);
     expect(first.page).toMatchObject({ hasMore: true, pageByteLimited: true });
     expect((second.matches as any[])[0].line).toBe((first.matches as any[]).length + 1);
+  });
+
+  it('terminates pathological regexes without blocking the main event loop', async () => {
+    await fsExtra.outputFile(
+      path.join(repo, 'src', 'pathological.ts'),
+      `${'a'.repeat(64)}!\n`
+    );
+    let eventLoopTicked = false;
+    const tick = new Promise<void>((resolve) => {
+      setTimeout(() => {
+        eventLoopTicked = true;
+        resolve();
+      }, 0);
+    });
+    const startedAt = Date.now();
+
+    const result = await searchBoundedCode({
+      cwd: repo,
+      pattern: '^(a+)+$',
+    }, {
+      regexTimeoutMs: 25,
+    });
+    await tick;
+
+    expect(eventLoopTicked).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    expect(result).toMatchObject({
+      success: false,
+      errorCode: 'EXPLORE_REGEX_TIMEOUT',
+      page: {
+        partial: true,
+        regexTimedOut: true,
+        regexTimeoutMs: 25,
+      },
+    });
   });
 });

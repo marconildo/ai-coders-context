@@ -32,4 +32,31 @@ loadDescribe('bounded explore load acceptance', () => {
       await fsExtra.remove(repo);
     }
   });
+
+  it('enforces the CPU deadline for catastrophic regex backtracking', async () => {
+    const repo = await fsExtra.mkdtemp(path.join(os.tmpdir(), 'bounded-regex-load-'));
+    try {
+      await fsExtra.outputFile(
+        path.join(repo, 'src', 'pathological.ts'),
+        `${'a'.repeat(128)}!\n`
+      );
+      const startedAt = Date.now();
+
+      const search = await searchBoundedCode({
+        cwd: repo,
+        pattern: '^(a+)+$',
+      }, {
+        regexTimeoutMs: 50,
+      });
+
+      expect(search).toMatchObject({
+        success: false,
+        errorCode: 'EXPLORE_REGEX_TIMEOUT',
+        page: { regexTimedOut: true, partial: true },
+      });
+      expect(Date.now() - startedAt).toBeLessThan(1_000);
+    } finally {
+      await fsExtra.remove(repo);
+    }
+  });
 });

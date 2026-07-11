@@ -36,9 +36,9 @@ The same UTF-8 budget applies to `context://`, `file://`, and `workflow://` reso
 
 The growing harness lists (`listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays`, and `listDatasets`) return bounded pages. Pass `limit` and the opaque `cursor` returned as `page.nextCursor` to continue; do not inspect or modify cursors. `replaySession.maxEvents` defaults to 100 and cannot exceed 1,000. An oversized page returns `MCP_PAGE_TOO_LARGE` with `suggestedLimit`, never truncated JSON.
 
-`explore` action `list` is also paginated: it defaults to 100 files, accepts at most 1,000, and returns an opaque `page.nextCursor` when more matches exist.
+`explore` action `list` is also paginated: it defaults to 100 files, accepts at most 1,000, and returns an opaque `page.nextCursor` when more matches exist. Directory, raw-entry, and matching-file ceilings still apply when `ignore: []`; `page.partial` and `page.discoveryLimitReason` report an incomplete traversal.
 
-`explore` action `read` rejects files above 1 MiB from metadata before opening their bodies. Action `search` streams a bounded directory walk and bounded files line-by-line, caps result bytes, reports discovery/file skips in `page`, and returns `page.nextCursor` when another result page is available.
+`explore` action `read` rejects files above 1 MiB from metadata before opening their bodies. Action `search` streams a bounded directory walk and bounded files line-by-line, caps result bytes, reports discovery/file skips in `page`, and returns `page.nextCursor` when another result page is available. Caller-controlled regular expressions run outside the MCP event loop with a hard per-line CPU deadline; a timeout returns `EXPLORE_REGEX_TIMEOUT` and partial metadata.
 
 ### Dedicated Workflow Tools (5)
 

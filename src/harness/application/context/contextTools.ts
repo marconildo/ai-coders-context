@@ -1,5 +1,5 @@
 import * as fs from 'fs-extra';
-import { glob, globIterate } from 'glob';
+import { glob } from 'glob';
 import * as path from 'path';
 import { TreeSitterLayer } from '../../adapters/out/semantic/treeSitter/treeSitterLayer';
 import { SemanticContextBuilder } from '../../adapters/out/semantic/contextBuilder';
@@ -30,13 +30,11 @@ import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
 import {
   boundedLimit,
-  decodeHistoryCursor,
-  encodeHistoryCursor,
-  queryBinding,
   RUNTIME_HISTORY_LIMITS,
   type RuntimeHistoryPage,
 } from '../history/runtimeHistory';
 import {
+  listBoundedExploreFiles,
   readBoundedExploreFile,
   searchBoundedCode,
 } from './boundedExplore';
@@ -378,53 +376,13 @@ export const listFilesTool = createInternalTool<
         RUNTIME_HISTORY_LIMITS.exploreFiles.maximum,
         'explore files'
       );
-      const binding = queryBinding({ pattern, cwd: resolvedCwd, ignore: resolvedIgnore });
-      const boundary = decodeHistoryCursor<{ offset: number }>(
-        input.cursor,
-        'explore-files',
-        binding
-      );
-      const offset = boundary?.offset ?? 0;
-      const files: string[] = [];
-      let matched = 0;
-      let recordsScanned = 0;
-      let hasMore = false;
-      const startedAt = Date.now();
-      for await (const file of globIterate(pattern, {
+      return await listBoundedExploreFiles({
+        pattern,
         cwd: resolvedCwd,
         ignore: resolvedIgnore,
-        absolute: false,
-        nodir: true,
-      })) {
-        recordsScanned += 1;
-        if (matched < offset) {
-          matched += 1;
-          continue;
-        }
-        if (files.length === limit) {
-          hasMore = true;
-          break;
-        }
-        files.push(file.split(path.sep).join('/'));
-        matched += 1;
-      }
-      return {
-        success: true,
-        files,
-        count: files.length,
-        pattern,
-        page: {
-          nextCursor: hasMore
-            ? encodeHistoryCursor('explore-files', binding, { offset: offset + files.length })
-            : undefined,
-          hasMore,
-          recordsReturned: files.length,
-          recordsScanned,
-          cursorVersion: 1,
-          partial: hasMore,
-          durationMs: Date.now() - startedAt,
-        },
-      };
+        limit,
+        cursor: input.cursor,
+      });
     } catch (error) {
       return {
         success: false,

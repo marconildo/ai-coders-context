@@ -60,9 +60,9 @@ Exploração de arquivos e código — ler arquivos, listar caminhos, buscar con
 
 **Retorna:** conteúdo de arquivos, arquivos correspondentes, análise de símbolos, resultados de busca ou uma árvore de diretórios.
 
-A action `list` transmite os matches em páginas limitadas, sem materializar todo o glob. Envie o `page.nextCursor` retornado, sem alterá-lo, para continuar.
+A action `list` usa um percurso limitado de diretórios, sem materializar todo o glob. Os limites de arquivos, entradas brutas e diretórios valem mesmo com `ignore: []`. Envie `page.nextCursor` sem alterações quando houver continuação; caso contrário, a descoberta parcial informa `discoveryLimitReason` e `continuationUnavailableReason`.
 
-A action `read` rejeita arquivos acima de 1 MiB com `EXPLORE_FILE_TOO_LARGE` antes de abrir o corpo. `search` percorre diretórios e lê arquivos correspondentes incrementalmente, com limites de arquivos, entradas brutas, diretórios, bytes por arquivo e bytes de resultado. Seu `page` informa descoberta parcial e arquivos ignorados por tamanho; envie `page.nextCursor` sem alterações para continuar.
+A action `read` rejeita arquivos acima de 1 MiB com `EXPLORE_FILE_TOO_LARGE` antes de abrir o corpo. `search` percorre diretórios e lê arquivos correspondentes incrementalmente, com limites de arquivos, entradas brutas, diretórios, bytes por arquivo e bytes de resultado. As regexes do cliente são executadas fora do event loop do MCP com prazo rígido de CPU; `EXPLORE_REGEX_TIMEOUT` informa uma busca parcial que excedeu o prazo. Seu `page` informa descoberta parcial e arquivos ignorados por tamanho; envie `page.nextCursor` sem alterações para continuar.
 
 ### context
 
