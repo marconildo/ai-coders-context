@@ -59,32 +59,6 @@ jest.mock('../lsp/lspLayer', () => ({
   })),
 }));
 
-// Mock glob
-jest.mock('glob', () => {
-  const glob = jest.fn().mockImplementation(async (pattern: string, options: { cwd: string }) => {
-    // Return mock files based on the pattern
-    if (String(pattern).includes('ts')) {
-      return [
-        path.join(options.cwd, 'src', 'services', 'userService.ts'),
-        path.join(options.cwd, 'src', 'controllers', 'userController.ts'),
-        path.join(options.cwd, 'src', 'models', 'user.ts'),
-        path.join(options.cwd, 'src', 'utils', 'helper.ts'),
-        path.join(options.cwd, 'src', 'index.ts'),
-        path.join(options.cwd, 'src', 'main.ts'),
-      ];
-    }
-    return [];
-  });
-  const globStream = jest.fn((pattern: string, options: { cwd: string }) => {
-    const iterator = (async function* () {
-      for (const file of await glob(pattern, options)) yield file;
-    })() as any;
-    iterator.destroy = jest.fn();
-    return iterator;
-  });
-  return { glob, globStream };
-});
-
 function createTempOutput(prefix: string): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
@@ -173,8 +147,22 @@ describe('CodebaseAnalyzer', () => {
         maxFiles: 5000,
         maxTotalBytes: 256 * 1024 * 1024,
         maxFileBytes: 2 * 1024 * 1024,
+        maxDirectoriesScanned: 10_000,
+        maxEntriesScanned: 100_000,
         concurrency: 16,
       });
+    });
+
+    it('absolute-clamps configurable repository scan limits', async () => {
+      const bundle = await new CodebaseAnalyzer({
+        maxDirectoriesScanned: Number.MAX_SAFE_INTEGER,
+        maxEntriesScanned: Number.MAX_SAFE_INTEGER,
+      }).analyzeBundle(tempDir);
+
+      expect(bundle.limits.maxDirectoriesScanned).toBe(50_000);
+      expect(bundle.limits.maxEntriesScanned).toBe(500_000);
+      expect(bundle.metrics.directoriesScanned).toBeGreaterThan(0);
+      expect(bundle.metrics.entriesScanned).toBeGreaterThan(0);
     });
 
     it('bounds a 3000-file-equivalent analysis and reports maximum in-flight work', async () => {
@@ -340,19 +328,6 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should find entry points based on file names', async () => {
-      // Override glob to return an entry point file
-      const { glob } = require('glob');
-      glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        if (String(pattern).includes('ts')) {
-          return [
-            path.join(options.cwd, 'src', 'index.ts'),
-            path.join(options.cwd, 'src', 'main.ts'),
-            path.join(options.cwd, 'src', 'services', 'userService.ts'),
-          ];
-        }
-        return [];
-      });
-
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
       const context = await analyzer.analyze(tempDir);
 
@@ -535,16 +510,10 @@ describe('CodebaseAnalyzer', () => {
 
   describe('options handling', () => {
     it('should respect maxFiles option', async () => {
-      const { glob } = require('glob');
-      const manyFiles = Array.from({ length: 100 }, (_, i) =>
-        path.join(tempDir, `file${i}.ts`)
-      );
-      glob.mockImplementationOnce(async () => manyFiles);
-
-      const analyzer = new CodebaseAnalyzer({ useLSP: false, maxFiles: 10 });
+      const analyzer = new CodebaseAnalyzer({ useLSP: false, maxFiles: 2 });
       const context = await analyzer.analyze(tempDir);
 
-      expect(context.stats.totalFiles).toBeLessThanOrEqual(10);
+      expect(context.stats.totalFiles).toBe(2);
     });
 
     it('should respect languages option', async () => {
@@ -572,25 +541,14 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should respect include patterns', async () => {
-      const { glob } = require('glob');
-      glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        return [
-          path.join(options.cwd, 'src', 'services', 'userService.ts'),
-          path.join(options.cwd, 'src', 'controllers', 'userController.ts'),
-          path.join(options.cwd, 'tests', 'testFile.ts'),
-        ];
-      });
-
       const analyzer = new CodebaseAnalyzer({
         useLSP: false,
-        include: ['src'],
+        include: ['services'],
       });
 
       const context = await analyzer.analyze(tempDir);
 
-      // Files should be filtered to only include 'src' paths
-      // Due to mock implementation, we check it doesn't error
-      expect(context).toBeDefined();
+      expect(context.stats.totalFiles).toBe(1);
     });
   });
 });

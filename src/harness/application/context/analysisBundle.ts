@@ -13,6 +13,8 @@ export const DEFAULT_ANALYSIS_LIMITS: AnalysisLimits = Object.freeze({
   maxFiles: 5_000,
   maxTotalBytes: 256 * 1024 * 1024,
   maxFileBytes: 2 * 1024 * 1024,
+  maxDirectoriesScanned: 10_000,
+  maxEntriesScanned: 100_000,
   concurrency: 16,
 });
 

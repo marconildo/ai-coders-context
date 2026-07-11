@@ -37,6 +37,8 @@ const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
   maxFiles: 5000,
   maxTotalBytes: 256 * 1024 * 1024,
   maxFileBytes: 2 * 1024 * 1024,
+  maxDirectoriesScanned: 10_000,
+  maxEntriesScanned: 100_000,
   concurrency: 16,
   cacheEnabled: true,
   maxSymbolsPerCategory: 50,

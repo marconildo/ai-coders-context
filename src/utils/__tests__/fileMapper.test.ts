@@ -2,19 +2,32 @@ import * as fs from 'fs-extra';
 import { promises as nativeFs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { globStream } from 'glob';
+
 import { FileMapper } from '../fileMapper';
 
-jest.mock('glob', () => ({ globStream: jest.fn() }));
+type FakeEntry = {
+  name: string;
+  isDirectory: () => boolean;
+  isFile: () => boolean;
+};
 
-const mockedGlobStream = globStream as jest.MockedFunction<typeof globStream>;
+function fakeEntry(name: string, type: 'file' | 'directory' = 'file'): FakeEntry {
+  return {
+    name,
+    isDirectory: () => type === 'directory',
+    isFile: () => type === 'file',
+  };
+}
 
-function entryStream(entries: string[]): AsyncIterable<string> & { destroy: jest.Mock } {
-  const iterator = (async function* () {
-    for (const entry of entries) yield entry;
-  })() as unknown as AsyncIterable<string> & { destroy: jest.Mock };
-  iterator.destroy = jest.fn();
-  return iterator;
+function fakeDirectory(entries: FakeEntry[]): {
+  read: jest.Mock;
+  close: jest.Mock;
+} {
+  let index = 0;
+  return {
+    read: jest.fn(async () => entries[index++] ?? null),
+    close: jest.fn(async () => undefined),
+  };
 }
 
 function mockFileStats(size: number): jest.Mock {
@@ -35,21 +48,22 @@ describe('FileMapper bounded discovery', () => {
 
   afterEach(async () => {
     jest.restoreAllMocks();
-    mockedGlobStream.mockReset();
     await fs.remove(repoPath);
   });
 
-  it('stops before statting or materializing entries beyond the file cap', async () => {
-    const stream = entryStream(
-      Array.from({ length: 5_100 }, (_, index) => `src/file-${index}.ts`)
+  it('stops before statting file candidates beyond the file cap', async () => {
+    const directory = fakeDirectory(
+      Array.from({ length: 5_100 }, (_, index) => fakeEntry(`file-${index}.ts`))
     );
-    mockedGlobStream.mockReturnValue(stream as any);
+    jest.spyOn(nativeFs, 'opendir').mockResolvedValue(directory as any);
     const stat = mockFileStats(1);
 
     const result = await new FileMapper().mapRepository(repoPath);
 
     expect(result.files).toHaveLength(5_000);
     expect(result.discoveryMetrics).toEqual({
+      entriesScanned: 5_001,
+      directoriesScanned: 1,
       entriesVisited: 5_001,
       statCalls: 5_000,
       stoppedEarly: true,
@@ -58,12 +72,15 @@ describe('FileMapper bounded discovery', () => {
     expect(result.skipped).toEqual(expect.arrayContaining([
       expect.objectContaining({ reason: 'file-limit' }),
     ]));
-    expect(stream.destroy).toHaveBeenCalled();
   });
 
   it('stops metadata work as soon as the aggregate byte budget is reached', async () => {
-    const stream = entryStream(['src/a.ts', 'src/b.ts', 'src/c.ts']);
-    mockedGlobStream.mockReturnValue(stream as any);
+    const directory = fakeDirectory([
+      fakeEntry('a.ts'),
+      fakeEntry('b.ts'),
+      fakeEntry('c.ts'),
+    ]);
+    jest.spyOn(nativeFs, 'opendir').mockResolvedValue(directory as any);
     const stat = mockFileStats(6);
 
     const result = await new FileMapper([], {
@@ -72,25 +89,101 @@ describe('FileMapper bounded discovery', () => {
       maxTotalBytes: 10,
     }).mapRepository(repoPath);
 
-    expect(result.files.map((file) => file.relativePath)).toEqual(['src/a.ts']);
+    expect(result.files.map((file) => file.relativePath)).toEqual(['a.ts']);
     expect(stat).toHaveBeenCalledTimes(2);
     expect(result.discoveryMetrics?.stoppedEarly).toBe(true);
     expect(result.skipped).toEqual(expect.arrayContaining([
-      expect.objectContaining({ file: path.join(repoPath, 'src/b.ts'), reason: 'total-byte-limit' }),
+      expect.objectContaining({ file: path.join(repoPath, 'b.ts'), reason: 'total-byte-limit' }),
     ]));
   });
 
-  it('uses targeted defaults and never stats irrelevant emitted paths', async () => {
-    const stream = entryStream(['assets/movie.bin', 'src/index.ts']);
-    mockedGlobStream.mockReturnValue(stream as any);
+  it('uses targeted defaults and never stats irrelevant paths', async () => {
+    const root = fakeDirectory([
+      fakeEntry('movie.bin'),
+      fakeEntry('src', 'directory'),
+    ]);
+    const src = fakeDirectory([
+      fakeEntry('asset.bin'),
+      fakeEntry('index.ts'),
+    ]);
+    jest.spyOn(nativeFs, 'opendir').mockImplementation(async (directoryPath) => {
+      return (path.basename(String(directoryPath)) === 'src' ? src : root) as any;
+    });
     const stat = mockFileStats(1);
 
     const result = await new FileMapper().mapRepository(repoPath);
 
-    const patterns = mockedGlobStream.mock.calls[0][0] as string[];
-    expect(patterns).not.toContain('**/*');
     expect(result.files.map((file) => file.relativePath)).toEqual(['src/index.ts']);
+    expect(result.discoveryMetrics).toEqual({
+      entriesScanned: 4,
+      directoriesScanned: 2,
+      entriesVisited: 1,
+      statCalls: 1,
+      stoppedEarly: false,
+    });
     expect(stat).toHaveBeenCalledTimes(1);
-    expect(stat).not.toHaveBeenCalledWith(path.join(repoPath, 'assets/movie.bin'));
+    expect(stat).not.toHaveBeenCalledWith(path.join(repoPath, 'movie.bin'));
+    expect(stat).not.toHaveBeenCalledWith(path.join(repoPath, 'src', 'asset.bin'));
+  });
+
+  it('caps raw scans inside one huge directory of irrelevant entries', async () => {
+    const root = fakeDirectory([fakeEntry('src', 'directory')]);
+    const src = fakeDirectory(
+      Array.from({ length: 100 }, (_, index) => fakeEntry(`asset-${index}.bin`))
+    );
+    jest.spyOn(nativeFs, 'opendir').mockImplementation(async (directoryPath) => {
+      return (path.basename(String(directoryPath)) === 'src' ? src : root) as any;
+    });
+    const stat = jest.spyOn(nativeFs, 'stat');
+
+    const result = await new FileMapper([], {
+      maxEntriesScanned: 10,
+      maxDirectoriesScanned: 10,
+    }).mapRepository(repoPath);
+
+    expect(result.files).toEqual([]);
+    expect(result.partial).toBe(true);
+    expect(result.discoveryMetrics).toEqual({
+      entriesScanned: 10,
+      directoriesScanned: 2,
+      entriesVisited: 0,
+      statCalls: 0,
+      stoppedEarly: true,
+    });
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reason: 'entry-limit' }),
+    ]));
+    expect(src.read).toHaveBeenCalledTimes(9);
+    expect(stat).not.toHaveBeenCalled();
+  });
+
+  it('caps traversal of a deep irrelevant directory tree', async () => {
+    const opened: string[] = [];
+    jest.spyOn(nativeFs, 'opendir').mockImplementation(async (directoryPath) => {
+      const normalized = path.relative(repoPath, String(directoryPath)).split(path.sep).join('/');
+      opened.push(normalized || '.');
+      const name = normalized ? `level-${normalized.split('/').length}` : 'src';
+      return fakeDirectory([fakeEntry(name, 'directory')]) as any;
+    });
+    const stat = jest.spyOn(nativeFs, 'stat');
+
+    const result = await new FileMapper([], {
+      maxDirectoriesScanned: 3,
+      maxEntriesScanned: 100,
+    }).mapRepository(repoPath);
+
+    expect(opened).toEqual(['.', 'src', 'src/level-1']);
+    expect(result.partial).toBe(true);
+    expect(result.discoveryMetrics).toEqual({
+      entriesScanned: 3,
+      directoriesScanned: 3,
+      entriesVisited: 0,
+      statCalls: 0,
+      stoppedEarly: true,
+    });
+    expect(result.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ reason: 'directory-limit' }),
+    ]));
+    expect(stat).not.toHaveBeenCalled();
   });
 });

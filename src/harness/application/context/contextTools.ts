@@ -683,7 +683,7 @@ export const initializeContextTool = createInternalTool<
           semanticFingerprint = fingerprintMetrics.fingerprint;
           semanticBundle = await analyzer.analyzeBundle(
             resolvedRepoPath,
-            repoStructure.files
+            repoStructure
           );
         } catch {
           semanticBundle = undefined;
@@ -703,7 +703,6 @@ export const initializeContextTool = createInternalTool<
       }
 
       if (semanticBundle && semanticFingerprint && fingerprintMetrics) {
-        const discoverySkipped = repoStructure.skipped ?? [];
         analysisBundle = {
           repoPath: resolvedRepoPath,
           discoveredFiles: semanticBundle.files,
@@ -713,8 +712,8 @@ export const initializeContextTool = createInternalTool<
           stackInfo: detectedStackInfo,
           repoFingerprint: semanticFingerprint,
           limits: semanticBundle.limits,
-          partial: !!repoStructure.partial || semanticBundle.partial,
-          skipped: [...discoverySkipped, ...semanticBundle.skipped],
+          partial: semanticBundle.partial,
+          skipped: semanticBundle.skipped,
           metrics: {
             ...semanticBundle.metrics,
             fingerprint: {

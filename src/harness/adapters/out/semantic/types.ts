@@ -196,6 +196,10 @@ export interface AnalyzerOptions {
   maxFileBytes?: number;
   /** Maximum number of file analyses running concurrently. */
   concurrency?: number;
+  /** Maximum directories opened while discovering repository files. */
+  maxDirectoriesScanned?: number;
+  /** Maximum raw directory entries inspected during discovery. */
+  maxEntriesScanned?: number;
   cacheEnabled?: boolean;
 }
 

@@ -7,8 +7,11 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
-import type { FileInfo } from '../../../../types';
-import { FileMapper } from '../../../../utils/fileMapper';
+import type { FileInfo, RepoDiscoveryMetrics, RepoStructure } from '../../../../types';
+import {
+  ABSOLUTE_FILE_MAPPING_SCAN_LIMITS,
+  FileMapper,
+} from '../../../../utils/fileMapper';
 import { TreeSitterLayer } from './treeSitter/treeSitterLayer';
 import { LSPLayer } from './lsp/lspLayer';
 import {
@@ -38,6 +41,8 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   maxFiles: 5000,
   maxTotalBytes: 256 * 1024 * 1024,
   maxFileBytes: 2 * 1024 * 1024,
+  maxDirectoriesScanned: 10_000,
+  maxEntriesScanned: 100_000,
   concurrency: 16,
   cacheEnabled: true,
 };
@@ -46,6 +51,8 @@ export interface AnalysisLimits {
   maxFiles: number;
   maxTotalBytes: number;
   maxFileBytes: number;
+  maxDirectoriesScanned: number;
+  maxEntriesScanned: number;
   concurrency: number;
 }
 
@@ -53,6 +60,8 @@ export type AnalysisSkipReason =
   | 'file-limit'
   | 'total-byte-limit'
   | 'file-too-large'
+  | 'directory-limit'
+  | 'entry-limit'
   | 'stat-failed';
 
 export interface SkippedAnalysisFile {
@@ -62,6 +71,8 @@ export interface SkippedAnalysisFile {
 }
 
 export interface AnalysisMetrics {
+  directoriesScanned: number;
+  entriesScanned: number;
   filesDiscovered: number;
   filesParsed: number;
   fileReads: number;
@@ -90,6 +101,7 @@ export interface SemanticAnalysisBundle {
 }
 
 type DiscoveredAnalysisFile = string | Pick<FileInfo, 'path' | 'size'>;
+type SemanticDiscoveryInput = DiscoveredAnalysisFile[] | RepoStructure;
 
 export class CodebaseAnalyzer {
   private treeSitter: TreeSitterLayer;
@@ -102,6 +114,14 @@ export class CodebaseAnalyzer {
     this.options.maxFiles = Math.max(0, this.options.maxFiles);
     this.options.maxTotalBytes = Math.max(0, this.options.maxTotalBytes);
     this.options.maxFileBytes = Math.max(0, this.options.maxFileBytes);
+    this.options.maxDirectoriesScanned = Math.min(
+      ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxDirectoriesScanned,
+      Math.max(0, Math.floor(this.options.maxDirectoriesScanned))
+    );
+    this.options.maxEntriesScanned = Math.min(
+      ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxEntriesScanned,
+      Math.max(0, Math.floor(this.options.maxEntriesScanned))
+    );
     this.options.concurrency = Math.max(1, this.options.concurrency);
 
     // Create LSPLayer if LSP mode is enabled
@@ -116,9 +136,9 @@ export class CodebaseAnalyzer {
 
   async analyzeBundle(
     projectPath: string,
-    discoveredFiles?: DiscoveredAnalysisFile[]
+    discoveryInput?: SemanticDiscoveryInput
   ): Promise<SemanticAnalysisBundle> {
-    const result = await this.analyzeProject(projectPath, discoveredFiles);
+    const result = await this.analyzeProject(projectPath, discoveryInput);
     const functionalStartedAt = Date.now();
     const functionalPatterns = this.detectFunctionalPatternsFromAnalyses(
       result.files,
@@ -137,7 +157,7 @@ export class CodebaseAnalyzer {
     };
   }
 
-  private async analyzeProject(projectPath: string, discoveredFiles?: DiscoveredAnalysisFile[]): Promise<{
+  private async analyzeProject(projectPath: string, discoveryInput?: SemanticDiscoveryInput): Promise<{
     context: SemanticContext;
     files: string[];
     fileAnalyses: Map<string, FileAnalysis>;
@@ -147,6 +167,8 @@ export class CodebaseAnalyzer {
   }> {
     const startTime = Date.now();
     const metrics: AnalysisMetrics = {
+      directoriesScanned: 0,
+      entriesScanned: 0,
       filesDiscovered: 0,
       filesParsed: 0,
       fileReads: 0,
@@ -166,10 +188,12 @@ export class CodebaseAnalyzer {
 
     // 1. Select source files once, applying byte and count budgets before parsing.
     const discoveryStartedAt = Date.now();
-    const discovery = discoveredFiles
-      ? { files: this.filterCodeFiles(projectPath, discoveredFiles), skipped: [] }
+    const discovery = discoveryInput
+      ? this.discoveryFromInput(projectPath, discoveryInput)
       : await this.findCodeFiles(projectPath);
     const candidates = discovery.files;
+    metrics.directoriesScanned = discovery.metrics?.directoriesScanned ?? 0;
+    metrics.entriesScanned = discovery.metrics?.entriesScanned ?? 0;
     metrics.filesDiscovered = candidates.length;
     const selected = await this.selectFilesWithinLimits(candidates);
     const files = selected.files;
@@ -223,6 +247,8 @@ export class CodebaseAnalyzer {
       maxFiles: this.options.maxFiles,
       maxTotalBytes: this.options.maxTotalBytes,
       maxFileBytes: this.options.maxFileBytes,
+      maxDirectoriesScanned: this.options.maxDirectoriesScanned,
+      maxEntriesScanned: this.options.maxEntriesScanned,
       concurrency: this.options.concurrency,
     };
   }
@@ -230,12 +256,15 @@ export class CodebaseAnalyzer {
   private async findCodeFiles(projectPath: string): Promise<{
     files: Array<{ path: string; size?: number }>;
     skipped: SkippedAnalysisFile[];
+    metrics?: RepoDiscoveryMetrics;
   }> {
     try {
       const structure = await new FileMapper(this.options.exclude, {
         maxFiles: this.options.maxFiles,
         maxTotalBytes: this.options.maxTotalBytes,
         maxFileBytes: this.options.maxFileBytes,
+        maxDirectoriesScanned: this.options.maxDirectoriesScanned,
+        maxEntriesScanned: this.options.maxEntriesScanned,
       }).mapRepository(projectPath);
       return {
         files: this.filterCodeFiles(projectPath, structure.files),
@@ -244,10 +273,33 @@ export class CodebaseAnalyzer {
           reason: skip.reason,
           size: skip.size,
         })),
+        metrics: structure.discoveryMetrics,
       };
     } catch {
       return { files: [], skipped: [] };
     }
+  }
+
+  private discoveryFromInput(
+    projectPath: string,
+    input: SemanticDiscoveryInput
+  ): {
+    files: Array<{ path: string; size?: number }>;
+    skipped: SkippedAnalysisFile[];
+    metrics?: RepoDiscoveryMetrics;
+  } {
+    if (Array.isArray(input)) {
+      return { files: this.filterCodeFiles(projectPath, input), skipped: [] };
+    }
+    return {
+      files: this.filterCodeFiles(projectPath, input.files),
+      skipped: (input.skipped ?? []).map((skip) => ({
+        file: skip.file,
+        reason: skip.reason,
+        size: skip.size,
+      })),
+      metrics: input.discoveryMetrics,
+    };
   }
 
   private filterCodeFiles(

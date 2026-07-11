@@ -131,7 +131,7 @@ export class AgentGenerator {
       try {
         semantics = (await this.analyzer.analyzeBundle(
           repoStructure.rootPath,
-          repoStructure.files.map((file) => file.path)
+          repoStructure
         )).context;
         GeneratorUtils.logProgress(
           `Analyzed ${semantics.stats.totalFiles} files, found ${semantics.stats.totalSymbols} symbols`,

@@ -240,6 +240,25 @@ export class SemanticSnapshotService {
           Math.floor(fingerprintLimits.maxFileBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxFileBytes)
         )
       ),
+      maxDirectoriesScanned: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxDirectoriesScanned,
+        Math.max(
+          0,
+          Math.floor(
+            fingerprintLimits.maxDirectoriesScanned ??
+            DEFAULT_FILE_MAPPING_LIMITS.maxDirectoriesScanned
+          )
+        )
+      ),
+      maxEntriesScanned: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxEntriesScanned,
+        Math.max(
+          0,
+          Math.floor(
+            fingerprintLimits.maxEntriesScanned ?? DEFAULT_FILE_MAPPING_LIMITS.maxEntriesScanned
+          )
+        )
+      ),
     };
   }
 
@@ -522,7 +541,7 @@ export class SemanticSnapshotService {
         analyzer = new CodebaseAnalyzer(options.analyzerOptions);
         const bundle = await analyzer.analyzeBundle(
           repoStructure.rootPath,
-          repoStructure.files
+          repoStructure
         );
         semantics ??= bundle.context;
         functionalPatterns ??= bundle.functionalPatterns;

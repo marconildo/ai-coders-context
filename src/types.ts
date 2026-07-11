@@ -20,6 +20,8 @@ export type RepoDiscoverySkipReason =
   | 'file-limit'
   | 'total-byte-limit'
   | 'file-too-large'
+  | 'directory-limit'
+  | 'entry-limit'
   | 'stat-failed';
 
 export interface RepoDiscoverySkip {
@@ -31,6 +33,11 @@ export interface RepoDiscoverySkip {
 }
 
 export interface RepoDiscoveryMetrics {
+  /** Raw directory entries inspected, including irrelevant files. */
+  entriesScanned: number;
+  /** Directories opened by the bounded repository walker. */
+  directoriesScanned: number;
+  /** Relevant file candidates considered after path filtering. */
   entriesVisited: number;
   statCalls: number;
   stoppedEarly: boolean;

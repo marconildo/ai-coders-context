@@ -106,10 +106,13 @@ export class DocumentationGenerator {
       GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
       this.analyzer = new CodebaseAnalyzer({ cacheEnabled: config.cacheEnabled ?? true });
       try {
-        snapshotFingerprint = await snapshotService!.captureRepoFingerprint(repoStructure.rootPath);
+        snapshotFingerprint = await snapshotService!.captureRepoFingerprint(
+          repoStructure.rootPath,
+          repoStructure
+        );
         const bundle = await this.analyzer.analyzeBundle(
           repoStructure.rootPath,
-          repoStructure.files
+          repoStructure
         );
         semantics = bundle.context;
         functionalPatterns = bundle.functionalPatterns;
