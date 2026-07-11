@@ -10,7 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Bounded semantic, file-analysis, MCP-session, and host-session retention with TTL/LRU limits, proactive cleanup, raw directory-entry scan budgets, and safe runtime configuration clamps.
-- Moved checkpoint payload history from `session.json` into individual checkpoint records with legacy dual-read and lazy migration.
+- Moved checkpoint payload history from `session.json` into individually bounded, paginated checkpoint records with summary-only session reads, incremental counts, legacy dual-read, and lazy migration.
+- Made host-session binding mutations atomic across concurrent hooks and prevented terminal MCP activity sessions from being reused.
 
 ## [1.1.1] - 2026-06-27
 

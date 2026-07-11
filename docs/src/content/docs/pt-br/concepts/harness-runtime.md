@@ -160,7 +160,9 @@ Adicione artifacts com a action `addArtifact` da tool `harness` e leia-os com `l
 
 Um **checkpoint** é um marco nomeado dentro de uma session. Ele agrupa um conjunto de artifacts e estado opcional, dando a você um ponto significativo e recuperável para o qual voltar — útil entre fases PREVC, antes de um passo arriscado ou sempre que você quiser um snapshot rotulado.
 
-Checkpoints são armazenados como registros individuais em `.context/runtime/sessions/<id>/checkpoints/`. O `session.json` mantém apenas o contador e a identidade do checkpoint mais recente, evitando que o histórico torne cada atualização da session progressivamente maior. Checkpoints legados inline continuam legíveis e são migrados na próxima gravação.
+Checkpoints são armazenados como registros individuais em `.context/runtime/sessions/<id>/checkpoints/`. O `session.json` mantém apenas o contador e a identidade do checkpoint mais recente, então leituras e gravações normais da session nunca carregam o histórico completo. Consumidores do runtime podem paginar os registros com `listCheckpointsPage`; o helper completo `listCheckpoints` continua disponível para operações explícitas, como replay. Checkpoints legados inline continuam legíveis e são migrados na próxima gravação.
+
+Cada novo registro é limitado por `checkpoints.maxSerializedBytes`; `data`, `note`, quantidade de artifacts e cada ID de artifact também têm limites independentes. Assim, um rótulo ou identificador grande não consegue contornar o budget do payload.
 
 ```json
 {

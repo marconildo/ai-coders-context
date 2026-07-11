@@ -50,7 +50,7 @@ describe('bounded semantic file discovery', () => {
     expect(result.files).toEqual([]);
     expect(result.metrics).toMatchObject({
       entriesScanned: 25,
-      statsAttempted: 2,
+      statsAttempted: 3,
       filesSelected: 0,
       partial: true,
       stopReason: 'maxEntriesScanned',
@@ -75,7 +75,7 @@ describe('bounded semantic file discovery', () => {
     expect(result.metrics).toMatchObject({
       entriesScanned: 9,
       directoriesVisited: 9,
-      statsAttempted: 9,
+      statsAttempted: 11,
       partial: true,
       stopReason: 'maxEntriesScanned',
     });

@@ -104,4 +104,37 @@ describe('hookSessionStore', () => {
     expect(Object.keys(store.bindings['claude-code'])).toHaveLength(2);
     expect(store.bindings['claude-code']['host-0']).toBeUndefined();
   });
+
+  it('serializes concurrent save and prune mutations without losing bindings', async () => {
+    const now = new Date().toISOString();
+    const saves = Array.from({ length: 30 }, async (_, index) => {
+      const harnessSessionId = `concurrent-harness-${index}`;
+      await fs.outputJson(
+        path.join(tempDir, '.context', 'runtime', 'sessions', harnessSessionId, 'session.json'),
+        { id: harnessSessionId, status: 'active' },
+      );
+      await saveHookHarnessSession({
+        repoPath: tempDir,
+        source: index % 2 === 0 ? 'claude-code' : 'codex',
+        hostSessionId: `concurrent-host-${index}`,
+        harnessSessionId,
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+
+    await Promise.all([
+      ...saves,
+      pruneHookSessionBindings(tempDir),
+      pruneHookSessionBindings(tempDir),
+      pruneHookSessionBindings(tempDir),
+    ]);
+
+    const storePath = path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json');
+    const store = await fs.readJson(storePath);
+    const bindings = Object.values(store.bindings)
+      .flatMap(source => Object.values(source as Record<string, unknown>));
+    expect(bindings).toHaveLength(30);
+    expect(await fs.pathExists(`${storePath}.lock`)).toBe(false);
+  });
 });

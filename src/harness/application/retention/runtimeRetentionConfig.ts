@@ -7,7 +7,13 @@ export interface RuntimeRetentionConfig {
   sessions: { maxEntries: number };
   replays: { maxEntries: number };
   datasets: { maxEntries: number };
-  checkpoints: { maxDataBytes: number; maxArtifactIds: number };
+  checkpoints: {
+    maxDataBytes: number;
+    maxSerializedBytes: number;
+    maxNoteBytes: number;
+    maxArtifactIds: number;
+    maxArtifactIdBytes: number;
+  };
   bindings: { maxEntries: number; maxAgeMs: number };
   caches: {
     context: { maxEntries: number; maxBytes: number; ttlMs: number; maxEntriesScanned: number };
@@ -38,7 +44,13 @@ export const DEFAULT_RUNTIME_RETENTION_CONFIG: RuntimeRetentionConfig = {
   sessions: { maxEntries: 1_000 },
   replays: { maxEntries: 100 },
   datasets: { maxEntries: 100 },
-  checkpoints: { maxDataBytes: 64 * 1024, maxArtifactIds: 200 },
+  checkpoints: {
+    maxDataBytes: 64 * 1024,
+    maxSerializedBytes: 96 * 1024,
+    maxNoteBytes: 4 * 1024,
+    maxArtifactIds: 200,
+    maxArtifactIdBytes: 1_024,
+  },
   bindings: { maxEntries: 1_000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 },
   caches: {
     context: { maxEntries: 16, maxBytes: 32 * 1024 * 1024, ttlMs: 5 * 60 * 1000, maxEntriesScanned: 20_000 },
@@ -55,7 +67,7 @@ const KNOWN_KEYS: Record<string, readonly string[]> = {
   sessions: ['maxEntries'],
   replays: ['maxEntries'],
   datasets: ['maxEntries'],
-  checkpoints: ['maxDataBytes', 'maxArtifactIds'],
+  checkpoints: ['maxDataBytes', 'maxSerializedBytes', 'maxNoteBytes', 'maxArtifactIds', 'maxArtifactIdBytes'],
   bindings: ['maxEntries', 'maxAgeMs'],
   caches: ['context', 'semantic', 'mcpSessions', 'fileAnalysis'],
   'caches.context': ['maxEntries', 'maxBytes', 'ttlMs', 'maxEntriesScanned'],
@@ -191,7 +203,10 @@ export async function loadRuntimeRetentionConfig(repoPath: string): Promise<Runt
     datasets: { maxEntries: number(datasets.maxEntries, d.datasets.maxEntries, 1, 10_000, 'datasets.maxEntries') },
     checkpoints: {
       maxDataBytes: number(checkpoints.maxDataBytes, d.checkpoints.maxDataBytes, 1_024, 1024 ** 2, 'checkpoints.maxDataBytes'),
+      maxSerializedBytes: number(checkpoints.maxSerializedBytes, d.checkpoints.maxSerializedBytes, 1_024, 2 * 1024 ** 2, 'checkpoints.maxSerializedBytes'),
+      maxNoteBytes: number(checkpoints.maxNoteBytes, d.checkpoints.maxNoteBytes, 1, 64 * 1024, 'checkpoints.maxNoteBytes'),
       maxArtifactIds: number(checkpoints.maxArtifactIds, d.checkpoints.maxArtifactIds, 1, 1_000, 'checkpoints.maxArtifactIds'),
+      maxArtifactIdBytes: number(checkpoints.maxArtifactIdBytes, d.checkpoints.maxArtifactIdBytes, 1, 16 * 1024, 'checkpoints.maxArtifactIdBytes'),
     },
     bindings: {
       maxEntries: number(bindings.maxEntries, d.bindings.maxEntries, 1, 10_000, 'bindings.maxEntries'),

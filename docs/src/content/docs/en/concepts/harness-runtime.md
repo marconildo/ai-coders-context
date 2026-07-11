@@ -160,7 +160,9 @@ Add artifacts with the `harness` tool's `addArtifact` action and read them with 
 
 A **checkpoint** is a named waypoint within a session. It bundles a set of artifacts and optional state so you have a meaningful, recoverable point to return to — useful between PREVC phases, before a risky step, or whenever you want a labeled snapshot.
 
-Checkpoints are stored as individual records under `.context/runtime/sessions/<id>/checkpoints/`. `session.json` retains only the count and latest checkpoint identity, so checkpoint history does not make every session update progressively larger. Legacy inline checkpoints remain readable and migrate on the next checkpoint write.
+Checkpoints are stored as individual records under `.context/runtime/sessions/<id>/checkpoints/`. `session.json` retains only the count and latest checkpoint identity, so normal session reads and writes never load the full checkpoint history. Runtime consumers can page through records with `listCheckpointsPage`; the complete `listCheckpoints` helper remains available for explicit replay-style operations. Legacy inline checkpoints remain readable and migrate on the next checkpoint write.
+
+Each new record is constrained by `checkpoints.maxSerializedBytes`; `data`, `note`, artifact count, and each artifact ID also have independent limits. This prevents a large label or identifier from bypassing the payload budget.
 
 ```json
 {

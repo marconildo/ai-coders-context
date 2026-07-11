@@ -107,4 +107,28 @@ describe('logMcpAction', () => {
     clearMcpActionSessionCache();
     expect(getMcpActionSessionCacheSize()).toBe(0);
   });
+
+  it('never reuses a terminal MCP activity session', async () => {
+    const state = new HarnessRuntimeStateService({ repoPath: tempDir });
+    const terminal = await state.createSession({
+      name: 'mcp-activity',
+      metadata: { transport: 'mcp', purpose: 'tool-audit' },
+    });
+    await state.completeSession(terminal.id);
+
+    await logMcpAction(tempDir, {
+      tool: 'context',
+      action: 'check',
+      status: 'success',
+    });
+
+    const sessions = await state.listSessions();
+    const activity = sessions.filter(session => session.name === 'mcp-activity');
+    expect(activity).toHaveLength(2);
+    expect(activity.find(session => session.id === terminal.id)?.status).toBe('completed');
+    const replacement = activity.find(session => session.id !== terminal.id);
+    expect(replacement?.status).toBe('active');
+    expect((await state.listTraces(terminal.id)).some(trace => trace.event === 'mcp.tool.succeeded')).toBe(false);
+    expect((await state.listTraces(replacement!.id)).some(trace => trace.event === 'mcp.tool.succeeded')).toBe(true);
+  });
 });

@@ -105,6 +105,17 @@ describe('ContextCache', () => {
             expect(await cache.get(tempDir, 'compact')).toBeNull();
         });
 
+        it('invalidates when a configured watch root is created after caching', async () => {
+            const cache = new ContextCache({ watchDirs: ['src', 'packages'] });
+            await cache.set(tempDir, 'compact', 'before-packages');
+            expect(await cache.get(tempDir, 'compact')).toBe('before-packages');
+
+            await fs.outputFile(path.join(tempDir, 'packages', 'new.ts'), 'export const created = true;');
+
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            cache.dispose();
+        });
+
         it('validates cache hits from bounded signals and ignores irrelevant runtime files', async () => {
             await fs.writeFile(path.join(tempDir, 'src', 'index.ts'), 'export const value = 1;');
             const cache = new ContextCache({ watchDirs: ['src', '.context'], freshnessMaxFiles: 4 });

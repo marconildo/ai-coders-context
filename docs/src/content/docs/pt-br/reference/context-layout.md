@@ -52,7 +52,7 @@ Esses arquivos governam como o harness se comporta. Você os escreve, os revisa 
 | `.context/config/` | versioned | Sim | O diretório de config autorada. |
 | `.context/config/policy.json` | versioned | Sim | Regras de [policy](/pt-br/concepts/policies/) do harness e restrições de aprovação. |
 | `.context/config/sensors.json` | versioned | Sim | Catálogo de [sensores](/pt-br/concepts/sensors/) do projeto mais informações da stack detectada. Gerado no bootstrap e depois customizado pelo time. |
-| `.context/config/runtime.json` | versioned | Sim | Limites versionados de retenção e descoberta semântica para traces, sessions, replays, datasets, checkpoints, bindings e caches. `caches.context.maxEntriesScanned` e `caches.semantic.maxEntriesScanned` limitam entradas brutas de diretório antes da filtragem; valores inseguros são limitados por tetos absolutos. |
+| `.context/config/runtime.json` | versioned | Sim | Limites versionados de retenção e descoberta semântica para traces, sessions, replays, datasets, checkpoints, bindings e caches. Registros de checkpoint têm limites total, de data, note, quantidade de artifacts e por ID de artifact. `caches.context.maxEntriesScanned` e `caches.semantic.maxEntriesScanned` limitam entradas brutas de diretório antes da filtragem; valores inseguros são limitados por tetos absolutos. |
 
 ## Conhecimento durável do projeto
 

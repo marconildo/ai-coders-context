@@ -13,8 +13,20 @@ export interface BoundedDirectorySignal {
   mtimeMs: number;
 }
 
+/**
+ * A configured discovery root, including roots which did not exist when the
+ * snapshot was captured. Keeping absence as an explicit signal prevents a
+ * newly-created source root from authorizing a stale cache hit.
+ */
+export interface BoundedRootSignal {
+  path: string;
+  exists: boolean;
+  mtimeMs?: number;
+}
+
 export interface BoundedFreshnessSnapshot {
   rootPath: string;
+  roots: BoundedRootSignal[];
   files: BoundedFileSignal[];
   directories: BoundedDirectorySignal[];
   partial: boolean;
@@ -68,6 +80,11 @@ function normalizedRelative(root: string, target: string): string {
 
 function fingerprintSnapshot(snapshot: BoundedFreshnessSnapshot): string {
   const hash = createHash('sha256');
+  for (const root of snapshot.roots) {
+    // Mtime is a cheap rescan sentinel, not source identity: excluded runtime
+    // churn may touch a watched parent without changing relevant source.
+    hash.update(`r:${root.path}:${root.exists}\n`);
+  }
   for (const file of snapshot.files) {
     hash.update(`f:${file.path}:${file.size}:${file.mtimeMs}\n`);
   }
@@ -89,14 +106,33 @@ export async function discoverBoundedFiles(
   const excludedNames = new Set([...DEFAULT_EXCLUDED_DIRECTORIES, ...(options.excludeDirectoryNames ?? [])]);
   const excludedPrefixes = [...(options.excludeRelativePrefixes ?? [])]
     .map(value => value.replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/$/, ''));
-  const queue = (options.roots?.length ? options.roots : ['.'])
+  let statsAttempted = 0;
+  const configuredRoots = (options.roots?.length ? options.roots : ['.'])
     .map(relative => path.resolve(root, relative))
     .filter(candidate => candidate === root || candidate.startsWith(`${root}${path.sep}`));
+  // Always observe the repository root as well as every configured watch root.
+  // De-duplication keeps the default `.` case to one signal/stat.
+  const rootCandidates = [...new Set([root, ...configuredRoots])];
+  const rootSignals: BoundedRootSignal[] = [];
+  for (const candidate of rootCandidates) {
+    statsAttempted += 1;
+    try {
+      const stat = await fs.stat(candidate);
+      rootSignals.push({
+        path: normalizedRelative(root, candidate) || '.',
+        exists: true,
+        mtimeMs: stat.mtimeMs,
+      });
+    } catch {
+      rootSignals.push({ path: normalizedRelative(root, candidate) || '.', exists: false });
+    }
+  }
+  rootSignals.sort((left, right) => left.path.localeCompare(right.path));
+  const queue = [...configuredRoots];
   const queued = new Set(queue);
   const files: BoundedFileSignal[] = [];
   const directories: BoundedDirectorySignal[] = [];
   let entriesScanned = 0;
-  let statsAttempted = 0;
   let partial = false;
   let stopReason: BoundedDiscoveryStopReason | undefined;
   const stopPartial = (reason: BoundedDiscoveryStopReason) => {
@@ -158,7 +194,7 @@ export async function discoverBoundedFiles(
   else if (queue.length > 0 || directories.length >= maxDirectories) stopPartial('maxDirectories');
   files.sort((left, right) => left.path.localeCompare(right.path));
   directories.sort((left, right) => left.path.localeCompare(right.path));
-  const snapshot: BoundedFreshnessSnapshot = { rootPath: root, files, directories, partial };
+  const snapshot: BoundedFreshnessSnapshot = { rootPath: root, roots: rootSignals, files, directories, partial };
   return {
     files: files.map(file => path.join(root, file.path)),
     fingerprint: fingerprintSnapshot(snapshot),
@@ -188,6 +224,18 @@ export async function isBoundedSnapshotFresh(snapshot: BoundedFreshnessSnapshot)
     return { fresh: false, signalsChecked: 0, durationMs: Date.now() - started };
   }
   let signalsChecked = 0;
+  for (const root of snapshot.roots ?? []) {
+    try {
+      const stat = await fs.stat(path.join(snapshot.rootPath, root.path));
+      signalsChecked += 1;
+      if (!root.exists || stat.mtimeMs !== root.mtimeMs) {
+        return { fresh: false, signalsChecked, durationMs: Date.now() - started };
+      }
+    } catch {
+      signalsChecked += 1;
+      if (root.exists) return { fresh: false, signalsChecked, durationMs: Date.now() - started };
+    }
+  }
   for (const directory of snapshot.directories) {
     try {
       const stat = await fs.stat(path.join(snapshot.rootPath, directory.path));

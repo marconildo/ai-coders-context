@@ -1,5 +1,7 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
+import { promises as nativeFs } from 'fs';
+import { randomUUID } from 'crypto';
 
 import { getContextRootPath } from '../../shared/context';
 import type { HarnessHookResponse } from '../../harness';
@@ -21,6 +23,10 @@ export interface HookSessionBinding {
 interface HookSessionStoreDocument {
   bindings: Record<string, Record<string, HookSessionBinding>>;
 }
+
+const mutationTails = new Map<string, Promise<void>>();
+const LOCK_WAIT_MS = 10_000;
+const LOCK_RETRY_MS = 20;
 
 export interface HookSessionPruneResult {
   removedExpired: number;
@@ -71,7 +77,65 @@ async function readStore(repoPath: string): Promise<HookSessionStoreDocument> {
 async function writeStore(repoPath: string, document: HookSessionStoreDocument): Promise<void> {
   const storePath = await getStorePath(repoPath);
   await fs.ensureDir(path.dirname(storePath));
-  await fs.writeJson(storePath, document, { spaces: 2 });
+  const temporary = `${storePath}.${process.pid}.${randomUUID()}.tmp`;
+  try {
+    await fs.writeJson(temporary, document, { spaces: 2 });
+    await fs.rename(temporary, storePath);
+  } finally {
+    await fs.remove(temporary).catch(() => undefined);
+  }
+}
+
+async function withInterProcessLock<T>(storePath: string, operation: () => Promise<T>): Promise<T> {
+  const lockPath = `${storePath}.lock`;
+  await fs.ensureDir(path.dirname(lockPath));
+  const deadline = Date.now() + LOCK_WAIT_MS;
+  let handle: Awaited<ReturnType<typeof nativeFs.open>> | undefined;
+
+  while (!handle) {
+    try {
+      handle = await nativeFs.open(lockPath, 'wx');
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for hook session store lock: ${path.basename(storePath)}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, LOCK_RETRY_MS));
+    }
+  }
+
+  try {
+    await handle.writeFile(JSON.stringify({ pid: process.pid, createdAt: Date.now() }), 'utf8');
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    await nativeFs.unlink(lockPath).catch(() => undefined);
+    throw error;
+  }
+
+  try {
+    return await operation();
+  } finally {
+    await handle.close().catch(() => undefined);
+    await nativeFs.unlink(lockPath).catch(() => undefined);
+  }
+}
+
+async function mutateStore<T>(repoPath: string, operation: () => Promise<T>): Promise<T> {
+  const normalizedRepoPath = path.resolve(repoPath);
+  const storePath = await getStorePath(normalizedRepoPath);
+  const predecessor = mutationTails.get(storePath) ?? Promise.resolve();
+  let release!: () => void;
+  const completed = new Promise<void>(resolve => { release = resolve; });
+  const tail = predecessor.catch(() => undefined).then(() => completed);
+  mutationTails.set(storePath, tail);
+
+  await predecessor.catch(() => undefined);
+  try {
+    return await withInterProcessLock(storePath, () => operation());
+  } finally {
+    release();
+    if (mutationTails.get(storePath) === tail) mutationTails.delete(storePath);
+  }
 }
 
 export async function getHookHarnessSessionId(options: {
@@ -86,13 +150,15 @@ export async function getHookHarnessSessionId(options: {
 
 export async function saveHookHarnessSession(binding: HookSessionBinding): Promise<void> {
   const normalizedRepoPath = path.resolve(binding.repoPath);
-  const document = await readStore(normalizedRepoPath);
-  const sourceBindings = document.bindings[binding.source] ?? {};
-  sourceBindings[binding.hostSessionId] = { ...binding, repoPath: normalizedRepoPath };
-  document.bindings[binding.source] = sourceBindings;
-  const { config } = await loadRuntimeRetentionConfig(normalizedRepoPath);
-  capBindings(document, config.bindings.maxEntries);
-  await writeStore(normalizedRepoPath, document);
+  await mutateStore(normalizedRepoPath, async () => {
+    const document = await readStore(normalizedRepoPath);
+    const sourceBindings = document.bindings[binding.source] ?? {};
+    sourceBindings[binding.hostSessionId] = { ...binding, repoPath: normalizedRepoPath };
+    document.bindings[binding.source] = sourceBindings;
+    const { config } = await loadRuntimeRetentionConfig(normalizedRepoPath);
+    capBindings(document, config.bindings.maxEntries);
+    await writeStore(normalizedRepoPath, document);
+  });
 }
 
 function allBindings(document: HookSessionStoreDocument): Array<{ source: string; hostSessionId: string; binding: HookSessionBinding }> {
@@ -116,34 +182,36 @@ export async function pruneHookSessionBindings(repoPath: string): Promise<HookSe
   const startedAt = Date.now();
   const normalizedRepoPath = path.resolve(repoPath);
   const contextRoot = await getContextRootPath(normalizedRepoPath);
-  const document = await readStore(normalizedRepoPath);
-  const { config } = await loadRuntimeRetentionConfig(normalizedRepoPath);
-  const cutoff = Date.now() - config.bindings.maxAgeMs;
-  let removedExpired = 0;
-  let removedMissing = 0;
+  return mutateStore(normalizedRepoPath, async () => {
+    const document = await readStore(normalizedRepoPath);
+    const { config } = await loadRuntimeRetentionConfig(normalizedRepoPath);
+    const cutoff = Date.now() - config.bindings.maxAgeMs;
+    let removedExpired = 0;
+    let removedMissing = 0;
 
-  for (const { source, hostSessionId, binding } of allBindings(document)) {
-    const updatedAt = Date.parse(binding.updatedAt);
-    if (!Number.isFinite(updatedAt) || updatedAt < cutoff) {
-      delete document.bindings[source]?.[hostSessionId];
-      removedExpired += 1;
-      continue;
+    for (const { source, hostSessionId, binding } of allBindings(document)) {
+      const updatedAt = Date.parse(binding.updatedAt);
+      if (!Number.isFinite(updatedAt) || updatedAt < cutoff) {
+        delete document.bindings[source]?.[hostSessionId];
+        removedExpired += 1;
+        continue;
+      }
+      const sessionFile = path.join(contextRoot, 'runtime', 'sessions', binding.harnessSessionId, 'session.json');
+      if (!await fs.pathExists(sessionFile)) {
+        delete document.bindings[source]?.[hostSessionId];
+        removedMissing += 1;
+      }
     }
-    const sessionFile = path.join(contextRoot, 'runtime', 'sessions', binding.harnessSessionId, 'session.json');
-    if (!await fs.pathExists(sessionFile)) {
-      delete document.bindings[source]?.[hostSessionId];
-      removedMissing += 1;
-    }
-  }
-  const removedOverLimit = capBindings(document, config.bindings.maxEntries);
-  await writeStore(normalizedRepoPath, document);
-  return {
-    removedExpired,
-    removedMissing,
-    removedOverLimit,
-    remaining: allBindings(document).length,
-    durationMs: Date.now() - startedAt,
-  };
+    const removedOverLimit = capBindings(document, config.bindings.maxEntries);
+    await writeStore(normalizedRepoPath, document);
+    return {
+      removedExpired,
+      removedMissing,
+      removedOverLimit,
+      remaining: allBindings(document).length,
+      durationMs: Date.now() - startedAt,
+    };
+  });
 }
 
 export async function ensureHookHarnessSession(
