@@ -145,6 +145,30 @@ describe('ContextCache', () => {
             cache.dispose();
         });
 
+        it('does not cache when irrelevant raw entries exhaust the configured freshness budget', async () => {
+            for (let index = 0; index < 40; index += 1) {
+                await fs.writeFile(path.join(tempDir, 'src', `${index}.txt`), 'ignored');
+            }
+            const cache = new ContextCache({
+                watchDirs: ['src'],
+                freshnessMaxFiles: 20,
+                freshnessMaxEntriesScanned: 7,
+            });
+
+            await cache.set(tempDir, 'compact', 'must-not-be-reused');
+            await cache.set(tempDir, 'compact', 'still-partial');
+
+            expect(cache.size).toBe(0);
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            expect(cache.freshnessMetrics()).toMatchObject({
+                discoveries: 2,
+                entriesScanned: 14,
+                partialDiscoveries: 2,
+                entryLimitDiscoveries: 2,
+            });
+            cache.dispose();
+        });
+
         it('allows cache hits when an injected strong fingerprint proves freshness', async () => {
             let fingerprint = 'source-v1';
             const cache = new ContextCache({

@@ -190,6 +190,8 @@ export interface AnalyzerOptions {
   exclude?: string[];
   include?: string[];
   maxFiles?: number;
+  /** Maximum raw directory entries inspected before returning a partial analysis. */
+  maxEntriesScanned?: number;
   cacheEnabled?: boolean;
   fileAnalysisCacheMaxEntries?: number;
   fileAnalysisCacheMaxBytes?: number;

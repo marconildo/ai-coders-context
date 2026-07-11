@@ -45,6 +45,8 @@ export interface ContextCacheOptions {
     freshnessMaxFiles?: number;
     /** Maximum directories visited while establishing freshness (default: 256). */
     freshnessMaxDirectories?: number;
+    /** Maximum raw directory entries inspected while establishing freshness. */
+    freshnessMaxEntriesScanned?: number;
     /** Optional operation-provided source fingerprint that avoids local discovery. */
     fingerprintProvider?: (repoPath: string) => Promise<string>;
 }
@@ -63,7 +65,9 @@ export interface ContextCacheFreshnessMetrics {
     discoveries: number;
     filesSelected: number;
     directoriesVisited: number;
+    entriesScanned: number;
     partialDiscoveries: number;
+    entryLimitDiscoveries: number;
     signalsChecked: number;
     invalidations: number;
 }
@@ -73,6 +77,7 @@ export class ContextCache {
         cache: BoundedLruCache<string, CacheEntry>;
         signature: string;
         diagnostics: string[];
+        maxEntriesScanned: number;
     }>();
     private readonly watchDirs: string[];
     private readonly options: ContextCacheOptions;
@@ -80,7 +85,9 @@ export class ContextCache {
         discoveries: 0,
         filesSelected: 0,
         directoriesVisited: 0,
+        entriesScanned: 0,
         partialDiscoveries: 0,
+        entryLimitDiscoveries: 0,
         signalsChecked: 0,
         invalidations: 0,
     };
@@ -231,6 +238,7 @@ export class ContextCache {
             maxEntries: this.options.maxEntries ?? configured.maxEntries ?? DEFAULT_MAX_ENTRIES,
             maxBytes: this.options.maxBytes ?? configured.maxBytes ?? DEFAULT_MAX_BYTES,
             ttlMs: this.options.ttlMs ?? configured.ttlMs ?? DEFAULT_TTL_MS,
+            maxEntriesScanned: this.options.freshnessMaxEntriesScanned ?? configured.maxEntriesScanned,
         };
         const signature = JSON.stringify(limits);
         const current = this.caches.get(normalized);
@@ -241,12 +249,19 @@ export class ContextCache {
         }
         current?.cache.dispose();
         const cache = new BoundedLruCache<string, CacheEntry>({
-            ...limits,
+            maxEntries: limits.maxEntries,
+            maxBytes: limits.maxBytes,
+            ttlMs: limits.ttlMs,
             sweepIntervalMs: this.options.sweepIntervalMs,
             estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(entry.content)
                 + Buffer.byteLength(JSON.stringify(entry.freshnessSnapshot ?? entry.freshnessFingerprint ?? '')),
         });
-        this.caches.set(normalized, { cache, signature, diagnostics: loaded.diagnostics });
+        this.caches.set(normalized, {
+            cache,
+            signature,
+            diagnostics: loaded.diagnostics,
+            maxEntriesScanned: limits.maxEntriesScanned,
+        });
         return cache;
     }
 
@@ -274,13 +289,16 @@ export class ContextCache {
             roots: this.watchDirs,
             maxFiles: this.options.freshnessMaxFiles ?? 128,
             maxDirectories: this.options.freshnessMaxDirectories ?? 256,
+            maxEntriesScanned: this.caches.get(this.normalizeRepoPath(repoPath))?.maxEntriesScanned,
             extensions: CONTEXT_RELEVANT_EXTENSIONS,
             excludeRelativePrefixes: ['.context/runtime', '.context/cache'],
         });
         this.freshness.discoveries += 1;
         this.freshness.filesSelected += discovery.metrics.filesSelected;
         this.freshness.directoriesVisited += discovery.metrics.directoriesVisited;
+        this.freshness.entriesScanned += discovery.metrics.entriesScanned;
         if (discovery.metrics.partial) this.freshness.partialDiscoveries += 1;
+        if (discovery.metrics.stopReason === 'maxEntriesScanned') this.freshness.entryLimitDiscoveries += 1;
         return { freshnessFingerprint: discovery.fingerprint, freshnessSnapshot: discovery.snapshot };
     }
 

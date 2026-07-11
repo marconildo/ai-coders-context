@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
-- Bounded semantic, file-analysis, MCP-session, and host-session retention with TTL/LRU limits, proactive cleanup, and safe runtime configuration clamps.
+- Bounded semantic, file-analysis, MCP-session, and host-session retention with TTL/LRU limits, proactive cleanup, raw directory-entry scan budgets, and safe runtime configuration clamps.
 - Moved checkpoint payload history from `session.json` into individual checkpoint records with legacy dual-read and lazy migration.
 
 ## [1.1.1] - 2026-06-27

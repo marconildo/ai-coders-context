@@ -34,6 +34,54 @@ describe('bounded semantic file discovery', () => {
     });
   });
 
+  it('counts irrelevant dirents and stops a huge single directory before stat work beyond the entry cap', async () => {
+    const irrelevant = path.join(repo, 'irrelevant');
+    await fs.ensureDir(irrelevant);
+    for (let index = 0; index < 500; index += 1) {
+      await fs.writeFile(path.join(irrelevant, `${String(index).padStart(3, '0')}.txt`), 'ignored');
+    }
+    const result = await discoverBoundedFiles(repo, {
+      maxFiles: 100,
+      maxDirectories: 100,
+      maxEntriesScanned: 25,
+      extensions: ['.ts'],
+    });
+
+    expect(result.files).toEqual([]);
+    expect(result.metrics).toMatchObject({
+      entriesScanned: 25,
+      statsAttempted: 2,
+      filesSelected: 0,
+      partial: true,
+      stopReason: 'maxEntriesScanned',
+    });
+  });
+
+  it('does not visit or stat queued deep directories after the raw-entry budget is exhausted', async () => {
+    const tree = path.join(repo, 'tree');
+    let cursor = tree;
+    for (let depth = 0; depth < 40; depth += 1) {
+      cursor = path.join(cursor, `d${depth}`);
+      await fs.ensureDir(cursor);
+    }
+    const result = await discoverBoundedFiles(repo, {
+      roots: ['tree'],
+      maxFiles: 100,
+      maxDirectories: 100,
+      maxEntriesScanned: 9,
+      extensions: ['.ts'],
+    });
+
+    expect(result.metrics).toMatchObject({
+      entriesScanned: 9,
+      directoriesVisited: 9,
+      statsAttempted: 9,
+      partial: true,
+      stopReason: 'maxEntriesScanned',
+    });
+    expect(result.snapshot.directories).not.toContainEqual(expect.objectContaining({ path: expect.stringContaining('d8') }));
+  });
+
   it('ignores irrelevant trees and detects dirty, new, and deleted relevant files', async () => {
     await fs.outputFile(path.join(repo, 'src', 'index.ts'), 'export const value = 1;');
     await fs.outputFile(path.join(repo, 'node_modules', 'large.ts'), 'ignored');

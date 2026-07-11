@@ -10,8 +10,8 @@ export interface RuntimeRetentionConfig {
   checkpoints: { maxDataBytes: number; maxArtifactIds: number };
   bindings: { maxEntries: number; maxAgeMs: number };
   caches: {
-    context: { maxEntries: number; maxBytes: number; ttlMs: number };
-    semantic: { maxEntries: number; maxBytes: number };
+    context: { maxEntries: number; maxBytes: number; ttlMs: number; maxEntriesScanned: number };
+    semantic: { maxEntries: number; maxBytes: number; maxEntriesScanned: number };
     mcpSessions: { maxEntries: number; ttlMs: number };
     fileAnalysis: { maxEntries: number; maxBytes: number };
   };
@@ -41,8 +41,8 @@ export const DEFAULT_RUNTIME_RETENTION_CONFIG: RuntimeRetentionConfig = {
   checkpoints: { maxDataBytes: 64 * 1024, maxArtifactIds: 200 },
   bindings: { maxEntries: 1_000, maxAgeMs: 30 * 24 * 60 * 60 * 1000 },
   caches: {
-    context: { maxEntries: 16, maxBytes: 32 * 1024 * 1024, ttlMs: 5 * 60 * 1000 },
-    semantic: { maxEntries: 1, maxBytes: 64 * 1024 * 1024 },
+    context: { maxEntries: 16, maxBytes: 32 * 1024 * 1024, ttlMs: 5 * 60 * 1000, maxEntriesScanned: 20_000 },
+    semantic: { maxEntries: 1, maxBytes: 64 * 1024 * 1024, maxEntriesScanned: 100_000 },
     mcpSessions: { maxEntries: 64, ttlMs: 30 * 60 * 1000 },
     fileAnalysis: { maxEntries: 5_000, maxBytes: 128 * 1024 * 1024 },
   },
@@ -58,8 +58,8 @@ const KNOWN_KEYS: Record<string, readonly string[]> = {
   checkpoints: ['maxDataBytes', 'maxArtifactIds'],
   bindings: ['maxEntries', 'maxAgeMs'],
   caches: ['context', 'semantic', 'mcpSessions', 'fileAnalysis'],
-  'caches.context': ['maxEntries', 'maxBytes', 'ttlMs'],
-  'caches.semantic': ['maxEntries', 'maxBytes'],
+  'caches.context': ['maxEntries', 'maxBytes', 'ttlMs', 'maxEntriesScanned'],
+  'caches.semantic': ['maxEntries', 'maxBytes', 'maxEntriesScanned'],
   'caches.mcpSessions': ['maxEntries', 'ttlMs'],
   'caches.fileAnalysis': ['maxEntries', 'maxBytes'],
 };
@@ -202,10 +202,12 @@ export async function loadRuntimeRetentionConfig(repoPath: string): Promise<Runt
         maxEntries: number(context.maxEntries, d.caches.context.maxEntries, 1, 256, 'caches.context.maxEntries'),
         maxBytes: number(context.maxBytes, d.caches.context.maxBytes, 1_024, 256 * 1024 * 1024, 'caches.context.maxBytes'),
         ttlMs: number(context.ttlMs, d.caches.context.ttlMs, 1_000, 24 * 60 * 60 * 1000, 'caches.context.ttlMs'),
+        maxEntriesScanned: number(context.maxEntriesScanned, d.caches.context.maxEntriesScanned, 1, 1_000_000, 'caches.context.maxEntriesScanned'),
       },
       semantic: {
         maxEntries: number(semantic.maxEntries, d.caches.semantic.maxEntries, 1, 4, 'caches.semantic.maxEntries'),
         maxBytes: number(semantic.maxBytes, d.caches.semantic.maxBytes, 1_024, 256 * 1024 * 1024, 'caches.semantic.maxBytes'),
+        maxEntriesScanned: number(semantic.maxEntriesScanned, d.caches.semantic.maxEntriesScanned, 1, 1_000_000, 'caches.semantic.maxEntriesScanned'),
       },
       mcpSessions: {
         maxEntries: number(mcpSessions.maxEntries, d.caches.mcpSessions.maxEntries, 1, 1_000, 'caches.mcpSessions.maxEntries'),

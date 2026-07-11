@@ -399,6 +399,25 @@ describe('CodebaseAnalyzer', () => {
       expect(glob).not.toHaveBeenCalled();
     });
 
+    it('should respect the raw directory-entry scan policy before analyzing files', async () => {
+      for (let index = 0; index < 40; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'irrelevant', `${index}.txt`), 'ignored');
+      }
+      const analyzer = new CodebaseAnalyzer({
+        useLSP: false,
+        maxFiles: 100,
+        maxEntriesScanned: 6,
+      });
+
+      await analyzer.analyze(tempDir);
+
+      expect(analyzer.discoveryMetrics()).toMatchObject({
+        entriesScanned: 6,
+        partial: true,
+        stopReason: 'maxEntriesScanned',
+      });
+    });
+
     it('should respect languages option', async () => {
       const analyzer = new CodebaseAnalyzer({
         useLSP: false,

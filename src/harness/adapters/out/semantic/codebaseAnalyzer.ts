@@ -36,6 +36,7 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   exclude: DEFAULT_EXCLUDE_PATTERNS,
   include: [],
   maxFiles: 5000,
+  maxEntriesScanned: 100_000,
   cacheEnabled: true,
   fileAnalysisCacheMaxEntries: 5_000,
   fileAnalysisCacheMaxBytes: 128 * 1024 * 1024,
@@ -47,11 +48,13 @@ export class CodebaseAnalyzer {
   private options: Required<AnalyzerOptions>;
   private readonly fileCacheEntriesExplicit: boolean;
   private readonly fileCacheBytesExplicit: boolean;
+  private readonly maxEntriesScannedExplicit: boolean;
   private lastDiscovery?: BoundedDiscoveryMetrics;
 
   constructor(options: AnalyzerOptions = {}) {
     this.fileCacheEntriesExplicit = options.fileAnalysisCacheMaxEntries !== undefined;
     this.fileCacheBytesExplicit = options.fileAnalysisCacheMaxBytes !== undefined;
+    this.maxEntriesScannedExplicit = options.maxEntriesScanned !== undefined;
     this.options = { ...DEFAULT_OPTIONS, ...options };
     this.treeSitter = new TreeSitterLayer({
       cacheEnabled: this.options.cacheEnabled,
@@ -67,8 +70,8 @@ export class CodebaseAnalyzer {
 
   async analyze(projectPath: string): Promise<SemanticContext> {
     const startTime = Date.now();
+    const { config } = await loadRuntimeRetentionConfig(projectPath);
     if (this.options.cacheEnabled) {
-      const { config } = await loadRuntimeRetentionConfig(projectPath);
       this.treeSitter.configureCache?.({
         maxEntries: this.fileCacheEntriesExplicit ? this.options.fileAnalysisCacheMaxEntries : config.caches.fileAnalysis.maxEntries,
         maxBytes: this.fileCacheBytesExplicit ? this.options.fileAnalysisCacheMaxBytes : config.caches.fileAnalysis.maxBytes,
@@ -77,7 +80,12 @@ export class CodebaseAnalyzer {
     }
 
     // 1. Find all code files
-    const files = await this.findCodeFiles(projectPath);
+    const files = await this.findCodeFiles(
+      projectPath,
+      this.maxEntriesScannedExplicit
+        ? this.options.maxEntriesScanned
+        : config.caches.semantic.maxEntriesScanned,
+    );
 
     // 2. Analyze with Tree-sitter
     const fileAnalyses = await this.analyzeFiles(files);
@@ -100,10 +108,11 @@ export class CodebaseAnalyzer {
     return context;
   }
 
-  private async findCodeFiles(projectPath: string): Promise<string[]> {
+  private async findCodeFiles(projectPath: string, maxEntriesScanned: number): Promise<string[]> {
     const discovery = await discoverBoundedFiles(projectPath, {
       maxFiles: this.options.maxFiles,
       maxDirectories: Math.min(10_000, this.options.maxFiles * 2 + 32),
+      maxEntriesScanned,
       extensions: Object.keys(LANGUAGE_EXTENSIONS),
       include: this.options.include,
       excludeDirectoryNames: this.options.exclude,
@@ -679,7 +688,13 @@ export class CodebaseAnalyzer {
    * These patterns indicate functional capabilities like auth, database, API, etc.
    */
   async detectFunctionalPatterns(projectPath: string): Promise<DetectedFunctionalPatterns> {
-    const files = await this.findCodeFiles(projectPath);
+    const { config } = await loadRuntimeRetentionConfig(projectPath);
+    const files = await this.findCodeFiles(
+      projectPath,
+      this.maxEntriesScannedExplicit
+        ? this.options.maxEntriesScanned
+        : config.caches.semantic.maxEntriesScanned,
+    );
     const analyses = await this.analyzeFiles(files);
 
     const patterns: FunctionalPattern[] = [];

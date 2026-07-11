@@ -52,7 +52,7 @@ These files govern how the harness behaves. You write them, you review them, and
 | `.context/config/` | versioned | Yes | The authored config directory. |
 | `.context/config/policy.json` | versioned | Yes | Harness [policy](/concepts/policies/) rules and approval constraints. |
 | `.context/config/sensors.json` | versioned | Yes | Project [sensor](/concepts/sensors/) catalog plus detected stack info. Generated at bootstrap, then customized by the team. |
-| `.context/config/runtime.json` | versioned | Yes | Versioned retention limits for traces, sessions, replays, datasets, checkpoints, bindings, and caches. Unsafe values are clamped to absolute ceilings. |
+| `.context/config/runtime.json` | versioned | Yes | Versioned retention and semantic-discovery limits for traces, sessions, replays, datasets, checkpoints, bindings, and caches. `caches.context.maxEntriesScanned` and `caches.semantic.maxEntriesScanned` cap raw directory entries before filtering; unsafe values are clamped to absolute ceilings. |
 
 ## Durable project knowledge
 

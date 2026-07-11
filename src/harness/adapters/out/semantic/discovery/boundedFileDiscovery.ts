@@ -24,9 +24,13 @@ export interface BoundedDiscoveryMetrics {
   filesSelected: number;
   directoriesVisited: number;
   entriesScanned: number;
+  statsAttempted: number;
   partial: boolean;
+  stopReason?: BoundedDiscoveryStopReason;
   durationMs: number;
 }
+
+export type BoundedDiscoveryStopReason = 'maxFiles' | 'maxDirectories' | 'maxEntriesScanned';
 
 export interface BoundedFileDiscoveryResult {
   files: string[];
@@ -39,6 +43,7 @@ export interface BoundedFileDiscoveryOptions {
   roots?: string[];
   maxFiles: number;
   maxDirectories?: number;
+  maxEntriesScanned?: number;
   extensions?: Iterable<string>;
   include?: string[];
   excludeDirectoryNames?: Iterable<string>;
@@ -48,6 +53,14 @@ export interface BoundedFileDiscoveryOptions {
 const DEFAULT_EXCLUDED_DIRECTORIES = new Set([
   '.git', 'node_modules', 'dist', 'build', 'coverage', '.next', '.nuxt', 'vendor', '__pycache__',
 ]);
+
+export const DEFAULT_MAX_ENTRIES_SCANNED = 100_000;
+export const ABSOLUTE_MAX_ENTRIES_SCANNED = 1_000_000;
+
+function boundedEntriesLimit(value: number | undefined): number {
+  if (value === undefined || !Number.isFinite(value)) return DEFAULT_MAX_ENTRIES_SCANNED;
+  return Math.min(ABSOLUTE_MAX_ENTRIES_SCANNED, Math.max(1, Math.floor(value)));
+}
 
 function normalizedRelative(root: string, target: string): string {
   return path.relative(root, target).split(path.sep).join('/');
@@ -71,6 +84,7 @@ export async function discoverBoundedFiles(
   const root = path.resolve(rootPath);
   const maxFiles = Math.max(1, Math.floor(options.maxFiles));
   const maxDirectories = Math.max(1, Math.floor(options.maxDirectories ?? Math.min(10_000, maxFiles * 2 + 32)));
+  const maxEntriesScanned = boundedEntriesLimit(options.maxEntriesScanned);
   const extensions = options.extensions ? new Set([...options.extensions].map(value => value.toLowerCase())) : undefined;
   const excludedNames = new Set([...DEFAULT_EXCLUDED_DIRECTORIES, ...(options.excludeDirectoryNames ?? [])]);
   const excludedPrefixes = [...(options.excludeRelativePrefixes ?? [])]
@@ -82,13 +96,25 @@ export async function discoverBoundedFiles(
   const files: BoundedFileSignal[] = [];
   const directories: BoundedDirectorySignal[] = [];
   let entriesScanned = 0;
+  let statsAttempted = 0;
   let partial = false;
+  let stopReason: BoundedDiscoveryStopReason | undefined;
+  const stopPartial = (reason: BoundedDiscoveryStopReason) => {
+    partial = true;
+    stopReason ??= reason;
+  };
 
-  while (queue.length > 0 && files.length < maxFiles && directories.length < maxDirectories) {
+  while (
+    queue.length > 0
+    && files.length < maxFiles
+    && directories.length < maxDirectories
+    && entriesScanned < maxEntriesScanned
+  ) {
     const directoryPath = queue.shift()!;
     const relativeDirectory = normalizedRelative(root, directoryPath);
     if (excludedPrefixes.some(prefix => relativeDirectory === prefix || relativeDirectory.startsWith(`${prefix}/`))) continue;
     try {
+      statsAttempted += 1;
       const directoryStat = await fs.stat(directoryPath);
       directories.push({ path: relativeDirectory || '.', mtimeMs: directoryStat.mtimeMs });
       const directory = await fs.opendir(directoryPath);
@@ -97,33 +123,39 @@ export async function discoverBoundedFiles(
         const absolute = path.join(directoryPath, entry.name);
         const relative = normalizedRelative(root, absolute);
         if (entry.isDirectory()) {
-          if (excludedNames.has(entry.name)) continue;
-          if (excludedPrefixes.some(prefix => relative === prefix || relative.startsWith(`${prefix}/`))) continue;
-          if (queued.size >= maxDirectories) {
-            partial = true;
-            continue;
-          }
-          if (!queued.has(absolute)) {
+          const excluded = excludedNames.has(entry.name)
+            || excludedPrefixes.some(prefix => relative === prefix || relative.startsWith(`${prefix}/`));
+          if (!excluded && queued.size >= maxDirectories) {
+            stopPartial('maxDirectories');
+          } else if (!excluded && !queued.has(absolute)) {
             queued.add(absolute);
             queue.push(absolute);
           }
-          continue;
+        } else if (
+          entry.isFile()
+          && (!extensions || extensions.has(path.extname(entry.name).toLowerCase()))
+          && (!options.include?.length || options.include.some(pattern => relative.includes(pattern)))
+        ) {
+          try {
+            statsAttempted += 1;
+            const stat = await fs.stat(absolute);
+            files.push({ path: relative, size: stat.size, mtimeMs: stat.mtimeMs });
+          } catch { /* file changed during discovery */ }
         }
-        if (!entry.isFile()) continue;
-        if (extensions && !extensions.has(path.extname(entry.name).toLowerCase())) continue;
-        if (options.include?.length && !options.include.some(pattern => relative.includes(pattern))) continue;
-        try {
-          const stat = await fs.stat(absolute);
-          files.push({ path: relative, size: stat.size, mtimeMs: stat.mtimeMs });
-        } catch { /* file changed during discovery */ }
+        if (entriesScanned >= maxEntriesScanned) {
+          stopPartial('maxEntriesScanned');
+          break;
+        }
         if (files.length >= maxFiles) {
-          partial = true;
+          stopPartial('maxFiles');
           break;
         }
       }
     } catch { /* missing or unreadable roots are represented by their absence */ }
   }
-  if (queue.length > 0 || directories.length >= maxDirectories) partial = true;
+  if (entriesScanned >= maxEntriesScanned) stopPartial('maxEntriesScanned');
+  else if (files.length >= maxFiles) stopPartial('maxFiles');
+  else if (queue.length > 0 || directories.length >= maxDirectories) stopPartial('maxDirectories');
   files.sort((left, right) => left.path.localeCompare(right.path));
   directories.sort((left, right) => left.path.localeCompare(right.path));
   const snapshot: BoundedFreshnessSnapshot = { rootPath: root, files, directories, partial };
@@ -135,7 +167,9 @@ export async function discoverBoundedFiles(
       filesSelected: files.length,
       directoriesVisited: directories.length,
       entriesScanned,
+      statsAttempted,
       partial,
+      stopReason,
       durationMs: Date.now() - started,
     },
   };

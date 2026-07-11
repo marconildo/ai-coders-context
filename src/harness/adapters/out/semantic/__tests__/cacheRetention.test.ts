@@ -111,4 +111,26 @@ describe('semantic cache retention', () => {
     expect(analyze).toHaveBeenCalledTimes(5);
     await builder.shutdown();
   });
+
+  it('does not retain semantic context when irrelevant entries exhaust the scan policy', async () => {
+    for (let index = 0; index < 30; index += 1) {
+      await fs.outputFile(path.join(repo, 'src', `${index}.txt`), 'ignored');
+    }
+    const builder = new SemanticContextBuilder({ maxEntriesScanned: 6 });
+    const analyze = jest.fn().mockResolvedValue(emptyContext);
+    (builder as any).analyzer.analyze = analyze;
+
+    await builder.analyze(repo);
+    await builder.analyze(repo);
+
+    expect(analyze).toHaveBeenCalledTimes(2);
+    expect(builder.semanticCacheMetrics(repo)).toMatchObject({ entries: 0 });
+    expect(builder.freshnessMetrics(repo)).toMatchObject({
+      discoveries: 2,
+      entriesScanned: 12,
+      partialDiscoveries: 2,
+      entryLimitDiscoveries: 2,
+    });
+    await builder.shutdown();
+  });
 });

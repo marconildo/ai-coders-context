@@ -11,11 +11,21 @@ describe('loadRuntimeRetentionConfig', () => {
       unknown: true,
       bindings: { maxEntries: Number.MAX_SAFE_INTEGER },
       checkpoints: { maxDataBytes: 0, maxArtifactIds: -1 },
+      caches: {
+        context: { maxEntriesScanned: Number.MAX_SAFE_INTEGER },
+        semantic: { maxEntriesScanned: Number.MAX_SAFE_INTEGER },
+      },
     });
     const result = await loadRuntimeRetentionConfig(repo);
     expect(result.config.bindings.maxEntries).toBe(10_000);
     expect(result.config.checkpoints.maxDataBytes).toBe(64 * 1024);
     expect(result.config.checkpoints.maxArtifactIds).toBe(200);
+    expect(result.config.caches.context.maxEntriesScanned).toBe(1_000_000);
+    expect(result.config.caches.semantic.maxEntriesScanned).toBe(1_000_000);
+    expect(result.diagnostics).toEqual(expect.arrayContaining([
+      expect.stringContaining('caches.context.maxEntriesScanned was clamped'),
+      expect.stringContaining('caches.semantic.maxEntriesScanned was clamped'),
+    ]));
     expect(result.diagnostics.some(item => item.includes('Unknown'))).toBe(true);
     expect(result.clamps).toBeGreaterThan(0);
     await fs.remove(repo);

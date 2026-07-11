@@ -45,6 +45,7 @@ export interface SemanticFreshnessMetrics {
   directoriesVisited: number;
   entriesScanned: number;
   partialDiscoveries: number;
+  entryLimitDiscoveries: number;
   signalsChecked: number;
   invalidations: number;
 }
@@ -55,6 +56,7 @@ const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
   exclude: DEFAULT_EXCLUDE_PATTERNS,
   include: [],
   maxFiles: 5000,
+  maxEntriesScanned: 100_000,
   cacheEnabled: true,
   fileAnalysisCacheMaxEntries: 5_000,
   fileAnalysisCacheMaxBytes: 128 * 1024 * 1024,
@@ -69,6 +71,7 @@ export class SemanticContextBuilder {
   private analyzer: CodebaseAnalyzer;
   private options: Required<ContextBuilderOptions>;
   private readonly semanticCacheBytesExplicit: boolean;
+  private readonly maxEntriesScannedExplicit: boolean;
   private readonly semanticCaches = new Map<string, {
     cache: BoundedLruCache<string, SemanticContext>;
     signature: string;
@@ -76,14 +79,19 @@ export class SemanticContextBuilder {
     diagnostics: string[];
     maxEntries: number;
     maxBytes: number;
+    maxEntriesScanned: number;
     snapshot?: BoundedFreshnessSnapshot;
     freshness: SemanticFreshnessMetrics;
   }>();
 
   constructor(options: ContextBuilderOptions = {}) {
     this.semanticCacheBytesExplicit = options.semanticCacheMaxBytes !== undefined;
+    this.maxEntriesScannedExplicit = options.maxEntriesScanned !== undefined;
     this.options = { ...DEFAULT_OPTIONS, ...options };
-    this.analyzer = new CodebaseAnalyzer(this.options);
+    this.analyzer = new CodebaseAnalyzer({
+      ...this.options,
+      maxEntriesScanned: options.maxEntriesScanned,
+    });
   }
 
   /**
@@ -111,7 +119,7 @@ export class SemanticContextBuilder {
         const cached = owner.cache.get(owner.fingerprint);
         if (cached) return cached;
       } else {
-        discovered = await this.computeProjectFingerprint(normalizedProjectPath);
+        discovered = await this.computeProjectFingerprint(normalizedProjectPath, owner.maxEntriesScanned);
         this.recordDiscoveryMetrics(owner.freshness, discovered.metrics);
         if (discovered.snapshot.partial) {
           owner.cache.clear();
@@ -132,7 +140,7 @@ export class SemanticContextBuilder {
     }
 
     if (!discovered) {
-      discovered = await this.computeProjectFingerprint(normalizedProjectPath);
+      discovered = await this.computeProjectFingerprint(normalizedProjectPath, owner.maxEntriesScanned);
       this.recordDiscoveryMetrics(owner.freshness, discovered.metrics);
     }
     if (discovered.snapshot.partial) {
@@ -931,6 +939,7 @@ export class SemanticContextBuilder {
     const limits = {
       maxEntries: configured.maxEntries,
       maxBytes: this.semanticCacheBytesExplicit ? this.options.semanticCacheMaxBytes : configured.maxBytes,
+      maxEntriesScanned: this.maxEntriesScannedExplicit ? this.options.maxEntriesScanned : configured.maxEntriesScanned,
     };
     const signature = JSON.stringify(limits);
     const current = this.semanticCaches.get(projectPath);
@@ -941,7 +950,8 @@ export class SemanticContextBuilder {
     }
     current?.cache.dispose();
     const cache = new BoundedLruCache<string, SemanticContext>({
-      ...limits,
+      maxEntries: limits.maxEntries,
+      maxBytes: limits.maxBytes,
       ttlMs: 24 * 60 * 60 * 1000,
       estimateBytes: context => this.estimateSemanticContextBytes(context),
     });
@@ -952,7 +962,16 @@ export class SemanticContextBuilder {
       ...limits,
       fingerprint: undefined as string | undefined,
       snapshot: undefined as BoundedFreshnessSnapshot | undefined,
-      freshness: { discoveries: 0, filesSelected: 0, directoriesVisited: 0, entriesScanned: 0, partialDiscoveries: 0, signalsChecked: 0, invalidations: 0 },
+      freshness: {
+        discoveries: 0,
+        filesSelected: 0,
+        directoriesVisited: 0,
+        entriesScanned: 0,
+        partialDiscoveries: 0,
+        entryLimitDiscoveries: 0,
+        signalsChecked: 0,
+        invalidations: 0,
+      },
     };
     this.semanticCaches.set(projectPath, owner);
     return owner;
@@ -974,10 +993,11 @@ export class SemanticContextBuilder {
     }
   }
 
-  private async computeProjectFingerprint(projectPath: string) {
+  private async computeProjectFingerprint(projectPath: string, maxEntriesScanned: number) {
     return discoverBoundedFiles(projectPath, {
       maxFiles: this.options.maxFiles,
       maxDirectories: Math.min(10_000, this.options.maxFiles * 2 + 32),
+      maxEntriesScanned,
       extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.pyw', '.pyi', '.go'],
       include: this.options.include,
       excludeDirectoryNames: this.options.exclude,
@@ -990,6 +1010,7 @@ export class SemanticContextBuilder {
     target.directoriesVisited += metrics.directoriesVisited;
     target.entriesScanned += metrics.entriesScanned;
     if (metrics.partial) target.partialDiscoveries += 1;
+    if (metrics.stopReason === 'maxEntriesScanned') target.entryLimitDiscoveries += 1;
   }
 
   private estimateSemanticContextBytes(context: SemanticContext): number {
