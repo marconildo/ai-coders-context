@@ -56,11 +56,13 @@ Exploração de arquivos e código — ler arquivos, listar caminhos, buscar con
 | `symbolTypes` | array | analyze | Extrai `class` \| `interface` \| `function` \| `type` \| `enum` |
 | `ignore` | array | list, search, getStructure | Padrões a excluir |
 | `limit` | inteiro, 1–1.000 | list | Arquivos por página; padrão 100 |
-| `cursor` | string | list | Cursor opaco de continuação retornado em `page.nextCursor` |
+| `cursor` | string | list, search | Cursor opaco de continuação retornado em `page.nextCursor` |
 
 **Retorna:** conteúdo de arquivos, arquivos correspondentes, análise de símbolos, resultados de busca ou uma árvore de diretórios.
 
 A action `list` transmite os matches em páginas limitadas, sem materializar todo o glob. Envie o `page.nextCursor` retornado, sem alterá-lo, para continuar.
+
+A action `read` rejeita arquivos acima de 1 MiB com `EXPLORE_FILE_TOO_LARGE` antes de abrir o corpo. `search` percorre diretórios e lê arquivos correspondentes incrementalmente, com limites de arquivos, entradas brutas, diretórios, bytes por arquivo e bytes de resultado. Seu `page` informa descoberta parcial e arquivos ignorados por tamanho; envie `page.nextCursor` sem alterações para continuar.
 
 ### context
 

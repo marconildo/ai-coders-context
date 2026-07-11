@@ -60,6 +60,7 @@ export class HarnessExploreActionService {
           fileGlob: params.fileGlob,
           maxResults: params.maxResults || 50,
           cwd: params.cwd || this.options.repoPath,
+          cursor: params.cursor,
         });
       case 'getStructure':
         return getFileStructureTool.execute({

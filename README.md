@@ -526,6 +526,8 @@ MCP JSON responses are compact and bounded to 1 MiB by default (4 MiB absolute).
 
 The same UTF-8 budget covers MCP resources (`context://`, `file://`, and `workflow://`). Oversized file resources return `MCP_RESOURCE_TOO_LARGE` before the file body is read. `explore` action `list` returns bounded pages (100 files by default, 1,000 maximum); continue with its opaque `page.nextCursor`.
 
+`explore` file reads use the same 1 MiB safety boundary and return `EXPLORE_FILE_TOO_LARGE` without opening an oversized body. Code search streams bounded discovery and files, reports partial/skip metrics, and supports continuation with `page.nextCursor`.
+
 ## CLI Reference
 
 ### Requirements

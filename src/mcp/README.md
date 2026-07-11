@@ -38,6 +38,8 @@ The growing harness lists (`listSessions`, `listTraces`, `listArtifacts`, `listT
 
 `explore` action `list` is also paginated: it defaults to 100 files, accepts at most 1,000, and returns an opaque `page.nextCursor` when more matches exist.
 
+`explore` action `read` rejects files above 1 MiB from metadata before opening their bodies. Action `search` streams a bounded directory walk and bounded files line-by-line, caps result bytes, reports discovery/file skips in `page`, and returns `page.nextCursor` when another result page is available.
+
 ### Dedicated Workflow Tools (5)
 
 | Tool | Description |

@@ -155,10 +155,10 @@ export class AIContextMCPServer {
     // Gateway 1: explore - File and code exploration
     this.server.registerTool('explore', {
       description: `File and code exploration. Actions:
-- read: Read file contents (params: filePath, encoding?)
+- read: Read bounded file contents (params: filePath, encoding?)
 - list: List files matching pattern (params: pattern, cwd?, ignore?, limit?, cursor?)
 - analyze: Analyze symbols in a file (params: filePath, symbolTypes?)
-- search: Search code with regex (params: pattern, fileGlob?, maxResults?, cwd?)
+- search: Search code with bounded streaming (params: pattern, fileGlob?, maxResults?, cwd?, cursor?)
 - getStructure: Get directory structure (params: rootPath?, maxDepth?, includePatterns?)`,
       inputSchema: {
         action: z.enum(['read', 'list', 'analyze', 'search', 'getStructure'])
@@ -176,7 +176,7 @@ export class AIContextMCPServer {
         limit: MCP_LIST_LIMIT_SCHEMA.optional()
           .describe('(list) Maximum files per page'),
         cursor: mcpString().max(MCP_INPUT_LIMITS.cursorLength).optional()
-          .describe('(list) Opaque continuation cursor'),
+          .describe('(list, search) Opaque continuation cursor'),
         symbolTypes: mcpArray(z.enum(['class', 'interface', 'function', 'type', 'enum'])).optional()
           .describe('(analyze) Types of symbols to extract'),
         fileGlob: mcpPattern().optional()

@@ -56,11 +56,13 @@ File and code exploration — read files, list paths, search content, and extrac
 | `symbolTypes` | array | analyze | Extract `class` \| `interface` \| `function` \| `type` \| `enum` |
 | `ignore` | array | list, search, getStructure | Patterns to exclude |
 | `limit` | integer, 1–1,000 | list | Files per page; defaults to 100 |
-| `cursor` | string | list | Opaque continuation cursor from `page.nextCursor` |
+| `cursor` | string | list, search | Opaque continuation cursor from `page.nextCursor` |
 
 **Returns:** file contents, matched files, symbol analysis, search results, or a directory tree.
 
 The `list` action streams matches into bounded pages instead of materializing the entire glob. Pass the returned `page.nextCursor` unchanged to continue.
+
+The `read` action rejects files above 1 MiB with `EXPLORE_FILE_TOO_LARGE` before opening the body. `search` walks directories and reads matching files incrementally under file, raw-entry, directory, per-file, and result-byte ceilings. Its `page` reports partial discovery and oversized-file skips; pass `page.nextCursor` unchanged to continue result pagination.
 
 ### context
 
