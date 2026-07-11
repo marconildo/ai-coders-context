@@ -123,10 +123,8 @@ export class HarnessSensorsService {
   }
 
   async getSessionSensorRuns(sessionId: string): Promise<HarnessSensorRun[]> {
-    const traces = await this.options.stateService.listTraces(sessionId);
-    return traces
-      .filter((trace) => trace.event === 'sensor.run' && trace.data?.run)
-      .map((trace) => trace.data!.run as HarnessSensorRun);
+    const summary = await this.options.stateService.getSensorSummary(sessionId);
+    return Object.values(summary.latestBySensor) as HarnessSensorRun[];
   }
 
   evaluateBackpressure(

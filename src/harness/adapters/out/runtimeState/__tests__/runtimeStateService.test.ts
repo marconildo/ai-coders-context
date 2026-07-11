@@ -168,4 +168,47 @@ describe('HarnessRuntimeStateService', () => {
     })).resolves.toMatchObject({ event: 'after.stale.lock' });
     expect(await fs.pathExists(lockFile)).toBe(false);
   });
+
+  it('streams bounded newest-first trace pages across rotated segments', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'hooks.json'), {
+      trace: { rotationBytes: 64 * 1024, retainedSegments: 8, maxSessionBytes: 1024 * 1024 },
+    });
+    const session = await service.createSession({ name: 'paged' });
+    for (let index = 0; index < 18; index += 1) {
+      await service.appendTrace(session.id, { level: 'info', event: 'page.event', message: `event-${index}`, data: { index, payload: 'x'.repeat(8 * 1024) } });
+    }
+
+    const first = await service.listTracePage(session.id, { limit: 5, event: 'page.event' });
+    const second = await service.listTracePage(session.id, { limit: 5, event: 'page.event', cursor: first.nextCursor });
+
+    expect(first.items.map(item => item.data?.index)).toEqual([17, 16, 15, 14, 13]);
+    expect(second.items.map(item => item.data?.index)).toEqual([12, 11, 10, 9, 8]);
+    expect(first).toMatchObject({ hasMore: true, recordsReturned: 5, cursorVersion: 1, malformedCount: 0 });
+    expect(first.scannedBytes).toBeLessThan(256 * 1024);
+  });
+
+  it('skips malformed terminal trace lines and rejects oversized pages', async () => {
+    const session = await service.createSession({ name: 'malformed' });
+    const traceFile = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'trace.jsonl');
+    await fs.appendFile(traceFile, '{"partial":', 'utf8');
+
+    const page = await service.listTracePage(session.id, { limit: 1 });
+    expect(page.items).toHaveLength(1);
+    expect(page.malformedCount).toBe(1);
+    await expect(service.listTracePage(session.id, { limit: 1001 })).rejects.toThrow('between 1 and 1000');
+    await expect(service.listSessionPage({ limit: 201 })).rejects.toThrow('between 1 and 200');
+    await expect(service.listTracePage(session.id, { cursor: 'not-a-cursor' })).rejects.toMatchObject({
+      code: 'INVALID_RUNTIME_HISTORY_CURSOR',
+    });
+  });
+
+  it('maintains a latest sensor summary without scanning trace history', async () => {
+    const session = await service.createSession({ name: 'sensor-summary' });
+    await service.appendTrace(session.id, { level: 'error', event: 'sensor.run', message: 'first', data: { run: { sensorId: 'tests', status: 'failed', createdAt: '2025-01-01' } } });
+    await service.appendTrace(session.id, { level: 'info', event: 'sensor.run', message: 'second', data: { run: { sensorId: 'tests', status: 'passed', createdAt: '2025-01-02' } } });
+
+    const summary = await service.getSensorSummary(session.id);
+    expect(summary.latestBySensor.tests).toMatchObject({ status: 'passed' });
+    expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'sensor-summary.json'))).toBe(true);
+  });
 });

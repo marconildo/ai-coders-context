@@ -4,6 +4,7 @@ import * as path from 'path';
 
 import { HarnessExecutionService } from '../../execution/executionService';
 import { HarnessDatasetService } from '../datasetService';
+import { HarnessReplayService } from '../../replay/replayService';
 
 describe('HarnessDatasetService', () => {
   let tempDir: string;
@@ -60,5 +61,36 @@ describe('HarnessDatasetService', () => {
     expect(datasets).toHaveLength(1);
     expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'evaluations', 'replays'))).toBe(false);
     expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'evaluations', 'datasets', `${dataset.id}.json`))).toBe(true);
+  });
+
+  it('bounds session concurrency and caps retained failure records', async () => {
+    const sessions = [];
+    for (let index = 0; index < 6; index += 1) {
+      const session = await execution.createSession({ name: `failure-${index}` });
+      await execution.appendTrace(session.id, { level: 'error', event: 'task.failed', message: `failed-${index}` });
+      sessions.push(session);
+    }
+    const replay = new HarnessReplayService({ repoPath: tempDir });
+    let active = 0;
+    let peak = 0;
+    const bounded = new HarnessDatasetService({
+      repoPath: tempDir,
+      dependencies: {
+        replayService: {
+          buildReplay: async (...args) => {
+            active += 1;
+            peak = Math.max(peak, active);
+            await new Promise(resolve => setTimeout(resolve, 5));
+            try { return await replay.buildReplay(...args); } finally { active -= 1; }
+          },
+        },
+      },
+    });
+
+    const dataset = await bounded.buildFailureDataset({ sessionIds: sessions.map(item => item.id), includeSuccessfulSessions: true, concurrency: 2, maxFailures: 2 });
+    expect(peak).toBeLessThanOrEqual(2);
+    expect(dataset.failures).toHaveLength(2);
+    expect(dataset.partial).toBe(true);
+    expect(dataset.omittedFailureCount).toBe(4);
   });
 });

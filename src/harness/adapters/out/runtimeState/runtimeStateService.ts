@@ -17,6 +17,16 @@ import {
   loadGenericTraceEventMaxBytes,
   loadHookTracePolicy,
 } from '../../../application/hooks/hookTracePolicy';
+import {
+  boundedLimit,
+  decodeHistoryCursor,
+  encodeHistoryCursor,
+  queryBinding,
+  RuntimeHistoryCursorError,
+  type RuntimeHistoryDirection,
+  type RuntimeHistoryPage,
+  type RuntimeHistoryQuery,
+} from '../../../application/history/runtimeHistory';
 
 const traceWriteQueues = new Map<string, Promise<void>>();
 
@@ -164,6 +174,92 @@ export interface HarnessRuntimeStatePort {
   listArtifacts(sessionId: string): Promise<HarnessArtifactRecord[]>;
   checkpointSession(sessionId: string, input?: CheckpointInput): Promise<HarnessSessionRecord>;
   listCheckpoints(sessionId: string): Promise<HarnessSessionCheckpoint[]>;
+  listTracePage(sessionId: string, query?: HarnessTracePageQuery): Promise<RuntimeHistoryPage<HarnessTraceRecord>>;
+  listSessionPage(query?: RuntimeHistoryQuery): Promise<RuntimeHistoryPage<HarnessSessionRecord>>;
+  listArtifactPage(sessionId: string, query?: RuntimeHistoryQuery): Promise<RuntimeHistoryPage<HarnessArtifactRecord>>;
+  getSensorSummary(sessionId: string): Promise<HarnessSensorSummary>;
+}
+
+export interface HarnessTracePageQuery extends RuntimeHistoryQuery {
+  event?: string;
+  level?: HarnessTraceLevel;
+  createdAfter?: string;
+  createdBefore?: string;
+}
+
+export interface HarnessSensorSummary {
+  version: 1;
+  updatedAt: string;
+  latestBySensor: Record<string, unknown>;
+}
+
+interface TraceCursorPosition {
+  file: string;
+  offset: number;
+  fingerprint: string;
+}
+
+interface TraceLine {
+  line: string;
+  nextOffset: number;
+  bytesRead: number;
+}
+
+async function* readLinesForward(file: string, startOffset = 0): AsyncGenerator<TraceLine> {
+  const handle = await nodeFs.open(file, 'r');
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  let position = startOffset;
+  let carry = Buffer.alloc(0);
+  let carryStart = startOffset;
+  try {
+    while (true) {
+      const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+      if (bytesRead === 0) break;
+      const data = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : Buffer.from(chunk.subarray(0, bytesRead));
+      let lineStart = 0;
+      for (let index = 0; index < data.length; index += 1) {
+        if (data[index] !== 0x0a) continue;
+        const nextOffset = carryStart + index + 1;
+        yield { line: data.subarray(lineStart, index).toString('utf8').replace(/\r$/, ''), nextOffset, bytesRead };
+        lineStart = index + 1;
+      }
+      carry = Buffer.from(data.subarray(lineStart));
+      carryStart += lineStart;
+      position += bytesRead;
+    }
+    if (carry.length > 0) yield { line: carry.toString('utf8').replace(/\r$/, ''), nextOffset: position, bytesRead: 0 };
+  } finally {
+    await handle.close();
+  }
+}
+
+async function* readLinesReverse(file: string, startOffset?: number): AsyncGenerator<TraceLine> {
+  const handle = await nodeFs.open(file, 'r');
+  const size = (await handle.stat()).size;
+  let position = Math.min(startOffset ?? size, size);
+  let carry = Buffer.alloc(0);
+  try {
+    while (position > 0) {
+      const length = Math.min(64 * 1024, position);
+      position -= length;
+      const chunk = Buffer.allocUnsafe(length);
+      const { bytesRead } = await handle.read(chunk, 0, length, position);
+      const data = carry.length ? Buffer.concat([chunk.subarray(0, bytesRead), carry]) : Buffer.from(chunk.subarray(0, bytesRead));
+      const newlines: number[] = [];
+      for (let index = 0; index < data.length; index += 1) if (data[index] === 0x0a) newlines.push(index);
+      if (newlines.length === 0) { carry = data; continue; }
+      for (let index = newlines.length - 1; index >= 0; index -= 1) {
+        const lineStart = newlines[index] + 1;
+        const lineEnd = index + 1 < newlines.length ? newlines[index + 1] : data.length;
+        const line = data.subarray(lineStart, lineEnd).toString('utf8').replace(/\r?\n$/, '').replace(/\r$/, '');
+        if (line.length > 0) yield { line, nextOffset: position + lineStart, bytesRead: index === newlines.length - 1 ? bytesRead : 0 };
+      }
+      carry = Buffer.from(data.subarray(0, newlines[0]));
+    }
+    if (carry.length > 0) yield { line: carry.toString('utf8').replace(/\r$/, ''), nextOffset: 0, bytesRead: 0 };
+  } finally {
+    await handle.close();
+  }
 }
 
 export interface CreateSessionInput {
@@ -243,6 +339,10 @@ export class HarnessRuntimeStateService {
 
   private artifactFile(sessionId: string, artifactId: string): string {
     return this.layout.sessionArtifactFile(sessionId, artifactId);
+  }
+
+  private sensorSummaryFile(sessionId: string): string {
+    return path.join(this.layout.sessionDir(sessionId), 'sensor-summary.json');
   }
 
   private async ensureSessionDir(sessionId: string): Promise<void> {
@@ -339,8 +439,38 @@ export class HarnessRuntimeStateService {
     }
 
     await fs.appendFile(activeFile, serialized, 'utf8');
+    await this.updateSensorSummary(sessionId, trace);
     await this.pruneTraceSegments(sessionId);
     return rotationTrace;
+  }
+
+  private async updateSensorSummary(sessionId: string, trace: HarnessTraceRecord): Promise<void> {
+    if (trace.event !== 'sensor.run' || !trace.data?.run || typeof trace.data.run !== 'object') return;
+    const run = trace.data.run as Record<string, unknown>;
+    if (typeof run.sensorId !== 'string') return;
+    const current = await this.getSensorSummary(sessionId);
+    current.latestBySensor[run.sensorId] = run;
+    current.updatedAt = trace.createdAt;
+    const target = this.sensorSummaryFile(sessionId);
+    const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
+    await fs.writeJson(temporary, current, { spaces: 2 });
+    await fs.rename(temporary, target);
+  }
+
+  async getSensorSummary(sessionId: string): Promise<HarnessSensorSummary> {
+    const target = this.sensorSummaryFile(sessionId);
+    if (await fs.pathExists(target)) {
+      try { return await fs.readJson(target) as HarnessSensorSummary; } catch { /* migrate below */ }
+    }
+    const latestBySensor: Record<string, unknown> = {};
+    for await (const trace of this.iterateTraces(sessionId)) {
+      const run = trace.data?.run as Record<string, unknown> | undefined;
+      if (trace.event === 'sensor.run' && typeof run?.sensorId === 'string') latestBySensor[run.sensorId] = run;
+    }
+    const summary: HarnessSensorSummary = { version: 1, updatedAt: nowIso(), latestBySensor };
+    await this.ensureSessionDir(sessionId);
+    await fs.writeJson(target, summary, { spaces: 2 });
+    return summary;
   }
 
   private async recordTrace(sessionId: string, trace: HarnessTraceRecord): Promise<HarnessTraceRecord> {
@@ -394,23 +524,54 @@ export class HarnessRuntimeStateService {
   }
 
   async listSessions(): Promise<HarnessSessionRecord[]> {
-    await this.ensureLayout();
-    const entries = await fs.readdir(this.sessionsPath, { withFileTypes: true });
     const sessions: HarnessSessionRecord[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) {
-        continue;
-      }
-      try {
-        const file = this.sessionFile(entry.name);
-        sessions.push((await fs.readJson(file)) as HarnessSessionRecord);
-      } catch {
-        // Skip sessions with missing or unparseable session.json.
-        continue;
-      }
-    }
+    let cursor: string | undefined;
+    do {
+      const page = await this.listSessionPage({ limit: 200, cursor });
+      sessions.push(...page.items);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return sessions;
+  }
 
-    return sessions.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
+  async listSessionPage(query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessSessionRecord>> {
+    const started = Date.now();
+    const limit = boundedLimit(query.limit, 50, 200, 'sessions');
+    const direction = query.direction ?? 'newest';
+    const binding = queryBinding({ direction });
+    const boundary = decodeHistoryCursor<{ updatedAt: string; id: string }>(query.cursor, 'sessions', binding);
+    await this.ensureLayout();
+    const selected: HarnessSessionRecord[] = [];
+    let recordsScanned = 0;
+    const directory = await nodeFs.opendir(this.sessionsPath);
+    for await (const entry of directory) {
+      if (!entry.isDirectory()) continue;
+      try {
+        const session = await fs.readJson(this.sessionFile(entry.name)) as HarnessSessionRecord;
+        recordsScanned += 1;
+        const key = `${session.updatedAt}\0${session.id}`;
+        const boundaryKey = boundary ? `${boundary.updatedAt}\0${boundary.id}` : undefined;
+        if (boundaryKey && (direction === 'newest' ? key >= boundaryKey : key <= boundaryKey)) continue;
+        selected.push(session);
+        selected.sort((a, b) => direction === 'newest'
+          ? b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id)
+          : a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
+        if (selected.length > limit + 1) selected.pop();
+      } catch { /* skip corrupt legacy records */ }
+    }
+    const hasMore = selected.length > limit;
+    const items = selected.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      nextCursor: hasMore && last ? encodeHistoryCursor('sessions', binding, { updatedAt: last.updatedAt, id: last.id }) : undefined,
+      hasMore,
+      recordsReturned: items.length,
+      recordsScanned,
+      cursorVersion: 1,
+      partial: hasMore,
+      durationMs: Date.now() - started,
+    };
   }
 
   async getSession(sessionId: string): Promise<HarnessSessionRecord> {
@@ -475,48 +636,136 @@ export class HarnessRuntimeStateService {
   }
 
   async listArtifacts(sessionId: string): Promise<HarnessArtifactRecord[]> {
-    const dir = this.layout.sessionArtifactsDir(sessionId);
-    if (!(await fs.pathExists(dir))) {
-      return [];
-    }
-
-    const entries = await fs.readdir(dir);
     const artifacts: HarnessArtifactRecord[] = [];
-    for (const entry of entries.filter((entry) => entry.endsWith('.json'))) {
-      try {
-        artifacts.push((await fs.readJson(path.join(dir, entry))) as HarnessArtifactRecord);
-      } catch {
-        // Skip missing or unparseable artifact files.
-        continue;
+    let cursor: string | undefined;
+    do {
+      const page = await this.listArtifactPage(sessionId, { limit: 200, cursor, direction: 'oldest' });
+      artifacts.push(...page.items);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return artifacts;
+  }
+
+  async listArtifactPage(sessionId: string, query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessArtifactRecord>> {
+    const started = Date.now();
+    const limit = boundedLimit(query.limit, 50, 200, 'artifacts');
+    const direction = query.direction ?? 'newest';
+    const binding = queryBinding({ sessionId, direction });
+    const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'artifacts', binding);
+    const dir = this.layout.sessionArtifactsDir(sessionId);
+    const selected: HarnessArtifactRecord[] = [];
+    let recordsScanned = 0;
+    if (await fs.pathExists(dir)) {
+      const directory = await nodeFs.opendir(dir);
+      for await (const entry of directory) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        try {
+          const artifact = await fs.readJson(path.join(dir, entry.name)) as HarnessArtifactRecord;
+          recordsScanned += 1;
+          const key = `${artifact.createdAt}\0${artifact.id}`;
+          const boundaryKey = boundary ? `${boundary.createdAt}\0${boundary.id}` : undefined;
+          if (boundaryKey && (direction === 'newest' ? key >= boundaryKey : key <= boundaryKey)) continue;
+          selected.push(artifact);
+          selected.sort((a, b) => direction === 'newest'
+            ? b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)
+            : a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
+          if (selected.length > limit + 1) selected.pop();
+        } catch { /* skip corrupt legacy records */ }
       }
     }
-
-    return artifacts.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const hasMore = selected.length > limit;
+    const items = selected.slice(0, limit);
+    const last = items.at(-1);
+    return {
+      items,
+      nextCursor: hasMore && last ? encodeHistoryCursor('artifacts', binding, { createdAt: last.createdAt, id: last.id }) : undefined,
+      hasMore,
+      recordsReturned: items.length,
+      recordsScanned,
+      cursorVersion: 1,
+      partial: hasMore,
+      durationMs: Date.now() - started,
+    };
   }
 
   async listTraces(sessionId: string): Promise<HarnessTraceRecord[]> {
-    const activeFile = this.traceFile(sessionId);
-    const files = [
-      ...(await this.listTraceSegmentFiles(sessionId)),
-      ...(await fs.pathExists(activeFile) ? [activeFile] : []),
-    ];
-    if (files.length === 0) {
-      return [];
-    }
+    const traces: HarnessTraceRecord[] = [];
+    for await (const trace of this.iterateTraces(sessionId)) traces.push(trace);
+    return traces;
+  }
 
-    const contents = await Promise.all(files.map((file) => fs.readFile(file, 'utf8')));
-    return contents.join('')
-      .split('\n')
-      .map((line) => line.trim())
-      .filter(Boolean)
-      .flatMap((line) => {
-        try {
-          return [JSON.parse(line) as HarnessTraceRecord];
-        } catch {
-          // Drop malformed/partially-written trace lines.
-          return [];
-        }
-      });
+  async *iterateTraces(sessionId: string): AsyncGenerator<HarnessTraceRecord> {
+    const files = [...await this.listTraceSegmentFiles(sessionId)];
+    const active = this.traceFile(sessionId);
+    if (await fs.pathExists(active)) files.push(active);
+    for (const file of files) {
+      for await (const item of readLinesForward(file)) {
+        if (!item.line.trim()) continue;
+        try { yield JSON.parse(item.line) as HarnessTraceRecord; } catch { /* bounded malformed diagnostic in pages */ }
+      }
+    }
+  }
+
+  async listTracePage(sessionId: string, query: HarnessTracePageQuery = {}): Promise<RuntimeHistoryPage<HarnessTraceRecord>> {
+    const started = Date.now();
+    const limit = boundedLimit(query.limit, 100, 1000, 'traces');
+    const direction: RuntimeHistoryDirection = query.direction ?? 'newest';
+    const filters = { sessionId, direction, event: query.event, level: query.level, createdAfter: query.createdAfter, createdBefore: query.createdBefore };
+    const binding = queryBinding(filters);
+    const cursor = decodeHistoryCursor<TraceCursorPosition>(query.cursor, 'traces', binding);
+    const active = this.traceFile(sessionId);
+    const chronological = [...await this.listTraceSegmentFiles(sessionId), ...(await fs.pathExists(active) ? [active] : [])];
+    const stats = await Promise.all(chronological.map(async file => {
+      const stat = await nodeFs.stat(file);
+      return { file, size: stat.size, mtime: stat.mtimeMs };
+    }));
+    const fingerprint = queryBinding(stats.map(item => [path.basename(item.file), item.size, item.mtime]));
+    if (cursor && cursor.fingerprint !== fingerprint) {
+      throw new RuntimeHistoryCursorError('Invalid or stale runtime history cursor: trace segments changed');
+    }
+    const files = direction === 'newest' ? [...chronological].reverse() : chronological;
+    let startIndex = cursor ? files.findIndex(file => path.basename(file) === cursor.file) : 0;
+    if (cursor && startIndex < 0) {
+      throw new RuntimeHistoryCursorError('Invalid or stale runtime history cursor: segment no longer exists');
+    }
+    const items: HarnessTraceRecord[] = [];
+    let recordsScanned = 0;
+    let scannedBytes = 0;
+    let malformedCount = 0;
+    let hasMore = false;
+    let nextPosition: TraceCursorPosition | undefined;
+    outer: for (let index = startIndex; index < files.length; index += 1) {
+      const file = files[index];
+      const initialOffset = index === startIndex ? cursor?.offset : undefined;
+      const iterator = direction === 'newest' ? readLinesReverse(file, initialOffset) : readLinesForward(file, initialOffset ?? 0);
+      for await (const line of iterator) {
+        scannedBytes += line.bytesRead;
+        if (!line.line.trim()) continue;
+        let trace: HarnessTraceRecord;
+        try { trace = JSON.parse(line.line) as HarnessTraceRecord; } catch { malformedCount += 1; continue; }
+        recordsScanned += 1;
+        if (query.event && trace.event !== query.event) continue;
+        if (query.level && trace.level !== query.level) continue;
+        if (query.createdAfter && trace.createdAt <= query.createdAfter) continue;
+        if (query.createdBefore && trace.createdAt >= query.createdBefore) continue;
+        if (items.length === limit) { hasMore = true; break outer; }
+        items.push(trace);
+        nextPosition = { file: path.basename(file), offset: line.nextOffset, fingerprint };
+      }
+      if (items.length > 0) nextPosition = { file: path.basename(files[index + 1] ?? file), offset: direction === 'newest' ? Number.MAX_SAFE_INTEGER : 0, fingerprint };
+    }
+    return {
+      items,
+      nextCursor: hasMore && nextPosition ? encodeHistoryCursor('traces', binding, nextPosition) : undefined,
+      hasMore,
+      recordsReturned: items.length,
+      recordsScanned,
+      scannedBytes,
+      malformedCount,
+      cursorVersion: 1,
+      partial: hasMore,
+      durationMs: Date.now() - started,
+    };
   }
 
   async checkpointSession(sessionId: string, input: CheckpointInput = {}): Promise<HarnessSessionRecord> {

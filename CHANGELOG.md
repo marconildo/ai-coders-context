@@ -10,12 +10,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Added configurable, globally clamped hook stdin, field, event, rotation, segment-retention, and per-session trace limits.
+- Added opaque cursor pages for sessions, traces, artifacts, replay summaries, and dataset summaries, including bounded defaults, query-bound cursors, and scan metadata.
+- Added latest-sensor summary indexes, bounded dataset concurrency/failure retention, and dry-run runtime pruning with active workflow protection.
 
 ### Fixed
 
 - Prevented Claude Code, Codex, and Pi Write/Edit hooks from retaining source bodies or sensitive fields by persisting bounded metadata summaries instead.
 - Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
 - Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
+- Replaced whole-file trace reads and post-materialization replay limits with rotation-aware streaming and source-level event bounds.
 
 ## [1.1.1] - 2026-06-27
 

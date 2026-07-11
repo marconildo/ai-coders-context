@@ -120,7 +120,7 @@ Cada entrada de trace tem este formato:
 | `message` | Descrição legível por humanos |
 | `data` | Payload estruturado opcional (resultados de sensor, contexto, etc.) |
 
-Como o arquivo é **append-only** (`.jsonl`, um objeto JSON por linha), traces são baratos de escrever e nunca reescrevem entradas anteriores. Use a action `appendTrace` da tool `harness` para adicionar um evento e `listTraces` para ler a linha do tempo.
+Como o arquivo é **append-only** (`.jsonl`, um objeto JSON por linha), traces são baratos de escrever e nunca reescrevem entradas anteriores. O harness lê segmentos legados e rotacionados de forma incremental. `listTraces` retorna uma página limitada (100 registros por padrão, máximo de 1.000) com `nextCursor` opaco, `hasMore` e metadados de bytes lidos, linhas malformadas e duração. Os filtros aceitos são `event`, `level`, `createdAfter` e `createdBefore`; leituras pontuais continuam disponíveis nas actions específicas de cada recurso.
 
 ::: note
 Valores de `event` de trace como `sensor.run` são a forma como o harness registra resultados de [sensores](/pt-br/concepts/sensors/) em uma session. É isso que depois permite que task contracts verifiquem se os sensores requeridos passaram, e que [failure datasets](/pt-br/concepts/replay-and-datasets/) agrupem eventos de nível de erro.

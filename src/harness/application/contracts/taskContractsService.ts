@@ -14,7 +14,6 @@ import { resolveRuntimeLayoutFromRepo, type RuntimeLayout } from '../../../share
 import type {
   HarnessArtifactRecord,
   HarnessRuntimeStatePort,
-  HarnessTraceRecord,
 } from '../../adapters/out/runtimeState/runtimeStateService';
 import type { HarnessSensorRun } from '../sensors/sensorsService';
 
@@ -377,10 +376,8 @@ export class HarnessTaskContractsService {
       throw new Error(`Task contract not found: ${taskId}`);
     }
 
-    const traces: HarnessTraceRecord[] = sessionId ? await this.options.stateService.listTraces(sessionId) : [];
-    const sensorRuns = traces
-      .filter((trace) => trace.event === 'sensor.run' && trace.data?.run)
-      .map((trace) => trace.data!.run as HarnessSensorRun);
+    const sensorSummary = sessionId ? await this.options.stateService.getSensorSummary(sessionId) : undefined;
+    const sensorRuns = sensorSummary ? Object.values(sensorSummary.latestBySensor) as HarnessSensorRun[] : [];
     const latestRunsBySensor = new Map<string, HarnessSensorRun>();
     for (const run of sensorRuns) {
       const current = latestRunsBySensor.get(run.sensorId);
@@ -388,7 +385,15 @@ export class HarnessTaskContractsService {
         latestRunsBySensor.set(run.sensorId, run);
       }
     }
-    const artifacts = sessionId ? await this.options.stateService.listArtifacts(sessionId) : [];
+    const artifacts: HarnessArtifactRecord[] = [];
+    if (sessionId) {
+      let cursor: string | undefined;
+      do {
+        const page = await this.options.stateService.listArtifactPage(sessionId, { limit: 200, cursor, direction: 'oldest' });
+        artifacts.push(...page.items);
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
 
     const matchedSensorRuns = contract.requiredSensors
       .map((sensorId) => latestRunsBySensor.get(sensorId))

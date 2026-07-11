@@ -59,4 +59,21 @@ describe('HarnessReplayService', () => {
     expect(list[0].sessionId).toBe(session.id);
     expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'evaluations', 'replays', `${replay.id}.json`))).toBe(true);
   });
+
+  it('applies maxEvents to materialization, response, and persistence', async () => {
+    const session = await execution.createSession({ name: 'bounded-replay' });
+    for (let index = 0; index < 20; index += 1) {
+      await execution.appendTrace(session.id, { level: 'info', event: 'step', message: `step-${index}` });
+    }
+
+    const replay = await service.replaySession(session.id, { maxEvents: 10 });
+    const persisted = await fs.readJson(path.join(tempDir, '.context', 'runtime', 'evaluations', 'replays', `${replay.id}.json`));
+    expect(replay.events).toHaveLength(10);
+    expect(replay.fidelity).toBe('partial');
+    expect(replay.omittedCounts.trace).toBeGreaterThan(0);
+    for (const source of ['artifacts', 'checkpoints', 'traces', 'sensorRuns', 'tasks', 'handoffs']) {
+      expect((replay[source as keyof typeof replay] as unknown[]).length).toBeLessThanOrEqual(10);
+      expect((persisted[source] as unknown[]).length).toBeLessThanOrEqual(10);
+    }
+  });
 });
