@@ -203,31 +203,65 @@ interface TraceLine {
   line: string;
   nextOffset: number;
   bytesRead: number;
+  oversized: boolean;
 }
+
+const TRACE_READ_CHUNK_BYTES = 64 * 1024;
+export const MAX_STREAMED_TRACE_LINE_BYTES = 1024 * 1024;
 
 async function* readLinesForward(file: string, startOffset = 0): AsyncGenerator<TraceLine> {
   const handle = await nodeFs.open(file, 'r');
-  const chunk = Buffer.allocUnsafe(64 * 1024);
+  const chunk = Buffer.allocUnsafe(TRACE_READ_CHUNK_BYTES);
   let position = startOffset;
   let carry = Buffer.alloc(0);
-  let carryStart = startOffset;
+  let discardingOversized = false;
+  let unreportedBytes = 0;
   try {
     while (true) {
       const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
       if (bytesRead === 0) break;
-      const data = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : Buffer.from(chunk.subarray(0, bytesRead));
-      let lineStart = 0;
-      for (let index = 0; index < data.length; index += 1) {
-        if (data[index] !== 0x0a) continue;
-        const nextOffset = carryStart + index + 1;
-        yield { line: data.subarray(lineStart, index).toString('utf8').replace(/\r$/, ''), nextOffset, bytesRead };
-        lineStart = index + 1;
+      unreportedBytes += bytesRead;
+      let segmentStart = 0;
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (chunk[index] !== 0x0a) continue;
+        const segment = chunk.subarray(segmentStart, index);
+        const oversized = discardingOversized || carry.length + segment.length > MAX_STREAMED_TRACE_LINE_BYTES;
+        const line = oversized
+          ? ''
+          : (carry.length ? Buffer.concat([carry, segment]) : Buffer.from(segment))
+            .toString('utf8')
+            .replace(/\r$/, '');
+        yield {
+          line,
+          nextOffset: position + index + 1,
+          bytesRead: unreportedBytes,
+          oversized,
+        };
+        unreportedBytes = 0;
+        carry = Buffer.alloc(0);
+        discardingOversized = false;
+        segmentStart = index + 1;
       }
-      carry = Buffer.from(data.subarray(lineStart));
-      carryStart += lineStart;
+
+      const trailing = chunk.subarray(segmentStart, bytesRead);
+      if (!discardingOversized) {
+        if (carry.length + trailing.length > MAX_STREAMED_TRACE_LINE_BYTES) {
+          carry = Buffer.alloc(0);
+          discardingOversized = true;
+        } else if (trailing.length > 0) {
+          carry = carry.length ? Buffer.concat([carry, trailing]) : Buffer.from(trailing);
+        }
+      }
       position += bytesRead;
     }
-    if (carry.length > 0) yield { line: carry.toString('utf8').replace(/\r$/, ''), nextOffset: position, bytesRead: 0 };
+    if (discardingOversized || carry.length > 0) {
+      yield {
+        line: discardingOversized ? '' : carry.toString('utf8').replace(/\r$/, ''),
+        nextOffset: position,
+        bytesRead: unreportedBytes,
+        oversized: discardingOversized,
+      };
+    }
   } finally {
     await handle.close();
   }
@@ -238,25 +272,66 @@ async function* readLinesReverse(file: string, startOffset?: number): AsyncGener
   const size = (await handle.stat()).size;
   let position = Math.min(startOffset ?? size, size);
   let carry = Buffer.alloc(0);
+  let discardingOversized = false;
+  let unreportedBytes = 0;
   try {
     while (position > 0) {
-      const length = Math.min(64 * 1024, position);
+      const length = Math.min(TRACE_READ_CHUNK_BYTES, position);
       position -= length;
       const chunk = Buffer.allocUnsafe(length);
       const { bytesRead } = await handle.read(chunk, 0, length, position);
-      const data = carry.length ? Buffer.concat([chunk.subarray(0, bytesRead), carry]) : Buffer.from(chunk.subarray(0, bytesRead));
+      unreportedBytes += bytesRead;
       const newlines: number[] = [];
-      for (let index = 0; index < data.length; index += 1) if (data[index] === 0x0a) newlines.push(index);
-      if (newlines.length === 0) { carry = data; continue; }
+      for (let index = 0; index < bytesRead; index += 1) {
+        if (chunk[index] === 0x0a) newlines.push(index);
+      }
+      if (newlines.length === 0) {
+        if (!discardingOversized) {
+          if (bytesRead + carry.length > MAX_STREAMED_TRACE_LINE_BYTES) {
+            carry = Buffer.alloc(0);
+            discardingOversized = true;
+          } else {
+            carry = carry.length
+              ? Buffer.concat([chunk.subarray(0, bytesRead), carry])
+              : Buffer.from(chunk.subarray(0, bytesRead));
+          }
+        }
+        continue;
+      }
+
+      let lineEnd = bytesRead;
       for (let index = newlines.length - 1; index >= 0; index -= 1) {
         const lineStart = newlines[index] + 1;
-        const lineEnd = index + 1 < newlines.length ? newlines[index + 1] : data.length;
-        const line = data.subarray(lineStart, lineEnd).toString('utf8').replace(/\r?\n$/, '').replace(/\r$/, '');
-        if (line.length > 0) yield { line, nextOffset: position + lineStart, bytesRead: index === newlines.length - 1 ? bytesRead : 0 };
+        const segment = chunk.subarray(lineStart, lineEnd);
+        const usesCarry = index === newlines.length - 1;
+        const oversized = usesCarry
+          ? discardingOversized || segment.length + carry.length > MAX_STREAMED_TRACE_LINE_BYTES
+          : segment.length > MAX_STREAMED_TRACE_LINE_BYTES;
+        const framed = oversized
+          ? Buffer.alloc(0)
+          : usesCarry && carry.length
+            ? Buffer.concat([segment, carry])
+            : Buffer.from(segment);
+        yield {
+          line: oversized ? '' : framed.toString('utf8').replace(/\r$/, ''),
+          nextOffset: position + lineStart,
+          bytesRead: unreportedBytes,
+          oversized,
+        };
+        unreportedBytes = 0;
+        lineEnd = newlines[index];
       }
-      carry = Buffer.from(data.subarray(0, newlines[0]));
+      carry = Buffer.from(chunk.subarray(0, newlines[0]));
+      discardingOversized = false;
     }
-    if (carry.length > 0) yield { line: carry.toString('utf8').replace(/\r$/, ''), nextOffset: 0, bytesRead: 0 };
+    if (discardingOversized || carry.length > 0) {
+      yield {
+        line: discardingOversized ? '' : carry.toString('utf8').replace(/\r$/, ''),
+        nextOffset: 0,
+        bytesRead: unreportedBytes,
+        oversized: discardingOversized,
+      };
+    }
   } finally {
     await handle.close();
   }
@@ -700,7 +775,7 @@ export class HarnessRuntimeStateService {
     if (await fs.pathExists(active)) files.push(active);
     for (const file of files) {
       for await (const item of readLinesForward(file)) {
-        if (!item.line.trim()) continue;
+        if (item.oversized || !item.line.trim()) continue;
         try { yield JSON.parse(item.line) as HarnessTraceRecord; } catch { /* bounded malformed diagnostic in pages */ }
       }
     }
@@ -740,6 +815,7 @@ export class HarnessRuntimeStateService {
       const iterator = direction === 'newest' ? readLinesReverse(file, initialOffset) : readLinesForward(file, initialOffset ?? 0);
       for await (const line of iterator) {
         scannedBytes += line.bytesRead;
+        if (line.oversized) { malformedCount += 1; continue; }
         if (!line.line.trim()) continue;
         let trace: HarnessTraceRecord;
         try { trace = JSON.parse(line.line) as HarnessTraceRecord; } catch { malformedCount += 1; continue; }

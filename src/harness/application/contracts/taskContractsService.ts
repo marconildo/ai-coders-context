@@ -16,6 +16,7 @@ import type {
   HarnessRuntimeStatePort,
 } from '../../adapters/out/runtimeState/runtimeStateService';
 import type { HarnessSensorRun } from '../sensors/sensorsService';
+import { boundedLimit } from '../history/runtimeHistory';
 
 /**
  * Structured artifact requirement.
@@ -186,6 +187,11 @@ export interface HarnessHandoffContract {
   metadata?: Record<string, unknown>;
 }
 
+export interface BoundedSessionContracts<T> {
+  items: T[];
+  total: number;
+}
+
 export interface HarnessTaskCompletionResult {
   taskId: string;
   sessionId?: string;
@@ -295,6 +301,17 @@ export class HarnessTaskContractsService {
     return contracts.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  async listSessionTaskContracts(
+    sessionId: string,
+    limit = 100
+  ): Promise<BoundedSessionContracts<HarnessTaskContract>> {
+    return this.listBoundedSessionContracts<HarnessTaskContract>(
+      this.tasksPath,
+      sessionId,
+      boundedLimit(limit, 100, 1000, 'session task contracts')
+    );
+  }
+
   async getTaskContract(taskId: string): Promise<HarnessTaskContract | null> {
     const filePath = await this.taskFile(taskId);
     if (!(await fs.pathExists(filePath))) {
@@ -368,6 +385,44 @@ export class HarnessTaskContractsService {
     );
 
     return contracts.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  }
+
+  async listSessionHandoffContracts(
+    sessionId: string,
+    limit = 100
+  ): Promise<BoundedSessionContracts<HarnessHandoffContract>> {
+    return this.listBoundedSessionContracts<HarnessHandoffContract>(
+      this.handoffsPath,
+      sessionId,
+      boundedLimit(limit, 100, 1000, 'session handoff contracts')
+    );
+  }
+
+  private async listBoundedSessionContracts<T extends { id: string; sessionId?: string; createdAt: string }>(
+    directoryPath: string,
+    sessionId: string,
+    limit: number
+  ): Promise<BoundedSessionContracts<T>> {
+    await this.ensureLayout();
+    const selected: T[] = [];
+    let total = 0;
+    const directory = await fs.opendir(directoryPath);
+    for await (const entry of directory) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const contract = await fs.readJson(path.join(directoryPath, entry.name)) as T;
+        if (contract.sessionId !== sessionId) continue;
+        total += 1;
+        selected.push(contract);
+        selected.sort((left, right) =>
+          left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+        );
+        if (selected.length > limit) selected.pop();
+      } catch {
+        // A malformed unrelated contract must not make replay unavailable.
+      }
+    }
+    return { items: selected, total };
   }
 
   async evaluateTaskCompletion(taskId: string, sessionId?: string): Promise<HarnessTaskCompletionResult> {

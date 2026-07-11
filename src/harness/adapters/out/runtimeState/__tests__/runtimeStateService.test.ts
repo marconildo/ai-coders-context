@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   HarnessRuntimeStateService,
+  MAX_STREAMED_TRACE_LINE_BYTES,
 } from '../runtimeStateService';
 
 describe('HarnessRuntimeStateService', () => {
@@ -200,6 +201,32 @@ describe('HarnessRuntimeStateService', () => {
     await expect(service.listTracePage(session.id, { cursor: 'not-a-cursor' })).rejects.toMatchObject({
       code: 'INVALID_RUNTIME_HISTORY_CURSOR',
     });
+  });
+
+  it('discards oversized JSONL frames with bounded memory in both directions', async () => {
+    const session = await service.createSession({ name: 'oversized-lines' });
+    const traceFile = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'trace.jsonl');
+    const oldest = {
+      id: 'oldest', sessionId: session.id, level: 'info', event: 'valid',
+      message: 'oldest', createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    const newest = {
+      id: 'newest', sessionId: session.id, level: 'info', event: 'valid',
+      message: 'newest', createdAt: '2026-01-02T00:00:00.000Z',
+    };
+    const oversized = `{"payload":"${'x'.repeat(MAX_STREAMED_TRACE_LINE_BYTES + 1)}"}`;
+    const contents = `${JSON.stringify(oldest)}\n${oversized}\n${JSON.stringify(newest)}\n`;
+    await fs.writeFile(traceFile, contents, 'utf8');
+
+    const forward = await service.listTracePage(session.id, { limit: 10, direction: 'oldest' });
+    const reverse = await service.listTracePage(session.id, { limit: 10, direction: 'newest' });
+
+    expect(forward.items.map(item => item.id)).toEqual(['oldest', 'newest']);
+    expect(reverse.items.map(item => item.id)).toEqual(['newest', 'oldest']);
+    expect(forward.malformedCount).toBe(1);
+    expect(reverse.malformedCount).toBe(1);
+    expect(forward.scannedBytes).toBe(Buffer.byteLength(contents));
+    expect(reverse.scannedBytes).toBe(Buffer.byteLength(contents));
   });
 
   it('maintains a latest sensor summary without scanning trace history', async () => {

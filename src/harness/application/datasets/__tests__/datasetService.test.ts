@@ -93,4 +93,58 @@ describe('HarnessDatasetService', () => {
     expect(dataset.partial).toBe(true);
     expect(dataset.omittedFailureCount).toBe(4);
   });
+
+  it('processes one bounded session page before requesting the next page', async () => {
+    const sessions = ['one', 'two', 'three'].map((id) => ({
+      id,
+      name: id,
+      status: 'failed',
+      repoPath: tempDir,
+      createdAt: '2026-01-01T00:00:00.000Z',
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      traceCount: 0,
+      artifactCount: 0,
+      checkpointCount: 0,
+      checkpoints: [],
+    }));
+    const processed = new Set<string>();
+    const listSessionPage = jest.fn(async ({ cursor }: { cursor?: string }) => {
+      if (!cursor) {
+        return { items: sessions.slice(0, 2), nextCursor: 'page-2', hasMore: true };
+      }
+      expect(processed).toEqual(new Set(['one', 'two']));
+      return { items: sessions.slice(2), hasMore: false };
+    });
+    const buildReplay = jest.fn(async (sessionId: string) => {
+      processed.add(sessionId);
+      const session = sessions.find(item => item.id === sessionId)!;
+      return {
+        id: `replay-${sessionId}`,
+        sessionId,
+        session,
+        sensorRuns: [],
+        tasks: [],
+        traces: [],
+      } as any;
+    });
+    const paged = new HarnessDatasetService({
+      repoPath: tempDir,
+      dependencies: {
+        stateService: { listSessionPage } as any,
+        replayService: { buildReplay },
+        taskContractsService: { evaluateTaskCompletion: jest.fn() },
+      },
+    });
+
+    const dataset = await paged.buildFailureDataset({
+      includeSuccessfulSessions: true,
+      concurrency: 1,
+    });
+
+    expect(listSessionPage).toHaveBeenCalledTimes(2);
+    expect(buildReplay).toHaveBeenCalledTimes(3);
+    expect(dataset.sessionCount).toBe(3);
+    expect(dataset.replayCount).toBe(3);
+  });
 });

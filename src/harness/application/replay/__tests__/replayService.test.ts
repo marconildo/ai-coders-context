@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { HarnessExecutionService } from '../../execution/executionService';
+import { HarnessTaskContractsService } from '../../contracts/taskContractsService';
 import { HarnessReplayService } from '../replayService';
 
 describe('HarnessReplayService', () => {
@@ -17,6 +18,7 @@ describe('HarnessReplayService', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await fs.remove(tempDir);
   });
 
@@ -75,5 +77,31 @@ describe('HarnessReplayService', () => {
       expect((replay[source as keyof typeof replay] as unknown[]).length).toBeLessThanOrEqual(10);
       expect((persisted[source] as unknown[]).length).toBeLessThanOrEqual(10);
     }
+  });
+
+  it('reads bounded session-scoped contracts without global materialization', async () => {
+    const target = await execution.createSession({ name: 'bounded-contracts' });
+    const other = await execution.createSession({ name: 'unrelated-contracts' });
+    for (let index = 0; index < 5; index += 1) {
+      await execution.createTaskContract({ title: `target-${index}`, sessionId: target.id });
+      await execution.createTaskContract({ title: `other-${index}`, sessionId: other.id });
+      await execution.createHandoffContract({ from: 'a', to: `target-${index}`, sessionId: target.id });
+      await execution.createHandoffContract({ from: 'a', to: `other-${index}`, sessionId: other.id });
+    }
+    const listTasks = jest.spyOn(HarnessTaskContractsService.prototype, 'listTaskContracts');
+    const listHandoffs = jest.spyOn(HarnessTaskContractsService.prototype, 'listHandoffContracts');
+    const scopedTasks = jest.spyOn(HarnessTaskContractsService.prototype, 'listSessionTaskContracts');
+    const scopedHandoffs = jest.spyOn(HarnessTaskContractsService.prototype, 'listSessionHandoffContracts');
+
+    const replay = await service.buildReplay(target.id, { maxEvents: 2 });
+
+    expect(listTasks).not.toHaveBeenCalled();
+    expect(listHandoffs).not.toHaveBeenCalled();
+    expect(scopedTasks).toHaveBeenCalledWith(target.id, 2);
+    expect(scopedHandoffs).toHaveBeenCalledWith(target.id, 2);
+    expect(replay.tasks).toHaveLength(2);
+    expect(replay.handoffs).toHaveLength(2);
+    expect(replay.sourceCounts.task).toBe(5);
+    expect(replay.sourceCounts.handoff).toBe(5);
   });
 });

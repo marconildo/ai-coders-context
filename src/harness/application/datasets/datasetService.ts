@@ -3,7 +3,11 @@ import * as path from 'path';
 import { randomUUID } from 'crypto';
 
 import { resolveRuntimeLayoutFromRepo } from '../../../shared/fs/pathHelpers';
-import { HarnessRuntimeStateService, type HarnessRuntimeStatePort } from '../../adapters/out/runtimeState/runtimeStateService';
+import {
+  HarnessRuntimeStateService,
+  type HarnessRuntimeStatePort,
+  type HarnessSessionRecord,
+} from '../../adapters/out/runtimeState/runtimeStateService';
 import { HarnessReplayService, type HarnessReplayRecord } from '../replay/replayService';
 import { HarnessSensorsService } from '../sensors/sensorsService';
 import { HarnessTaskContractsService } from '../contracts/taskContractsService';
@@ -267,49 +271,71 @@ export class HarnessDatasetService {
   async buildFailureDataset(options: BuildHarnessDatasetOptions = {}): Promise<HarnessFailureDataset> {
     const concurrency = boundedLimit(options.concurrency, 1, 4, 'dataset concurrency');
     const maxFailures = boundedLimit(options.maxFailures, 10_000, 10_000, 'dataset failures');
-    const sessions = [];
-    if (options.sessionIds?.length) {
-      for (const sessionId of options.sessionIds) sessions.push(await this.stateService.getSession(sessionId));
-    } else {
-      let cursor: string | undefined;
-      do {
-        const page = await this.stateService.listSessionPage({ limit: 200, cursor });
-        sessions.push(...page.items);
-        cursor = page.nextCursor;
-      } while (cursor);
-    }
-
-    const selectedSessions = options.includeSuccessfulSessions
-      ? sessions
-      : sessions.filter(session => session.status !== 'completed');
-
     const failures: HarnessFailureRecord[] = [];
     let omittedFailureCount = 0;
-    let nextIndex = 0;
+    let sessionCount = 0;
+    let replayCount = 0;
     const retain = (records: HarnessFailureRecord[]) => {
       const available = Math.max(0, maxFailures - failures.length);
       failures.push(...records.slice(0, available));
       omittedFailureCount += Math.max(0, records.length - available);
     };
-    const worker = async () => {
-      while (true) {
-        const index = nextIndex++;
-        if (index >= selectedSessions.length) return;
-        const replay = await this.replayService.buildReplay(selectedSessions[index].id, { includePayloads: false, maxEvents: 1000 });
-        retain(buildSensorFailures(replay));
-        retain(await buildTaskFailures(replay, this.taskContractsService));
-        retain(buildSessionFailure(replay));
-        retain(buildTraceFailures(replay));
-      }
+
+    const processSession = async (session: HarnessSessionRecord): Promise<void> => {
+      if (!options.includeSuccessfulSessions && session.status === 'completed') return;
+      sessionCount += 1;
+      const replay = await this.replayService.buildReplay(session.id, {
+        includePayloads: false,
+        maxEvents: 1000,
+      });
+      replayCount += 1;
+      retain(buildSensorFailures(replay));
+      retain(await buildTaskFailures(replay, this.taskContractsService));
+      retain(buildSessionFailure(replay));
+      retain(buildTraceFailures(replay));
     };
-    await Promise.all(Array.from({ length: Math.min(concurrency, selectedSessions.length) }, () => worker()));
+
+    const processBatch = async <T>(
+      batch: T[],
+      resolveSession: (item: T) => Promise<HarnessSessionRecord>
+    ): Promise<void> => {
+      let nextIndex = 0;
+      const worker = async () => {
+        while (true) {
+          const index = nextIndex++;
+          if (index >= batch.length) return;
+          await processSession(await resolveSession(batch[index]));
+        }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(concurrency, batch.length) },
+        () => worker()
+      ));
+    };
+
+    if (options.sessionIds?.length) {
+      for (let start = 0; start < options.sessionIds.length; start += 200) {
+        await processBatch(
+          options.sessionIds.slice(start, start + 200),
+          (sessionId) => this.stateService.getSession(sessionId)
+        );
+      }
+    } else {
+      let cursor: string | undefined;
+      do {
+        const page = await this.stateService.listSessionPage({ limit: 200, cursor });
+        await processBatch(page.items, async (session) => session);
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
+
     const clusters = clusterFailures(failures);
     const dataset: HarnessFailureDataset = {
       id: randomUUID(),
       createdAt: nowIso(),
       repoPath: this.repoPath,
-      sessionCount: selectedSessions.length,
-      replayCount: selectedSessions.length,
+      sessionCount,
+      replayCount,
       failureCount: failures.length,
       clusterCount: clusters.length,
       failures,

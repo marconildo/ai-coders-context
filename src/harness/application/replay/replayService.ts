@@ -88,7 +88,10 @@ export interface HarnessReplaySummary {
 export interface HarnessReplayDependencies {
   stateService: HarnessRuntimeStatePort;
   sensorsService: Pick<HarnessSensorsService, 'getSessionSensorRuns'>;
-  contractsService: Pick<HarnessTaskContractsService, 'listTaskContracts' | 'listHandoffContracts'>;
+  contractsService: Pick<
+    HarnessTaskContractsService,
+    'listSessionTaskContracts' | 'listSessionHandoffContracts'
+  >;
 }
 
 function nowIso(): string {
@@ -156,20 +159,20 @@ export class HarnessReplayService {
   ): Promise<HarnessReplayRecord> {
     const maxEvents = boundedLimit(options.maxEvents, 100, 1000, 'replay events');
     const session = await this.stateService.getSession(sessionId);
-    const [tracePage, artifactPage, sensorRuns, tasks, handoffs] = await Promise.all([
+    const [tracePage, artifactPage, allSensorRuns, taskScan, handoffScan] = await Promise.all([
       this.stateService.listTracePage(sessionId, { limit: maxEvents, direction: 'oldest' }),
       this.stateService.listArtifactPage(sessionId, { limit: Math.min(maxEvents, 200), direction: 'oldest' }),
       this.sensorsService.getSessionSensorRuns(sessionId),
-      this.contractsService.listTaskContracts(),
-      this.contractsService.listHandoffContracts(),
+      this.contractsService.listSessionTaskContracts(sessionId, maxEvents),
+      this.contractsService.listSessionHandoffContracts(sessionId, maxEvents),
     ]);
 
     const traces = tracePage.items;
     const artifacts = artifactPage.items;
     const checkpoints = session.checkpoints.slice(0, maxEvents);
-
-    const sessionTasks = tasks.filter((task) => task.sessionId === sessionId);
-    const sessionHandoffs = handoffs.filter((handoff) => handoff.sessionId === sessionId);
+    const sensorRuns = sortByCreatedAt(allSensorRuns).slice(0, maxEvents);
+    const sessionTasks = taskScan.items;
+    const sessionHandoffs = handoffScan.items;
 
     const events: HarnessReplayEvent[] = [
       {
@@ -278,9 +281,9 @@ export class HarnessReplayService {
       trace: session.traceCount,
       artifact: session.artifactCount,
       checkpoint: session.checkpointCount,
-      sensor: sensorRuns.length,
-      task: sessionTasks.length,
-      handoff: sessionHandoffs.length,
+      sensor: allSensorRuns.length,
+      task: taskScan.total,
+      handoff: handoffScan.total,
     };
     const includedCounts = orderedEvents.reduce((counts, event) => {
       counts[event.source] += 1;
