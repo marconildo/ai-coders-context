@@ -20,7 +20,9 @@ export interface AnalysisMetrics extends SemanticAnalysisMetrics {
   fingerprint: {
     files: number;
     bytesRead: number;
+    contentReads: number;
     cacheHits: number;
+    discoveries: number;
     durationMs: number;
   };
 }

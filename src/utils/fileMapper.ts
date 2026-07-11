@@ -10,8 +10,11 @@ export class FileMapper {
     '**/node_modules',
     '**/node_modules/**',
     '.git/**',
+    '.git',
     'dist/**',
     'build/**',
+    '.context/**',
+    '.context',
     '*.log',
     '.env*',
     '*.tmp',
@@ -54,7 +57,7 @@ export class FileMapper {
       const files = await glob(pattern, {
         cwd: absolutePath,
         ignore: ignorePatterns,
-        dot: false,
+        dot: true,
         absolute: false
       });
       allFiles.push(...files);
@@ -81,6 +84,8 @@ export class FileMapper {
             relativePath,
             extension: path.extname(relativePath),
             size: stats.size,
+            mtimeMs: stats.mtimeMs,
+            ctimeMs: stats.ctimeMs,
             type: stats.isDirectory() ? 'directory' : 'file'
           };
 

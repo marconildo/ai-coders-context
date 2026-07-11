@@ -3,7 +3,11 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { FileMapper } from '../../../../../utils/fileMapper';
-import { RepositoryChangingError, SemanticSnapshotService } from '../semanticSnapshotService';
+import {
+  RepositoryChangingError,
+  SemanticFingerprintCache,
+  SemanticSnapshotService,
+} from '../semanticSnapshotService';
 
 describe('SemanticSnapshotService', () => {
   let tempDir: string;
@@ -118,6 +122,104 @@ describe('SemanticSnapshotService', () => {
     expect(initial.bytesRead).toBeGreaterThan(0);
     expect(repeated.bytesRead).toBe(0);
     expect(repeated.cacheHits).toBe(repeated.files);
+  });
+
+  it('reuses bounded content hashes across short-lived service operations', async () => {
+    const cache = new SemanticFingerprintCache(100, 60_000);
+    const mapper = new FileMapper();
+    const firstDiscovery = await mapper.mapRepository(repoPath);
+    const initial = await new SemanticSnapshotService(true, cache)
+      .captureRepoFingerprintWithMetrics(repoPath, firstDiscovery);
+
+    const secondDiscovery = await mapper.mapRepository(repoPath);
+    const repeated = await new SemanticSnapshotService(true, cache)
+      .captureRepoFingerprintWithMetrics(repoPath, secondDiscovery);
+
+    expect(initial.discoveries).toBe(0);
+    expect(initial.contentReads).toBe(initial.files);
+    expect(repeated.fingerprint).toBe(initial.fingerprint);
+    expect(repeated.discoveries).toBe(0);
+    expect(repeated.contentReads).toBe(0);
+    expect(repeated.bytesRead).toBe(0);
+    expect(repeated.cacheHits).toBe(repeated.files);
+    expect(cache.size).toBe(repeated.files);
+  });
+
+  it('produces the same fingerprint from shared discovery and fallback discovery', async () => {
+    const mapper = new FileMapper();
+    const discovery = await mapper.mapRepository(repoPath);
+    const service = new SemanticSnapshotService();
+
+    const shared = await service.captureRepoFingerprintWithMetrics(repoPath, discovery);
+    const fallback = await service.captureRepoFingerprintWithMetrics(repoPath);
+
+    expect(shared.discoveries).toBe(0);
+    expect(fallback.discoveries).toBe(1);
+    expect(fallback.fingerprint).toBe(shared.fingerprint);
+  });
+
+  it('keeps shared hashes correct for dirty, new, and deleted files', async () => {
+    const cache = new SemanticFingerprintCache(100, 60_000);
+    const mapper = new FileMapper();
+    const capture = async () => new SemanticSnapshotService(true, cache)
+      .captureRepoFingerprintWithMetrics(repoPath, await mapper.mapRepository(repoPath));
+
+    const initial = await capture();
+    const targetPath = path.join(repoPath, 'src', 'index.ts');
+    const targetStats = await fs.stat(targetPath);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    await fs.writeFile(targetPath, 'export const run = () => fals;\n', 'utf-8');
+    await fs.utimes(targetPath, targetStats.atime, targetStats.mtime);
+    const dirty = await capture();
+    expect(dirty.fingerprint).not.toBe(initial.fingerprint);
+    expect(dirty.contentReads).toBe(1);
+
+    await fs.writeFile(path.join(repoPath, 'src', 'new.ts'), 'export const added = true;\n');
+    const withNewFile = await capture();
+    expect(withNewFile.fingerprint).not.toBe(dirty.fingerprint);
+    expect(withNewFile.contentReads).toBe(1);
+
+    await fs.remove(path.join(repoPath, 'src', 'auth.ts'));
+    const withDeletedFile = await capture();
+    expect(withDeletedFile.fingerprint).not.toBe(withNewFile.fingerprint);
+    expect(withDeletedFile.contentReads).toBe(0);
+    expect(withDeletedFile.cacheHits).toBe(withDeletedFile.files);
+    expect(cache.size).toBe(withDeletedFile.files);
+  });
+
+  it('does not use or populate an injected cache when caching is disabled', async () => {
+    const cache = new SemanticFingerprintCache(100, 60_000);
+    const mapper = new FileMapper();
+    const discovery = await mapper.mapRepository(repoPath);
+    const first = await new SemanticSnapshotService(false, cache)
+      .captureRepoFingerprintWithMetrics(repoPath, discovery);
+    const repeated = await new SemanticSnapshotService(false, cache)
+      .captureRepoFingerprintWithMetrics(repoPath, discovery);
+
+    expect(first.contentReads).toBe(first.files);
+    expect(repeated.contentReads).toBe(repeated.files);
+    expect(repeated.cacheHits).toBe(0);
+    expect(cache.size).toBe(0);
+  });
+
+  it('bounds shared cache entries, expires them, and supports explicit disposal', () => {
+    let now = 1_000;
+    const nowSpy = jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const cache = new SemanticFingerprintCache(2, 10);
+    const cachePrefix = path.resolve(repoPath).toLowerCase();
+    try {
+      cache.set(`${cachePrefix}\0a.ts`, 'm1', 'h1');
+      cache.set(`${cachePrefix}\0b.ts`, 'm2', 'h2');
+      cache.set(`${cachePrefix}\0c.ts`, 'm3', 'h3');
+      expect(cache.size).toBe(2);
+
+      now += 11;
+      expect(cache.get(`${cachePrefix}\0c.ts`, 'm3')).toBeUndefined();
+      cache.dispose(repoPath);
+      expect(cache.size).toBe(0);
+    } finally {
+      nowSpy.mockRestore();
+    }
   });
 
   it('honors disabled fingerprint caching', async () => {

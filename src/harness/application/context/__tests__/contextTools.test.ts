@@ -13,6 +13,7 @@ import { CodebaseAnalyzer } from '../../../adapters/out/semantic';
 import { DocumentationGenerator } from '../scaffolding/generators/documentation/documentationGenerator';
 import { AgentGenerator } from '../scaffolding/generators/agents/agentGenerator';
 import { SemanticSnapshotService } from '../../../adapters/out/semantic';
+import { FileMapper } from '../../../../utils/fileMapper';
 
 describe('contextTools sensors scaffolding', () => {
   let tempDir: string;
@@ -73,6 +74,48 @@ describe('contextTools sensors scaffolding', () => {
       semantics: analyzed.context,
       functionalPatterns: analyzed.functionalPatterns,
     }));
+  });
+
+  it('performs one discovery per operation and reuses fingerprint reads across operations', async () => {
+    const repositoryDiscovery = jest.spyOn(FileMapper.prototype, 'mapRepository');
+    const fingerprintDiscovery = jest.spyOn(
+      SemanticSnapshotService.prototype as any,
+      'discoverFingerprintFiles'
+    );
+
+    const first = await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'both',
+        semantic: true,
+        generateQA: false,
+        generateSkills: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    ) as Record<string, any>;
+    const second = await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'both',
+        semantic: true,
+        generateQA: false,
+        generateSkills: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    ) as Record<string, any>;
+
+    const firstFingerprint = first._metadata.analysis.metrics.fingerprint;
+    const secondFingerprint = second._metadata.analysis.metrics.fingerprint;
+    expect(repositoryDiscovery).toHaveBeenCalledTimes(2);
+    expect(fingerprintDiscovery).not.toHaveBeenCalled();
+    expect(firstFingerprint.discoveries).toBe(0);
+    expect(firstFingerprint.contentReads).toBe(firstFingerprint.files);
+    expect(secondFingerprint.discoveries).toBe(0);
+    expect(secondFingerprint.contentReads).toBe(0);
+    expect(secondFingerprint.bytesRead).toBe(0);
+    expect(secondFingerprint.cacheHits).toBe(secondFingerprint.files);
   });
 
   it('includes bootstrap sensors.json in pending writes and listToFill', async () => {

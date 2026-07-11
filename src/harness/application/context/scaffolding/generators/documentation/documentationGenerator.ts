@@ -76,6 +76,8 @@ interface DocumentationGenerationConfig {
   }) => void;
   /** Preferred operation-scoped input from context init. */
   analysisBundle?: AnalysisBundle;
+  /** Operation-owned service; avoids rebuilding fingerprint cache ownership. */
+  snapshotService?: SemanticSnapshotService;
 }
 
 export class DocumentationGenerator {
@@ -92,7 +94,7 @@ export class DocumentationGenerator {
     const docsDir = path.join(outputDir, 'docs');
     await GeneratorUtils.ensureDirectoryAndLog(docsDir, verbose, 'Generating documentation scaffold in');
     const snapshotService = (config.semantic || config.semanticContext)
-      ? new SemanticSnapshotService(config.cacheEnabled ?? true)
+      ? config.snapshotService ?? new SemanticSnapshotService(config.cacheEnabled ?? true)
       : null;
 
     // Perform semantic analysis if enabled

@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { promises as nativeFs } from 'fs';
 import * as fs from 'fs-extra';
 import { glob } from 'glob';
 import * as path from 'path';
@@ -99,6 +100,7 @@ const VERSIONS_DIRNAME = 'versions';
 const MAX_REFRESH_ATTEMPTS = 2;
 const MAX_VERSION_HISTORY = 3;
 const MAX_FINGERPRINT_CACHE_ENTRIES = 10_000;
+const DEFAULT_FINGERPRINT_CACHE_TTL_MS = 5 * 60_000;
 
 const SECTION_FILENAMES: Record<SnapshotFileSection, string> = {
   stack: 'stack.json',
@@ -170,11 +172,78 @@ interface FingerprintCacheEntry {
   lastUsedAt: number;
 }
 
+/**
+ * Bounded metadata/content-hash cache that may be injected into short-lived
+ * snapshot services. It never stores file contents or semantic analyses.
+ */
+export class SemanticFingerprintCache {
+  private readonly entries = new Map<string, FingerprintCacheEntry>();
+
+  constructor(
+    private readonly maxEntries = MAX_FINGERPRINT_CACHE_ENTRIES,
+    private readonly ttlMs = DEFAULT_FINGERPRINT_CACHE_TTL_MS
+  ) {}
+
+  get(cacheKey: string, metadata: string): string | undefined {
+    const entry = this.entries.get(cacheKey);
+    if (!entry) return undefined;
+    const now = Date.now();
+    if (now - entry.lastUsedAt > this.ttlMs) {
+      this.entries.delete(cacheKey);
+      return undefined;
+    }
+    if (entry.metadata !== metadata) return undefined;
+    entry.lastUsedAt = now;
+    return entry.contentHash;
+  }
+
+  set(cacheKey: string, metadata: string, contentHash: string): void {
+    this.entries.set(cacheKey, { metadata, contentHash, lastUsedAt: Date.now() });
+    this.prune();
+  }
+
+  reconcileRepo(repoPrefix: string, liveCacheKeys: Set<string>): void {
+    for (const key of this.entries.keys()) {
+      if (key.startsWith(repoPrefix) && !liveCacheKeys.has(key)) this.entries.delete(key);
+    }
+    this.prune();
+  }
+
+  dispose(repoPath?: string): void {
+    if (!repoPath) {
+      this.entries.clear();
+      return;
+    }
+    const prefix = `${path.resolve(repoPath).toLowerCase()}\0`;
+    for (const key of this.entries.keys()) {
+      if (key.startsWith(prefix)) this.entries.delete(key);
+    }
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  private prune(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.entries) {
+      if (now - entry.lastUsedAt > this.ttlMs) this.entries.delete(key);
+    }
+    if (this.entries.size <= this.maxEntries) return;
+    const stale = [...this.entries.entries()]
+      .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)
+      .slice(0, this.entries.size - this.maxEntries);
+    for (const [key] of stale) this.entries.delete(key);
+  }
+}
+
 export interface RepoFingerprintResult {
   fingerprint: string;
   files: number;
   bytesRead: number;
+  contentReads: number;
   cacheHits: number;
+  discoveries: number;
   durationMs: number;
 }
 
@@ -192,16 +261,21 @@ export class RepositoryChangingError extends Error {
 
 export class SemanticSnapshotService {
   private static readonly inFlightRefreshes = new Map<string, Promise<SemanticSnapshotWriteResult>>();
-  private readonly fingerprintCache = new Map<string, FingerprintCacheEntry>();
 
-  constructor(private readonly cacheEnabled = true) {}
+  constructor(
+    private readonly cacheEnabled = true,
+    private readonly fingerprintCache = new SemanticFingerprintCache()
+  ) {}
 
-  async captureRepoFingerprint(repoPath: string): Promise<string> {
-    return (await this.computeRepoFingerprint(repoPath)).fingerprint;
+  async captureRepoFingerprint(repoPath: string, discovery?: RepoStructure): Promise<string> {
+    return (await this.computeRepoFingerprint(repoPath, discovery)).fingerprint;
   }
 
-  async captureRepoFingerprintWithMetrics(repoPath: string): Promise<RepoFingerprintResult> {
-    return this.computeRepoFingerprint(repoPath);
+  async captureRepoFingerprintWithMetrics(
+    repoPath: string,
+    discovery?: RepoStructure
+  ): Promise<RepoFingerprintResult> {
+    return this.computeRepoFingerprint(repoPath, discovery);
   }
 
   async writeSnapshot(
@@ -349,15 +423,15 @@ export class SemanticSnapshotService {
       const publishedSummaryPath = path.join(snapshotDir, SUMMARY_FILENAME);
 
       for (let attempt = 1; attempt <= MAX_REFRESH_ATTEMPTS; attempt += 1) {
-        const repoFingerprint = (await this.computeRepoFingerprint(repoPath)).fingerprint;
         const repoStructure = await fileMapper.mapRepository(repoPath);
+        const repoFingerprint = (await this.computeRepoFingerprint(repoPath, repoStructure)).fingerprint;
         const generationStartedAt = Date.now();
         const artifacts = await this.buildSnapshotArtifacts(repoStructure, {
           outputDir,
           repoFingerprint,
         });
         const generationMs = Date.now() - generationStartedAt;
-        const currentFingerprint = (await this.computeRepoFingerprint(repoPath)).fingerprint;
+        const currentFingerprint = (await this.computeRepoFingerprint(repoPath, repoStructure)).fingerprint;
 
         if (currentFingerprint !== repoFingerprint) {
           continue;
@@ -768,59 +842,75 @@ export class SemanticSnapshotService {
     return expectedFingerprint === (await this.computeRepoFingerprint(repoPath)).fingerprint;
   }
 
-  private async computeRepoFingerprint(repoPath: string): Promise<RepoFingerprintResult> {
+  private async computeRepoFingerprint(
+    repoPath: string,
+    discovery?: RepoStructure
+  ): Promise<RepoFingerprintResult> {
     const startedAt = Date.now();
-    const extensionPattern = `**/*.{${[...FINGERPRINT_CODE_EXTENSIONS]
-      .map((extension) => extension.slice(1))
-      .join(',')}}`;
-    const files = await glob([
-      extensionPattern,
-      '{src,lib,bin,app,packages,scripts}/**/*',
-      ...FINGERPRINT_ROOT_FILES,
-      '.github/workflows/**/*.{yml,yaml}',
-    ], {
-      cwd: repoPath,
-      nodir: true,
-      dot: true,
-      ignore: FINGERPRINT_IGNORE_PATTERNS,
-    });
-
-    const relevantFiles = files
+    const files = discovery
+      ? discovery.files.map((file) => file.relativePath)
+      : await this.discoverFingerprintFiles(repoPath);
+    const discoveries = discovery ? 0 : 1;
+    const relevantFiles = [...new Set(files.map((file) => file.split(path.sep).join('/')))]
       .filter((filePath) => this.isFingerprintRelevant(filePath))
       .sort();
+    const relevantDirectories = this.fingerprintDirectoriesForFiles(relevantFiles);
 
     const hash = createHash('sha256');
     let bytesRead = 0;
+    let contentReads = 0;
     let cacheHits = 0;
     const liveCacheKeys = new Set<string>();
+    const repoPrefix = `${path.resolve(repoPath).toLowerCase()}\0`;
     for (const relativePath of relevantFiles) {
       const absolutePath = path.join(repoPath, relativePath);
-      const cacheKey = `${path.resolve(repoPath).toLowerCase()}\0${relativePath}`;
+      const cacheKey = `${repoPrefix}${relativePath}`;
       liveCacheKeys.add(cacheKey);
       try {
-        const stats = await fs.stat(absolutePath);
-        const metadata = `${stats.size}:${stats.mtimeMs}:${stats.ctimeMs}`;
+        const stats = await nativeFs.stat(absolutePath, { bigint: true });
+        const metadata = `${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
         let contentHash: string;
-        const cached = this.cacheEnabled ? this.fingerprintCache.get(cacheKey) : undefined;
-        if (cached?.metadata === metadata) {
-          contentHash = cached.contentHash;
-          cached.lastUsedAt = Date.now();
+        const cachedHash = this.cacheEnabled
+          ? this.fingerprintCache.get(cacheKey, metadata)
+          : undefined;
+        if (cachedHash) {
+          contentHash = cachedHash;
           cacheHits += 1;
         } else {
           const content = await fs.readFile(absolutePath);
           bytesRead += content.byteLength;
+          contentReads += 1;
           contentHash = createHash('sha256').update(content).digest('hex');
           if (this.cacheEnabled) {
-            this.fingerprintCache.set(cacheKey, {
-              metadata,
-              contentHash,
-              lastUsedAt: Date.now(),
-            });
+            this.fingerprintCache.set(cacheKey, metadata, contentHash);
           }
         }
-        hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeMs}\0${contentHash}\n`);
+        hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0${contentHash}\n`);
       } catch {
         hash.update(`${relativePath}:missing\n`);
+      }
+    }
+
+    // Directory metadata detects files created during stabilization without a
+    // second enumeration. A retry remaps the repository and includes them.
+    for (const relativePath of relevantDirectories) {
+      try {
+        const absoluteDirectory = relativePath === '.'
+          ? repoPath
+          : path.join(repoPath, relativePath);
+        const entriesHash = await this.hashRelevantDirectoryEntries(repoPath, relativePath);
+        if (relativePath === '.') {
+          // Root metadata also changes for ignored entries such as .context;
+          // its filtered entry signature is the stable relevant signal.
+          hash.update(`dir:.\0${entriesHash}\n`);
+        } else {
+          const stats = await nativeFs.stat(absoluteDirectory, { bigint: true });
+          hash.update(
+            `dir:${relativePath}\0${stats.size}\0${stats.mtimeNs}\0${stats.ctimeNs}\0${entriesHash}\n`
+          );
+        }
+      } catch {
+        hash.update(`dir:${relativePath}:missing\n`);
       }
     }
 
@@ -834,33 +924,35 @@ export class SemanticSnapshotService {
     }
 
     if (this.cacheEnabled) {
-      for (const key of this.fingerprintCache.keys()) {
-        if (key.startsWith(`${path.resolve(repoPath).toLowerCase()}\0`) && !liveCacheKeys.has(key)) {
-          this.fingerprintCache.delete(key);
-        }
-      }
-      this.pruneFingerprintCache();
+      this.fingerprintCache.reconcileRepo(repoPrefix, liveCacheKeys);
     }
 
     return {
       fingerprint: hash.digest('hex'),
       files: relevantFiles.length,
       bytesRead,
+      contentReads,
       cacheHits,
+      discoveries,
       durationMs: Date.now() - startedAt,
     };
   }
 
-  private pruneFingerprintCache(): void {
-    if (this.fingerprintCache.size <= MAX_FINGERPRINT_CACHE_ENTRIES) {
-      return;
-    }
-    const stale = [...this.fingerprintCache.entries()]
-      .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)
-      .slice(0, this.fingerprintCache.size - MAX_FINGERPRINT_CACHE_ENTRIES);
-    for (const [key] of stale) {
-      this.fingerprintCache.delete(key);
-    }
+  private async discoverFingerprintFiles(repoPath: string): Promise<string[]> {
+    const extensionPattern = `**/*.{${[...FINGERPRINT_CODE_EXTENSIONS]
+      .map((extension) => extension.slice(1))
+      .join(',')}}`;
+    return glob([
+      extensionPattern,
+      '{src,lib,bin,app,packages,scripts}/**/*',
+      ...FINGERPRINT_ROOT_FILES,
+      '.github/workflows/**/*.{yml,yaml}',
+    ], {
+      cwd: repoPath,
+      nodir: true,
+      dot: true,
+      ignore: FINGERPRINT_IGNORE_PATTERNS,
+    });
   }
 
   private isFingerprintRelevant(relativePath: string): boolean {
@@ -874,5 +966,58 @@ export class SemanticSnapshotService {
     }
 
     return FINGERPRINT_CODE_EXTENSIONS.has(path.extname(relativePath).toLowerCase());
+  }
+
+  private fingerprintDirectoriesForFiles(relevantFiles: string[]): string[] {
+    const directories = new Set<string>(['.']);
+    for (const file of relevantFiles) {
+      let directory = path.posix.dirname(file);
+      while (directory !== '.') {
+        directories.add(directory);
+        directory = path.posix.dirname(directory);
+      }
+    }
+    return [...directories].sort();
+  }
+
+  private async hashRelevantDirectoryEntries(
+    repoPath: string,
+    relativeDirectory: string
+  ): Promise<string> {
+    const absoluteDirectory = relativeDirectory === '.'
+      ? repoPath
+      : path.join(repoPath, relativeDirectory);
+    const aggregate = Buffer.alloc(32);
+    let count = 0;
+    const directory = await nativeFs.opendir(absoluteDirectory);
+    for await (const entry of directory) {
+      const relativePath = relativeDirectory === '.'
+        ? entry.name
+        : path.posix.join(relativeDirectory, entry.name);
+      if (!this.isFingerprintDirectoryEntryRelevant(relativePath, entry.isDirectory())) continue;
+      const entryHash = createHash('sha256')
+        .update(`${entry.isDirectory() ? 'd' : 'f'}:${entry.name}`)
+        .digest();
+      for (let index = 0; index < aggregate.length; index += 1) {
+        aggregate[index] ^= entryHash[index];
+      }
+      count += 1;
+    }
+    return `${count}:${aggregate.toString('hex')}`;
+  }
+
+  private isFingerprintDirectoryEntryRelevant(
+    relativePath: string,
+    isDirectory: boolean
+  ): boolean {
+    const normalized = relativePath.split(path.sep).join('/');
+    const segments = normalized.split('/');
+    if (segments.some((segment) => [
+      'node_modules', '.git', 'dist', 'build', 'coverage', '.context',
+      'vendor', '__pycache__',
+    ].includes(segment))) return false;
+    if (!isDirectory) return this.isFingerprintRelevant(normalized);
+    if (segments.length > 1) return true;
+    return ['src', 'lib', 'bin', 'app', 'packages', 'scripts', '.github'].includes(segments[0]);
   }
 }

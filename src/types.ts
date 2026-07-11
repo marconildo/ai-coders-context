@@ -3,6 +3,9 @@ export interface FileInfo {
   relativePath: string;
   extension: string;
   size: number;
+  /** Filesystem metadata captured during bounded repository discovery. */
+  mtimeMs?: number;
+  ctimeMs?: number;
   content?: string;
   type: 'file' | 'directory';
 }

@@ -10,6 +10,7 @@ import { getScaffoldStructure, serializeStructureForAI } from './scaffolding/gen
 import { DocumentationGenerator } from './scaffolding/generators/documentation/documentationGenerator';
 import {
   CodebaseAnalyzer,
+  SemanticFingerprintCache,
   SemanticSnapshotService,
   type SemanticAnalysisBundle,
 } from '../../adapters/out/semantic';
@@ -33,6 +34,14 @@ import { resolveRuntimeLayout } from '../../../shared/fs/pathHelpers';
 import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
 import type { AnalysisBundle } from './analysisBundle';
+
+// Context tools are long-lived while each operation remains short-lived. Only
+// bounded fingerprint metadata/content hashes cross operation boundaries.
+const contextFingerprintCache = new SemanticFingerprintCache();
+
+function createContextSnapshotService(cacheEnabled = true): SemanticSnapshotService {
+  return new SemanticSnapshotService(cacheEnabled, contextFingerprintCache);
+}
 
 type ToolContext = unknown;
 
@@ -653,14 +662,19 @@ export const initializeContextTool = createInternalTool<
       let analysisBundle: AnalysisBundle | undefined;
       let semanticFingerprint: string | undefined;
       let fingerprintMetrics: Awaited<ReturnType<SemanticSnapshotService['captureRepoFingerprintWithMetrics']>> | undefined;
+      const snapshotService = semantic
+        ? createContextSnapshotService(cacheEnabled)
+        : undefined;
       if (semantic) {
         const analyzer = new CodebaseAnalyzer({
           exclude: [...new Set([...DEFAULT_EXCLUDE_PATTERNS, ...exclude])],
           cacheEnabled,
         });
         try {
-          const snapshotService = new SemanticSnapshotService(cacheEnabled);
-          fingerprintMetrics = await snapshotService.captureRepoFingerprintWithMetrics(resolvedRepoPath);
+          fingerprintMetrics = await snapshotService!.captureRepoFingerprintWithMetrics(
+            resolvedRepoPath,
+            repoStructure
+          );
           semanticFingerprint = fingerprintMetrics.fingerprint;
           semanticBundle = await analyzer.analyzeBundle(
             resolvedRepoPath,
@@ -700,7 +714,9 @@ export const initializeContextTool = createInternalTool<
             fingerprint: {
               files: fingerprintMetrics.files,
               bytesRead: fingerprintMetrics.bytesRead,
+              contentReads: fingerprintMetrics.contentReads,
               cacheHits: fingerprintMetrics.cacheHits,
+              discoveries: fingerprintMetrics.discoveries,
               durationMs: fingerprintMetrics.durationMs,
             },
           },
@@ -741,6 +757,7 @@ export const initializeContextTool = createInternalTool<
             repoFingerprint: semanticFingerprint,
             cacheEnabled,
             analysisBundle,
+            snapshotService,
             onSnapshotMetrics: (metrics) => {
               if (analysisBundle) {
                 analysisBundle.metrics.durationsMs.generation = metrics.generationMs;
@@ -1249,7 +1266,7 @@ export const getCodebaseMapTool = createInternalTool<
 
     const section = input.section || 'all';
     try {
-      const snapshotService = new SemanticSnapshotService();
+      const snapshotService = createContextSnapshotService();
       const result = await snapshotService.ensureFreshSection(input.repoPath, section as any);
       return {
         success: true,
