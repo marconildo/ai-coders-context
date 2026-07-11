@@ -23,6 +23,15 @@ describe('tests-passing sensor', () => {
     return ['node', '-e', body];
   }
 
+  function processExists(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
   it('passes when jest-style JSON shows zero failures and exit 0', async () => {
     const json = JSON.stringify({
       numPassedTests: 5,
@@ -38,6 +47,31 @@ describe('tests-passing sensor', () => {
     const out = result.output as { numPassedTests: number; numFailedTests: number };
     expect(out.numPassedTests).toBe(5);
     expect(out.numFailedTests).toBe(0);
+  });
+
+  it('spools complete structured output for custom Jest commands larger than the tail', async () => {
+    const json = JSON.stringify({
+      irrelevant: 'x'.repeat(30 * 1024),
+      numPassedTests: 7,
+      numFailedTests: 0,
+      numTotalTestSuites: 3,
+      testResults: [],
+    });
+    const result = await executeTestsPassing(tempDir, {
+      sessionId: 's',
+      context: {
+        kind: 'jest',
+        testCommand: nodeScript(`process.stdout.write(${JSON.stringify(json)})`),
+        tailBytes: 8 * 1024,
+      },
+    });
+
+    expect(result.status).toBe('passed');
+    expect(result.output).toEqual(expect.objectContaining({
+      numPassedTests: 7,
+      numTotalTestSuites: 3,
+    }));
+    expect(result.details).toEqual(expect.objectContaining({ outputTruncated: true }));
   });
 
   it('uses a temporary output file for the default Jest command', async () => {
@@ -172,6 +206,28 @@ describe('tests-passing sensor', () => {
     }));
   });
 
+  it('terminates descendants that inherit pipes when the hard limit is exceeded', async () => {
+    const pidPath = path.join(tempDir, 'sensor-grandchild.pid');
+    const script = [
+      "const {spawn}=require('child_process');",
+      "const fs=require('fs');",
+      "const child=spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});",
+      `fs.writeFileSync(${JSON.stringify(pidPath)},String(child.pid));`,
+      "const c='x'.repeat(4096); while(true) process.stdout.write(c);",
+    ].join('');
+
+    const startedAt = Date.now();
+    const result = await runShell(nodeScript(script), tempDir, 10_000, {
+      tailBytes: 128,
+      hardCombinedOutputBytes: 32 * 1024,
+    });
+    const grandchildPid = Number(await fs.readFile(pidPath, 'utf8'));
+
+    expect(result.outputLimitExceeded).toBe(true);
+    expect(Date.now() - startedAt).toBeLessThan(3_000);
+    expect(processExists(grandchildPid)).toBe(false);
+  });
+
   it('reports timeout and spawn error termination paths', async () => {
     const timedOut = await executeTestsPassing(tempDir, {
       sessionId: 's',
@@ -203,4 +259,31 @@ describe('tests-passing sensor', () => {
     await fs.writeFile(malformed, '{not-json');
     await expect(readJestResultFile(malformed)).resolves.toEqual({ status: 'malformed' });
   });
+
+  it('projects a near-limit Jest file without materializing irrelevant fields', async () => {
+    const nearLimit = path.join(tempDir, 'near-limit.json');
+    const handle = await nativeFs.open(nearLimit, 'w');
+    await handle.write('{"numPassedTests":11,"numFailedTests":0,"numTotalTestSuites":4,"irrelevant":"');
+    const chunk = 'z'.repeat(64 * 1024);
+    for (let index = 0; index < 496; index += 1) await handle.write(chunk);
+    await handle.write('","testResults":[]}');
+    await handle.close();
+
+    const before = process.memoryUsage().heapUsed;
+    const projected = await readJestResultFile(nearLimit);
+    const heapGrowth = process.memoryUsage().heapUsed - before;
+
+    expect(projected).toEqual({
+      status: 'ok',
+      value: {
+        numPassedTests: 11,
+        numFailedTests: 0,
+        numTotalTestSuites: 4,
+        failures: [],
+      },
+    });
+    // The file is ~31 MiB; projection should stay far below a full string plus
+    // parsed object. Leave headroom for Jest/GC noise while catching regressions.
+    expect(heapGrowth).toBeLessThan(16 * 1024 * 1024);
+  }, 30_000);
 });

@@ -11,3 +11,10 @@ export {
   type SubprocessOutputLimits,
   type SubprocessOutputLimitsInput,
 } from './boundedByteCollector';
+export {
+  PROCESS_TREE_TERMINATION_GRACE_MS,
+  PROCESS_TREE_TERMINATION_SETTLE_MS,
+  subprocessSpawnOptions,
+  terminateProcessTree,
+  type ProcessTreeTerminationOptions,
+} from './processTreeTermination';

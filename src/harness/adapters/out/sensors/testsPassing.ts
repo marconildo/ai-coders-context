@@ -4,7 +4,7 @@
  * Two modes:
  *   - `kind: 'jest'` (default): runs `npm test -- --runInBand --json`, writes
  *     structured results to a size-checked temporary file, and keeps console
- *     output bounded. Configured commands retain legacy JSON-on-stdout parsing.
+ *     output bounded. Configured commands spool structured stdout to disk.
  *     Passes iff exit code 0 AND `numFailedTests === 0`.
  *   - `kind: 'exit-code'`: runs the configured `testCommand` argv array and
  *     passes iff the process exits with code 0. Use this for non-jest test
@@ -17,7 +17,7 @@
  */
 
 import { spawn } from 'child_process';
-import { promises as fs } from 'fs';
+import { closeSync, openSync, promises as fs, writeSync } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type {
@@ -29,10 +29,12 @@ import {
   BoundedByteCollector,
   DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
   DEFAULT_SUBPROCESS_TAIL_BYTES,
-  MAX_JEST_RESULT_FILE_BYTES,
   resolveSubprocessOutputLimits,
+  subprocessSpawnOptions,
+  terminateProcessTree,
   type SubprocessOutputLimitsInput,
 } from '../../../domain/execution';
+import { projectJestResultFile, type ProjectedJestResultRead } from './jestResultProjector';
 
 export interface TestsPassingOptions {
   kind?: 'jest' | 'exit-code';
@@ -90,6 +92,11 @@ export interface SpawnResult {
   terminationReason?: 'timeout' | 'outputLimit' | 'spawnError';
 }
 
+function writeComplete(fd: number, chunk: Buffer): void {
+  let offset = 0;
+  while (offset < chunk.length) offset += writeSync(fd, chunk, offset);
+}
+
 function emptySpawnResult(startedAt: number, spawnError: string): SpawnResult {
   return {
     exitCode: null,
@@ -112,12 +119,22 @@ export function runShell(
   argv: string[],
   cwd: string,
   timeoutMs: number,
-  outputLimits: SubprocessOutputLimitsInput = {}
+  outputLimits: SubprocessOutputLimitsInput = {},
+  structuredStdoutPath?: string
 ): Promise<SpawnResult> {
   return new Promise((resolve) => {
     const startedAt = Date.now();
     const [executable, ...args] = argv;
     const limits = resolveSubprocessOutputLimits(outputLimits);
+    let structuredStdoutFd: number | undefined;
+    if (structuredStdoutPath) {
+      try {
+        structuredStdoutFd = openSync(structuredStdoutPath, 'w');
+      } catch (err) {
+        resolve(emptySpawnResult(startedAt, err instanceof Error ? err.message : String(err)));
+        return;
+      }
+    }
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(executable, args, {
@@ -125,8 +142,10 @@ export function runShell(
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
+        ...subprocessSpawnOptions(),
       });
     } catch (err) {
+      if (structuredStdoutFd !== undefined) closeSync(structuredStdoutFd);
       resolve(emptySpawnResult(startedAt, err instanceof Error ? err.message : String(err)));
       return;
     }
@@ -137,17 +156,38 @@ export function runShell(
     let outputLimitExceeded = false;
     let settled = false;
     let spawnError: Error | undefined;
+    let exitCodeSeen: number | null = null;
+    let termination: Promise<void> | undefined;
 
     let timer: NodeJS.Timeout;
+    const requestTermination = () => {
+      if (termination) return;
+      clearTimeout(timer);
+      termination = terminateProcessTree(child);
+      void termination.then(() => {
+        // A hostile descendant may keep inherited pipes open. Once the whole
+        // tree has received the forced signal, stop waiting on those streams.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        void finish(exitCodeSeen);
+      });
+    };
     const capture = (collector: BoundedByteCollector, chunk: Buffer) => {
       collector.append(chunk);
+      if (collector === stdout && structuredStdoutFd !== undefined) {
+        try {
+          writeComplete(structuredStdoutFd, chunk);
+        } catch (err) {
+          spawnError = err instanceof Error ? err : new Error(String(err));
+          requestTermination();
+        }
+      }
       if (
         !outputLimitExceeded &&
         stdout.totalBytes + stderr.totalBytes > limits.hardCombinedOutputBytes
       ) {
         outputLimitExceeded = true;
-        clearTimeout(timer);
-        child.kill('SIGKILL');
+        requestTermination();
       }
     };
 
@@ -157,13 +197,19 @@ export function runShell(
     timer = setTimeout(() => {
       if (outputLimitExceeded) return;
       timedOut = true;
-      child.kill('SIGKILL');
+      requestTermination();
     }, timeoutMs);
 
-    const finish = (exitCode: number | null) => {
+    const finish = async (exitCode: number | null) => {
+      if (settled) return;
+      if (termination) await termination;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (structuredStdoutFd !== undefined) {
+        closeSync(structuredStdoutFd);
+        structuredStdoutFd = undefined;
+      }
       resolve({
         exitCode,
         stdoutTail: stdout.toString(),
@@ -190,43 +236,15 @@ export function runShell(
     // Wait for close after error/kill so the child is always reaped before the
     // promise resolves.
     child.on('error', (err) => { spawnError = err; });
-    child.on('close', (code) => finish(code));
+    child.on('exit', (code) => { exitCodeSeen = code; });
+    child.on('close', (code) => { void finish(code); });
   });
 }
 
-function extractJsonFromStdout(stdout: string): unknown | null {
-  // Jest --json sometimes emits warnings on stdout before the JSON object.
-  // Find the first `{` and try to parse from there.
-  const trimmed = stdout.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith('{')) {
-    try { return JSON.parse(trimmed); } catch { /* fallthrough */ }
-  }
-  const idx = stdout.indexOf('{');
-  if (idx === -1) return null;
-  try {
-    return JSON.parse(stdout.slice(idx));
-  } catch {
-    return null;
-  }
-}
-
-export type JestResultFileRead =
-  | { status: 'ok'; value: unknown }
-  | { status: 'resultFileTooLarge' }
-  | { status: 'malformed' };
+export type JestResultFileRead = ProjectedJestResultRead;
 
 export async function readJestResultFile(resultPath: string): Promise<JestResultFileRead> {
-  try {
-    const stat = await fs.stat(resultPath);
-    if (stat.size > MAX_JEST_RESULT_FILE_BYTES) {
-      return { status: 'resultFileTooLarge' };
-    }
-    const contents = await fs.readFile(resultPath, 'utf-8');
-    return { status: 'ok', value: JSON.parse(contents) };
-  } catch {
-    return { status: 'malformed' };
-  }
+  return projectJestResultFile(resultPath);
 }
 
 export function subprocessDetails(result: SpawnResult, argv: string[]): Record<string, unknown> {
@@ -251,17 +269,19 @@ export async function executeTestsPassing(
   let resultDirectory: string | undefined;
   let resultPath: string | undefined;
   let command = opts.testCommand;
-  if (opts.kind === 'jest' && opts.usesDefaultCommand) {
+  let structuredStdoutPath: string | undefined;
+  if (opts.kind === 'jest') {
     resultDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotcontext-jest-'));
     resultPath = path.join(resultDirectory, 'result.json');
-    command = [...DEFAULT_JEST_COMMAND, '--outputFile', resultPath];
+    if (opts.usesDefaultCommand) command = [...DEFAULT_JEST_COMMAND, '--outputFile', resultPath];
+    else structuredStdoutPath = resultPath;
   }
 
   try {
     const result = await runShell(command, repoPath, opts.timeoutMs, {
       tailBytes: opts.tailBytes,
       hardCombinedOutputBytes: opts.hardOutputLimitBytes,
-    });
+    }, structuredStdoutPath);
 
     const details = subprocessDetails(result, command);
 
@@ -309,9 +329,8 @@ export async function executeTestsPassing(
       };
     }
 
-    // Default Jest runs write structured output to a bounded temporary file.
-    // Configured commands retain legacy stdout parsing, but stdout itself is
-    // now always a bounded tail.
+    // Default Jest writes with --outputFile; custom Jest commands have stdout
+    // spooled directly to the same size-checked structured-output path.
     const fileRead = resultPath ? await readJestResultFile(resultPath) : undefined;
     if (fileRead?.status === 'resultFileTooLarge') {
       return {
@@ -321,10 +340,7 @@ export async function executeTestsPassing(
         details,
       };
     }
-    const parsed = fileRead?.status === 'ok'
-      ? fileRead.value
-      : extractJsonFromStdout(result.stdoutTail);
-    if (!parsed || typeof parsed !== 'object') {
+    if (fileRead?.status !== 'ok') {
       return {
         status: 'failed',
         summary: 'tests-passing: could not parse jest --json output',
@@ -338,43 +354,8 @@ export async function executeTestsPassing(
       };
     }
 
-    const j = parsed as Record<string, unknown>;
-    const numPassedTests = typeof j.numPassedTests === 'number' ? j.numPassedTests : 0;
-    const numFailedTests = typeof j.numFailedTests === 'number' ? j.numFailedTests : 0;
-    const numTotalTestSuites = typeof j.numTotalTestSuites === 'number' ? j.numTotalTestSuites : 0;
-
-    const failures: Array<{ name: string; message: string }> = [];
-    const testResults = Array.isArray(j.testResults) ? j.testResults : [];
-    for (const suite of testResults) {
-      if (!suite || typeof suite !== 'object') continue;
-      const s = suite as Record<string, unknown>;
-      const assertionResults = Array.isArray(s.assertionResults) ? s.assertionResults : [];
-      for (const a of assertionResults) {
-        if (!a || typeof a !== 'object') continue;
-        const ar = a as Record<string, unknown>;
-        if (ar.status === 'failed') {
-          const messages = Array.isArray(ar.failureMessages) ? ar.failureMessages : [];
-          if (failures.length >= 100) continue;
-          failures.push({
-            name: typeof ar.fullName === 'string'
-              ? ar.fullName
-              : (typeof ar.title === 'string' ? ar.title : 'unknown'),
-            message: messages
-              .slice(0, 10)
-              .map((m) => String(m).slice(0, 2000))
-              .join('\n')
-              .slice(0, 2000),
-          });
-        }
-      }
-    }
-
-    const report: TestsPassingReport = {
-      numPassedTests,
-      numFailedTests,
-      numTotalTestSuites,
-      failures,
-    };
+    const report: TestsPassingReport = fileRead.value;
+    const { numPassedTests, numFailedTests, numTotalTestSuites, failures } = report;
 
     const passed = result.exitCode === 0 && numFailedTests === 0;
     if (passed) {

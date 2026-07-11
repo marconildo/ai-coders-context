@@ -13,6 +13,8 @@ import {
   DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
   DEFAULT_SUBPROCESS_TAIL_BYTES,
   resolveSubprocessOutputLimits,
+  subprocessSpawnOptions,
+  terminateProcessTree,
 } from '../../execution';
 import type { StepAcceptanceRun, StepAcceptanceSpec } from './executionTypes';
 
@@ -80,6 +82,7 @@ export async function runAcceptance(
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
+        ...subprocessSpawnOptions(),
       });
     } catch (err) {
       resolve({
@@ -106,8 +109,20 @@ export async function runAcceptance(
     const stderr = new BoundedByteCollector(limits.tailBytes);
     let outputLimitExceeded = false;
     let spawnError: Error | undefined;
+    let exitCodeSeen: number | null = null;
+    let termination: Promise<void> | undefined;
 
     let timer: NodeJS.Timeout;
+    const requestTermination = () => {
+      if (termination) return;
+      clearTimeout(timer);
+      termination = terminateProcessTree(child);
+      void termination.then(() => {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        void finish(exitCodeSeen);
+      });
+    };
     const capture = (collector: BoundedByteCollector, chunk: Buffer) => {
       collector.append(chunk);
       if (
@@ -115,8 +130,7 @@ export async function runAcceptance(
         stdout.totalBytes + stderr.totalBytes > limits.hardCombinedOutputBytes
       ) {
         outputLimitExceeded = true;
-        clearTimeout(timer);
-        child.kill('SIGKILL');
+        requestTermination();
       }
     };
 
@@ -126,10 +140,12 @@ export async function runAcceptance(
     timer = setTimeout(() => {
       if (outputLimitExceeded) return;
       timedOut = true;
-      child.kill('SIGKILL');
+      requestTermination();
     }, timeoutMs);
 
-    const finish = (exitCode: number | null) => {
+    const finish = async (exitCode: number | null) => {
+      if (settled) return;
+      if (termination) await termination;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -164,6 +180,7 @@ export async function runAcceptance(
       spawnError = err;
       stderr.append(Buffer.from(`spawn error: ${err.message}`));
     });
-    child.on('close', (code) => finish(code));
+    child.on('exit', (code) => { exitCodeSeen = code; });
+    child.on('close', (code) => { void finish(code); });
   });
 }
