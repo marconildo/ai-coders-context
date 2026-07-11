@@ -43,6 +43,7 @@ interface AgentGenerationConfig {
   /** Operation-scoped data supplied by context init. */
   semanticContext?: SemanticContext;
   stackInfo?: StackInfo;
+  cacheEnabled?: boolean;
 }
 
 /**
@@ -122,15 +123,22 @@ export class AgentGenerator {
     let semantics = normalizedConfig.semanticContext;
     if (normalizedConfig.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis for agents...', verbose);
-      this.analyzer = new CodebaseAnalyzer();
+      GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
+      this.analyzer = new CodebaseAnalyzer({ cacheEnabled: normalizedConfig.cacheEnabled ?? true });
       try {
-        semantics = await this.analyzer.analyze(repoStructure.rootPath);
+        semantics = (await this.analyzer.analyzeBundle(
+          repoStructure.rootPath,
+          repoStructure.files.map((file) => file.path)
+        )).context;
         GeneratorUtils.logProgress(
           `Analyzed ${semantics.stats.totalFiles} files, found ${semantics.stats.totalSymbols} symbols`,
           verbose
         );
       } catch (error) {
         GeneratorUtils.logError('Semantic analysis failed, continuing without it', error, verbose);
+      } finally {
+        await this.analyzer.shutdown();
+        this.analyzer = undefined;
       }
     }
 

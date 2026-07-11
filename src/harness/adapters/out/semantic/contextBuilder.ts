@@ -35,6 +35,9 @@ const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
   exclude: DEFAULT_EXCLUDE_PATTERNS,
   include: [],
   maxFiles: 5000,
+  maxTotalBytes: 256 * 1024 * 1024,
+  maxFileBytes: 2 * 1024 * 1024,
+  concurrency: 16,
   cacheEnabled: true,
   maxSymbolsPerCategory: 50,
   includeDocumentation: true,
@@ -57,13 +60,16 @@ export class SemanticContextBuilder {
    * Analyze the codebase and cache the result
    */
   async analyze(projectPath: string): Promise<SemanticContext> {
-    if (this.cachedContext && this.cachedProjectPath === projectPath) {
+    if (this.options.cacheEnabled && this.cachedContext && this.cachedProjectPath === projectPath) {
       return this.cachedContext;
     }
 
-    this.cachedContext = await this.analyzer.analyze(projectPath);
-    this.cachedProjectPath = projectPath;
-    return this.cachedContext;
+    const context = await this.analyzer.analyze(projectPath);
+    if (this.options.cacheEnabled) {
+      this.cachedContext = context;
+      this.cachedProjectPath = projectPath;
+    }
+    return context;
   }
 
   /**

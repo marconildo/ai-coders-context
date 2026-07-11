@@ -13,6 +13,7 @@
 
 import * as fs from 'fs-extra';
 import * as path from 'path';
+import { SemanticSnapshotService } from './semanticSnapshotService';
 
 /**
  * A cached context entry with metadata for invalidation.
@@ -24,6 +25,8 @@ interface CacheEntry {
     createdAt: number;
     /** Modification time hash of source directories at cache time */
     mtimeHash: string;
+    /** Content-aware identity; prevents path/TTL-only reuse. */
+    repoFingerprint: string;
 }
 
 export interface ContextCacheOptions {
@@ -40,6 +43,7 @@ export class ContextCache {
     private readonly cache = new Map<string, CacheEntry>();
     private readonly ttlMs: number;
     private readonly watchDirs: string[];
+    private readonly fingerprintService = new SemanticSnapshotService(true);
 
     constructor(options: ContextCacheOptions = {}) {
         this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
@@ -69,7 +73,8 @@ export class ContextCache {
 
         // Check directory mtime invalidation
         const currentMtimeHash = await this.computeMtimeHash(repoPath);
-        if (currentMtimeHash !== entry.mtimeHash) {
+        const currentFingerprint = await this.fingerprintService.captureRepoFingerprint(repoPath);
+        if (currentMtimeHash !== entry.mtimeHash || currentFingerprint !== entry.repoFingerprint) {
             this.cache.delete(key);
             return null;
         }
@@ -87,11 +92,13 @@ export class ContextCache {
     async set(repoPath: string, contextType: string, content: string): Promise<void> {
         const key = this.buildKey(repoPath, contextType);
         const mtimeHash = await this.computeMtimeHash(repoPath);
+        const repoFingerprint = await this.fingerprintService.captureRepoFingerprint(repoPath);
 
         this.cache.set(key, {
             content,
             createdAt: Date.now(),
             mtimeHash,
+            repoFingerprint,
         });
     }
 

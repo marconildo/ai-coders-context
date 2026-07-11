@@ -67,6 +67,12 @@ interface DocumentationGenerationConfig {
   functionalPatterns?: DetectedFunctionalPatterns;
   stackInfo?: StackInfo;
   repoFingerprint?: string;
+  cacheEnabled?: boolean;
+  onSnapshotMetrics?: (metrics: {
+    generationMs: number;
+    publicationMs: number;
+    stabilizationAttempts: number;
+  }) => void;
 }
 
 export class DocumentationGenerator {
@@ -83,24 +89,34 @@ export class DocumentationGenerator {
     const docsDir = path.join(outputDir, 'docs');
     await GeneratorUtils.ensureDirectoryAndLog(docsDir, verbose, 'Generating documentation scaffold in');
     const snapshotService = (config.semantic || config.semanticContext)
-      ? new SemanticSnapshotService()
+      ? new SemanticSnapshotService(config.cacheEnabled ?? true)
       : null;
 
     // Perform semantic analysis if enabled
     let semantics = config.semanticContext;
+    let functionalPatterns = config.functionalPatterns;
     let snapshotFingerprint = config.repoFingerprint;
     if (config.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis...', verbose);
-      this.analyzer = new CodebaseAnalyzer();
+      GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
+      this.analyzer = new CodebaseAnalyzer({ cacheEnabled: config.cacheEnabled ?? true });
       try {
         snapshotFingerprint = await snapshotService!.captureRepoFingerprint(repoStructure.rootPath);
-        semantics = await this.analyzer.analyze(repoStructure.rootPath);
+        const bundle = await this.analyzer.analyzeBundle(
+          repoStructure.rootPath,
+          repoStructure.files.map((file) => file.path)
+        );
+        semantics = bundle.context;
+        functionalPatterns = bundle.functionalPatterns;
         GeneratorUtils.logProgress(
           `Analyzed ${semantics.stats.totalFiles} files, found ${semantics.stats.totalSymbols} symbols in ${semantics.stats.analysisTimeMs}ms`,
           verbose
         );
       } catch (error) {
         GeneratorUtils.logError('Semantic analysis failed, continuing without it', error, verbose);
+      } finally {
+        await this.analyzer.shutdown();
+        this.analyzer = undefined;
       }
     }
 
@@ -123,9 +139,10 @@ export class DocumentationGenerator {
           outputDir,
           semantics,
           stackInfo,
-          functionalPatterns: config.functionalPatterns,
+          functionalPatterns,
           repoFingerprint: snapshotFingerprint,
         });
+        config.onSnapshotMetrics?.(snapshot.metrics);
 
         GeneratorUtils.logProgress(
           `Created semantic snapshot summary at ${path.relative(outputDir, snapshot.publishedSummaryPath)}`,

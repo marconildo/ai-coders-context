@@ -10,6 +10,9 @@ import {
 } from '../contextTools';
 import { toolExecutionContext } from '../../../../shared';
 import { CodebaseAnalyzer } from '../../../adapters/out/semantic';
+import { DocumentationGenerator } from '../scaffolding/generators/documentation/documentationGenerator';
+import { AgentGenerator } from '../scaffolding/generators/agents/agentGenerator';
+import { SemanticSnapshotService } from '../../../adapters/out/semantic';
 
 describe('contextTools sensors scaffolding', () => {
   let tempDir: string;
@@ -36,6 +39,9 @@ describe('contextTools sensors scaffolding', () => {
 
   it('shares one semantic analysis bundle across docs, snapshot, and agents', async () => {
     const analyzeBundle = jest.spyOn(CodebaseAnalyzer.prototype, 'analyzeBundle');
+    const docs = jest.spyOn(DocumentationGenerator.prototype, 'generateDocumentation');
+    const agents = jest.spyOn(AgentGenerator.prototype, 'generateAgentPrompts');
+    const snapshot = jest.spyOn(SemanticSnapshotService.prototype, 'writeSnapshot');
 
     await initializeContextTool.execute!(
       {
@@ -49,6 +55,18 @@ describe('contextTools sensors scaffolding', () => {
     );
 
     expect(analyzeBundle).toHaveBeenCalledTimes(1);
+    const analyzed = await analyzeBundle.mock.results[0].value;
+    expect(docs.mock.calls[0][2]).toEqual(expect.objectContaining({
+      semanticContext: analyzed.context,
+      functionalPatterns: analyzed.functionalPatterns,
+    }));
+    expect(agents.mock.calls[0][2]).toEqual(expect.objectContaining({
+      semanticContext: analyzed.context,
+    }));
+    expect(snapshot.mock.calls[0][1]).toEqual(expect.objectContaining({
+      semantics: analyzed.context,
+      functionalPatterns: analyzed.functionalPatterns,
+    }));
   });
 
   it('includes bootstrap sensors.json in pending writes and listToFill', async () => {

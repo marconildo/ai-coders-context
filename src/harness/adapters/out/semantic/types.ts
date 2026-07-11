@@ -190,6 +190,12 @@ export interface AnalyzerOptions {
   exclude?: string[];
   include?: string[];
   maxFiles?: number;
+  /** Maximum aggregate bytes selected for semantic parsing. */
+  maxTotalBytes?: number;
+  /** Maximum size of one source file selected for semantic parsing. */
+  maxFileBytes?: number;
+  /** Maximum number of file analyses running concurrently. */
+  concurrency?: number;
   cacheEnabled?: boolean;
 }
 

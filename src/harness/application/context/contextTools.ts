@@ -32,6 +32,7 @@ import { getUntrackedContextLayoutEntries } from '../../../shared';
 import { resolveRuntimeLayout } from '../../../shared/fs/pathHelpers';
 import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
+import type { AnalysisBundle } from './analysisBundle';
 
 type ToolContext = unknown;
 
@@ -585,6 +586,7 @@ export const initializeContextTool = createInternalTool<
     skipContentGeneration?: boolean;
     generateQA?: boolean;
     generateSkills?: boolean;
+    cacheEnabled?: boolean;
   },
   Record<string, unknown>
 >(
@@ -603,6 +605,7 @@ export const initializeContextTool = createInternalTool<
       skipContentGeneration = true,
       generateQA = false,
       generateSkills = true,
+      cacheEnabled = true,
     } = input;
 
     const resolvedRepoPath = path.resolve(repoPath);
@@ -647,15 +650,22 @@ export const initializeContextTool = createInternalTool<
       const repoStructure = await fileMapper.mapRepository(resolvedRepoPath, include);
 
       let semanticBundle: SemanticAnalysisBundle | undefined;
+      let analysisBundle: AnalysisBundle | undefined;
       let semanticFingerprint: string | undefined;
+      let fingerprintMetrics: Awaited<ReturnType<SemanticSnapshotService['captureRepoFingerprintWithMetrics']>> | undefined;
       if (semantic) {
         const analyzer = new CodebaseAnalyzer({
           exclude: [...new Set([...DEFAULT_EXCLUDE_PATTERNS, ...exclude])],
+          cacheEnabled,
         });
         try {
-          const snapshotService = new SemanticSnapshotService();
-          semanticFingerprint = await snapshotService.captureRepoFingerprint(resolvedRepoPath);
-          semanticBundle = await analyzer.analyzeBundle(resolvedRepoPath);
+          const snapshotService = new SemanticSnapshotService(cacheEnabled);
+          fingerprintMetrics = await snapshotService.captureRepoFingerprintWithMetrics(resolvedRepoPath);
+          semanticFingerprint = fingerprintMetrics.fingerprint;
+          semanticBundle = await analyzer.analyzeBundle(
+            resolvedRepoPath,
+            repoStructure.files.map((file) => file.path)
+          );
         } catch {
           semanticBundle = undefined;
           semanticFingerprint = undefined;
@@ -671,6 +681,30 @@ export const initializeContextTool = createInternalTool<
       if (!disableFiltering || semantic) {
         const stackDetector = new StackDetector();
         detectedStackInfo = await stackDetector.detect(resolvedRepoPath);
+      }
+
+      if (semanticBundle && semanticFingerprint && fingerprintMetrics) {
+        analysisBundle = {
+          repoPath: resolvedRepoPath,
+          discoveredFiles: semanticBundle.files,
+          repoStructure,
+          semanticContext: semanticBundle.context,
+          functionalPatterns: semanticBundle.functionalPatterns,
+          stackInfo: detectedStackInfo,
+          repoFingerprint: semanticFingerprint,
+          limits: semanticBundle.limits,
+          partial: semanticBundle.partial,
+          skipped: semanticBundle.skipped,
+          metrics: {
+            ...semanticBundle.metrics,
+            fingerprint: {
+              files: fingerprintMetrics.files,
+              bytesRead: fingerprintMetrics.bytesRead,
+              cacheHits: fingerprintMetrics.cacheHits,
+              durationMs: fingerprintMetrics.durationMs,
+            },
+          },
+        };
       }
 
       if (!disableFiltering) {
@@ -705,6 +739,13 @@ export const initializeContextTool = createInternalTool<
             functionalPatterns: semanticBundle?.functionalPatterns,
             stackInfo: detectedStackInfo,
             repoFingerprint: semanticFingerprint,
+            cacheEnabled,
+            onSnapshotMetrics: (metrics) => {
+              if (analysisBundle) {
+                analysisBundle.metrics.durationsMs.generation = metrics.generationMs;
+                analysisBundle.metrics.durationsMs.publication = metrics.publicationMs;
+              }
+            },
           },
           false
         );
@@ -755,6 +796,7 @@ export const initializeContextTool = createInternalTool<
             availableSkills,
             semanticContext: semanticBundle?.context,
             stackInfo: detectedStackInfo,
+            cacheEnabled,
           },
           false
         );
@@ -898,6 +940,14 @@ export const initializeContextTool = createInternalTool<
                 projectType: classification.primaryType,
                 confidence: classification.confidence,
                 reasoning: classification.reasoning,
+              }
+            : undefined,
+          analysis: analysisBundle
+            ? {
+                limits: analysisBundle.limits,
+                partial: analysisBundle.partial,
+                skipped: analysisBundle.skipped,
+                metrics: analysisBundle.metrics,
               }
             : undefined,
         },

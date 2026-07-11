@@ -97,6 +97,19 @@ describe('ContextCache', () => {
 
             expect(await cache.get(tempDir, 'compact')).toBeNull();
         });
+
+        it('invalidates by content fingerprint when directory mtime is unchanged', async () => {
+            const cache = new ContextCache({ watchDirs: ['src'] });
+            const filePath = path.join(tempDir, 'src', 'stable.ts');
+            await fs.writeFile(filePath, 'export const value = 1;\n');
+            await cache.set(tempDir, 'compact', 'old-content');
+            const original = await fs.stat(filePath);
+
+            await fs.writeFile(filePath, 'export const value = 2;\n');
+            await fs.utimes(filePath, original.atime, original.mtime);
+
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+        });
     });
 
     describe('invalidation and clearing', () => {

@@ -3,7 +3,7 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { FileMapper } from '../../../../../utils/fileMapper';
-import { SemanticSnapshotService } from '../semanticSnapshotService';
+import { RepositoryChangingError, SemanticSnapshotService } from '../semanticSnapshotService';
 
 describe('SemanticSnapshotService', () => {
   let tempDir: string;
@@ -108,6 +108,29 @@ describe('SemanticSnapshotService', () => {
     expect(stale).toBeNull();
   });
 
+  it('reuses cached content hashes when file metadata is unchanged', async () => {
+    const service = new SemanticSnapshotService(true);
+
+    const initial = await service.captureRepoFingerprintWithMetrics(repoPath);
+    const repeated = await service.captureRepoFingerprintWithMetrics(repoPath);
+
+    expect(repeated.fingerprint).toBe(initial.fingerprint);
+    expect(initial.bytesRead).toBeGreaterThan(0);
+    expect(repeated.bytesRead).toBe(0);
+    expect(repeated.cacheHits).toBe(repeated.files);
+  });
+
+  it('honors disabled fingerprint caching', async () => {
+    const service = new SemanticSnapshotService(false);
+
+    const initial = await service.captureRepoFingerprintWithMetrics(repoPath);
+    const repeated = await service.captureRepoFingerprintWithMetrics(repoPath);
+
+    expect(repeated.fingerprint).toBe(initial.fingerprint);
+    expect(repeated.bytesRead).toBeGreaterThan(0);
+    expect(repeated.cacheHits).toBe(0);
+  });
+
   it('auto-refreshes a stale snapshot on demand', async () => {
     const mapper = new FileMapper();
     const repoStructure = await mapper.mapRepository(repoPath);
@@ -199,6 +222,36 @@ describe('SemanticSnapshotService', () => {
     const observedGeneratedAt =
       (observedDuringPublish as { manifest?: { generatedAt?: string } } | null)?.manifest?.generatedAt ?? null;
     expect(observedGeneratedAt).toBe(initial.manifest.generatedAt);
+  });
+
+  it('stops after two unstable attempts with a typed error and retains the previous snapshot', async () => {
+    const mapper = new FileMapper();
+    const repoStructure = await mapper.mapRepository(repoPath);
+    const service = new SemanticSnapshotService();
+    const initial = await service.writeSnapshot(repoStructure, { outputDir });
+    await fs.writeFile(path.join(repoPath, 'src', 'index.ts'), 'export const run = () => false;\n');
+
+    let mutation = 0;
+    const originalBuild = (service as any).buildSnapshotArtifacts.bind(service);
+    const buildSpy = jest.spyOn(service as any, 'buildSnapshotArtifacts').mockImplementation(async (...args) => {
+      const artifacts = await originalBuild(...args);
+      mutation += 1;
+      await fs.writeFile(
+        path.join(repoPath, 'src', 'auth.ts'),
+        `export const login = () => ${mutation};\n`
+      );
+      return artifacts;
+    });
+
+    await expect(service.ensureFreshSummary(repoPath, { outputDir }))
+      .rejects.toBeInstanceOf(RepositoryChangingError);
+    expect(buildSpy).toHaveBeenCalledTimes(2);
+
+    const retained = await new SemanticSnapshotService().readSummary(repoPath, {
+      outputDir,
+      allowStale: true,
+    });
+    expect(retained?.manifest?.generatedAt).toBe(initial.manifest.generatedAt);
   });
 
   it('does not load a legacy docs/codebase-map.json without a snapshot manifest', async () => {

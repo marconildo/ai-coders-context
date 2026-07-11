@@ -84,6 +84,18 @@ describe('CodebaseAnalyzer', () => {
 
   beforeEach(async () => {
     tempDir = await createTempOutput('dotcontext-analyzer-');
+    await Promise.all([
+      'src/services/userService.ts',
+      'src/controllers/userController.ts',
+      'src/models/user.ts',
+      'src/utils/helper.ts',
+      'src/index.ts',
+      'src/main.ts',
+    ].map(async (relativePath) => {
+      const filePath = path.join(tempDir, relativePath);
+      await fs.ensureDir(path.dirname(filePath));
+      await fs.writeFile(filePath, 'export const fixture = true;\n');
+    }));
     jest.clearAllMocks();
   });
 
@@ -139,6 +151,111 @@ describe('CodebaseAnalyzer', () => {
         patterns: expect.any(Array),
       }));
       expect(bundle.files).toHaveLength(bundle.context.stats.totalFiles);
+      expect(bundle.metrics.filesParsed).toBe(bundle.files.length);
+      expect(bundle.metrics.bytesRead).toBeGreaterThan(0);
+      expect(bundle.partial).toBe(false);
+    });
+
+    it('uses the documented default analysis limits', async () => {
+      const bundle = await new CodebaseAnalyzer().analyzeBundle(tempDir);
+
+      expect(bundle.limits).toEqual({
+        maxFiles: 5000,
+        maxTotalBytes: 256 * 1024 * 1024,
+        maxFileBytes: 2 * 1024 * 1024,
+        concurrency: 16,
+      });
+    });
+
+    it('bounds a 3000-file-equivalent analysis and reports maximum in-flight work', async () => {
+      const files = Array.from({ length: 3000 }, (_, index) =>
+        path.join(tempDir, 'scale', `file-${index}.ts`)
+      );
+      await fs.ensureDir(path.join(tempDir, 'scale'));
+      for (let index = 0; index < files.length; index += 100) {
+        await Promise.all(files.slice(index, index + 100).map((file) =>
+          fs.writeFile(file, 'export const value = true;\n')
+        ));
+      }
+
+      const { TreeSitterLayer } = require('../treeSitter/treeSitterLayer');
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const analyzeFile = jest.fn().mockImplementation(async (filePath: string): Promise<FileAnalysis> => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await Promise.resolve();
+        inFlight -= 1;
+        return { filePath, language: 'typescript', symbols: [], imports: [], exports: [] };
+      });
+      TreeSitterLayer.mockImplementationOnce(() => ({ analyzeFile, clearCache: jest.fn() }));
+
+      const bundle = await new CodebaseAnalyzer({ concurrency: 16 }).analyzeBundle(tempDir, files);
+
+      expect(bundle.metrics.filesDiscovered).toBe(3000);
+      expect(bundle.metrics.filesParsed).toBe(3000);
+      expect(bundle.metrics.fileReads).toBe(3000);
+      expect(analyzeFile).toHaveBeenCalledTimes(3000);
+      expect(bundle.metrics.maxInFlight).toBeLessThanOrEqual(16);
+      expect(maxInFlight).toBeLessThanOrEqual(16);
+      expect(bundle.metrics.bytesRead).toBeLessThanOrEqual(bundle.limits.maxTotalBytes);
+    }, 20_000);
+
+    it('skips oversized files and reports partial analysis without parsing them', async () => {
+      const small = path.join(tempDir, 'small.ts');
+      const oversized = path.join(tempDir, 'oversized.ts');
+      await fs.writeFile(small, 'ok');
+      await fs.writeFile(oversized, '0123456789');
+      const { TreeSitterLayer } = require('../treeSitter/treeSitterLayer');
+      const analyzeFile = jest.fn().mockImplementation(async (filePath: string): Promise<FileAnalysis> =>
+        ({ filePath, language: 'typescript', symbols: [], imports: [], exports: [] }));
+      TreeSitterLayer.mockImplementationOnce(() => ({ analyzeFile, clearCache: jest.fn() }));
+
+      const bundle = await new CodebaseAnalyzer({ maxFileBytes: 5 }).analyzeBundle(
+        tempDir,
+        [small, oversized]
+      );
+
+      expect(bundle.partial).toBe(true);
+      expect(bundle.skipped).toContainEqual({
+        file: oversized,
+        reason: 'file-too-large',
+        size: 10,
+      });
+      expect(analyzeFile).toHaveBeenCalledTimes(1);
+      expect(analyzeFile).toHaveBeenCalledWith(small);
+    });
+
+    it('honors aggregate byte and file budgets', async () => {
+      const files = await Promise.all([0, 1, 2].map(async (index) => {
+        const file = path.join(tempDir, `budget-${index}.ts`);
+        await fs.writeFile(file, '1234');
+        return file;
+      }));
+
+      const bundle = await new CodebaseAnalyzer({
+        maxFiles: 2,
+        maxTotalBytes: 6,
+      }).analyzeBundle(tempDir, files);
+
+      expect(bundle.metrics.filesParsed).toBe(1);
+      expect(bundle.metrics.bytesRead).toBe(4);
+      expect(bundle.partial).toBe(true);
+      expect(bundle.skipped.map((item) => item.reason)).toEqual([
+        'total-byte-limit',
+        'total-byte-limit',
+      ]);
+    });
+
+    it('does not retain parser cache state when cacheEnabled is false', async () => {
+      const { TreeSitterLayer } = require('../treeSitter/treeSitterLayer');
+      const analyzer = new CodebaseAnalyzer({ cacheEnabled: false });
+      const layer = TreeSitterLayer.mock.results.at(-1).value;
+
+      await analyzer.analyzeBundle(tempDir);
+      await analyzer.shutdown();
+
+      expect(layer.clearCache).toHaveBeenCalledTimes(3);
     });
 
     it('should analyze files with Tree-sitter by default', async () => {

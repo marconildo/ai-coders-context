@@ -35,13 +35,57 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   exclude: DEFAULT_EXCLUDE_PATTERNS,
   include: [],
   maxFiles: 5000,
+  maxTotalBytes: 256 * 1024 * 1024,
+  maxFileBytes: 2 * 1024 * 1024,
+  concurrency: 16,
   cacheEnabled: true,
 };
+
+export interface AnalysisLimits {
+  maxFiles: number;
+  maxTotalBytes: number;
+  maxFileBytes: number;
+  concurrency: number;
+}
+
+export type AnalysisSkipReason =
+  | 'file-limit'
+  | 'total-byte-limit'
+  | 'file-too-large'
+  | 'stat-failed';
+
+export interface SkippedAnalysisFile {
+  file: string;
+  reason: AnalysisSkipReason;
+  size?: number;
+}
+
+export interface AnalysisMetrics {
+  filesDiscovered: number;
+  filesParsed: number;
+  fileReads: number;
+  bytesRead: number;
+  maxInFlight: number;
+  cacheHits: number;
+  durationsMs: {
+    discovery: number;
+    parsing: number;
+    architecture: number;
+    functionalPatterns: number;
+    generation: number;
+    publication: number;
+    total: number;
+  };
+}
 
 export interface SemanticAnalysisBundle {
   context: SemanticContext;
   functionalPatterns: DetectedFunctionalPatterns;
   files: string[];
+  limits: AnalysisLimits;
+  partial: boolean;
+  skipped: SkippedAnalysisFile[];
+  metrics: AnalysisMetrics;
 }
 
 export class CodebaseAnalyzer {
@@ -52,6 +96,10 @@ export class CodebaseAnalyzer {
   constructor(options: AnalyzerOptions = {}) {
     this.treeSitter = new TreeSitterLayer();
     this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.options.maxFiles = Math.max(0, this.options.maxFiles);
+    this.options.maxTotalBytes = Math.max(0, this.options.maxTotalBytes);
+    this.options.maxFileBytes = Math.max(0, this.options.maxFileBytes);
+    this.options.concurrency = Math.max(1, this.options.concurrency);
 
     // Create LSPLayer if LSP mode is enabled
     if (this.options.useLSP) {
@@ -63,27 +111,71 @@ export class CodebaseAnalyzer {
     return (await this.analyzeProject(projectPath)).context;
   }
 
-  async analyzeBundle(projectPath: string): Promise<SemanticAnalysisBundle> {
-    const { context, files, fileAnalyses } = await this.analyzeProject(projectPath);
+  async analyzeBundle(projectPath: string, discoveredFiles?: string[]): Promise<SemanticAnalysisBundle> {
+    const result = await this.analyzeProject(projectPath, discoveredFiles);
+    const functionalStartedAt = Date.now();
+    const functionalPatterns = this.detectFunctionalPatternsFromAnalyses(
+      result.files,
+      result.fileAnalyses
+    );
+    result.metrics.durationsMs.functionalPatterns = Date.now() - functionalStartedAt;
+    result.metrics.durationsMs.total = Date.now() - result.startedAt;
     return {
-      context,
-      functionalPatterns: this.detectFunctionalPatternsFromAnalyses(files, fileAnalyses),
-      files,
+      context: result.context,
+      functionalPatterns,
+      files: result.files,
+      limits: this.analysisLimits(),
+      partial: result.skipped.length > 0,
+      skipped: result.skipped,
+      metrics: result.metrics,
     };
   }
 
-  private async analyzeProject(projectPath: string): Promise<{
+  private async analyzeProject(projectPath: string, discoveredFiles?: string[]): Promise<{
     context: SemanticContext;
     files: string[];
     fileAnalyses: Map<string, FileAnalysis>;
+    skipped: SkippedAnalysisFile[];
+    metrics: AnalysisMetrics;
+    startedAt: number;
   }> {
     const startTime = Date.now();
+    const metrics: AnalysisMetrics = {
+      filesDiscovered: 0,
+      filesParsed: 0,
+      fileReads: 0,
+      bytesRead: 0,
+      maxInFlight: 0,
+      cacheHits: 0,
+      durationsMs: {
+        discovery: 0,
+        parsing: 0,
+        architecture: 0,
+        functionalPatterns: 0,
+        generation: 0,
+        publication: 0,
+        total: 0,
+      },
+    };
 
-    // 1. Find all code files
-    const files = await this.findCodeFiles(projectPath);
+    // 1. Select source files once, applying byte and count budgets before parsing.
+    const discoveryStartedAt = Date.now();
+    const candidates = discoveredFiles
+      ? this.filterCodeFiles(projectPath, discoveredFiles)
+      : await this.findCodeFiles(projectPath);
+    metrics.filesDiscovered = candidates.length;
+    const { files, skipped, bytes } = await this.selectFilesWithinLimits(candidates);
+    metrics.bytesRead = bytes;
+    metrics.durationsMs.discovery = Date.now() - discoveryStartedAt;
 
     // 2. Analyze with Tree-sitter
-    const fileAnalyses = await this.analyzeFiles(files);
+    if (!this.options.cacheEnabled) {
+      this.treeSitter.clearCache();
+    }
+    const parsingStartedAt = Date.now();
+    const fileAnalyses = await this.analyzeFiles(files, metrics);
+    metrics.filesParsed = fileAnalyses.size;
+    metrics.durationsMs.parsing = Date.now() - parsingStartedAt;
 
     // 3. Build base context
     const context = this.buildBaseContext(fileAnalyses, projectPath);
@@ -94,66 +186,155 @@ export class CodebaseAnalyzer {
     }
 
     // 5. Detect architecture and patterns
+    const architectureStartedAt = Date.now();
     context.architecture = this.detectArchitecture(fileAnalyses, projectPath);
+    metrics.durationsMs.architecture = Date.now() - architectureStartedAt;
 
     // 6. Calculate stats
     context.stats.analysisTimeMs = Date.now() - startTime;
+    metrics.durationsMs.total = context.stats.analysisTimeMs;
+
+    if (!this.options.cacheEnabled) {
+      this.treeSitter.clearCache();
+    }
 
     return {
       context,
       files,
       fileAnalyses,
+      skipped,
+      metrics,
+      startedAt: startTime,
+    };
+  }
+
+  private analysisLimits(): AnalysisLimits {
+    return {
+      maxFiles: this.options.maxFiles,
+      maxTotalBytes: this.options.maxTotalBytes,
+      maxFileBytes: this.options.maxFileBytes,
+      concurrency: this.options.concurrency,
     };
   }
 
   private async findCodeFiles(projectPath: string): Promise<string[]> {
-    const extensions = Object.keys(LANGUAGE_EXTENSIONS);
-    const patterns = extensions.map((ext) => `**/*${ext}`);
+    const enabledLanguages = new Set(this.options.languages);
+    const extensions = Object.entries(LANGUAGE_EXTENSIONS)
+      .filter(([, language]) => enabledLanguages.has(language))
+      .map(([extension]) => extension);
+    if (extensions.length === 0) {
+      return [];
+    }
+    const pattern = `**/*{${extensions.join(',')}}`;
 
     const ignorePatterns = this.options.exclude.map((p) => `**/${p}/**`);
 
-    const allFiles: string[] = [];
-
-    for (const pattern of patterns) {
-      try {
-        const matches = await glob(pattern, {
-          cwd: projectPath,
-          ignore: ignorePatterns,
-          absolute: true,
-          nodir: true,
-        });
-        allFiles.push(...matches);
-      } catch {
-        // Ignore glob errors for individual patterns
-      }
+    let allFiles: string[] = [];
+    try {
+      allFiles = await glob(pattern, {
+        cwd: projectPath,
+        ignore: ignorePatterns,
+        absolute: true,
+        nodir: true,
+      });
+    } catch {
+      // A repository that cannot be enumerated produces an empty, valid bundle.
     }
 
     // Apply include filter if specified
-    let filteredFiles = [...new Set(allFiles)];
+    let filteredFiles = [...new Set(allFiles)].sort();
     if (this.options.include.length > 0) {
       filteredFiles = filteredFiles.filter((file) =>
         this.options.include.some((pattern) => file.includes(pattern))
       );
     }
 
-    // Limit number of files
-    return filteredFiles.slice(0, this.options.maxFiles);
+    return filteredFiles;
   }
 
-  private async analyzeFiles(files: string[]): Promise<Map<string, FileAnalysis>> {
-    const analyses = new Map<string, FileAnalysis>();
-    const batchSize = 50;
+  private filterCodeFiles(projectPath: string, discoveredFiles: string[]): string[] {
+    const supported = new Set(Object.keys(LANGUAGE_EXTENSIONS));
+    return [...new Set(discoveredFiles.map((file) =>
+      path.isAbsolute(file) ? file : path.resolve(projectPath, file)
+    ))]
+      .filter((file) => {
+        const extension = path.extname(file).toLowerCase();
+        return supported.has(extension) &&
+          this.options.languages.includes(LANGUAGE_EXTENSIONS[extension]);
+      })
+      .filter((file) => this.options.include.length === 0 ||
+        this.options.include.some((pattern) => file.includes(pattern)))
+      .sort();
+  }
 
-    for (let i = 0; i < files.length; i += batchSize) {
-      const batch = files.slice(i, i + batchSize);
-      const results = await Promise.all(
-        batch.map((file) => this.treeSitter.analyzeFile(file))
-      );
+  private async selectFilesWithinLimits(files: string[]): Promise<{
+    files: string[];
+    skipped: SkippedAnalysisFile[];
+    bytes: number;
+  }> {
+    const selected: string[] = [];
+    const skipped: SkippedAnalysisFile[] = [];
+    let bytes = 0;
 
-      for (const analysis of results) {
-        analyses.set(analysis.filePath, analysis);
+    for (const file of files) {
+      let size: number;
+      try {
+        size = (await fs.stat(file)).size;
+      } catch {
+        skipped.push({ file, reason: 'stat-failed' });
+        continue;
       }
+
+      if (size > this.options.maxFileBytes) {
+        skipped.push({ file, reason: 'file-too-large', size });
+        continue;
+      }
+      if (selected.length >= this.options.maxFiles) {
+        skipped.push({ file, reason: 'file-limit', size });
+        continue;
+      }
+      if (bytes + size > this.options.maxTotalBytes) {
+        skipped.push({ file, reason: 'total-byte-limit', size });
+        continue;
+      }
+
+      selected.push(file);
+      bytes += size;
     }
+
+    return { files: selected, skipped, bytes };
+  }
+
+  private async analyzeFiles(
+    files: string[],
+    metrics?: AnalysisMetrics
+  ): Promise<Map<string, FileAnalysis>> {
+    const analyses = new Map<string, FileAnalysis>();
+    let cursor = 0;
+    let inFlight = 0;
+    const workerCount = Math.min(this.options.concurrency, files.length);
+
+    const worker = async (): Promise<void> => {
+      while (cursor < files.length) {
+        const index = cursor;
+        cursor += 1;
+        inFlight += 1;
+        if (metrics) {
+          metrics.maxInFlight = Math.max(metrics.maxInFlight, inFlight);
+        }
+        try {
+          if (metrics) {
+            metrics.fileReads += 1;
+          }
+          const analysis = await this.treeSitter.analyzeFile(files[index]);
+          analyses.set(analysis.filePath, analysis);
+        } finally {
+          inFlight -= 1;
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     return analyses;
   }
@@ -623,6 +804,7 @@ export class CodebaseAnalyzer {
    * Shutdown LSP servers gracefully
    */
   async shutdown(): Promise<void> {
+    this.treeSitter.clearCache();
     if (this.lspLayer) {
       await this.lspLayer.shutdown();
     }
@@ -698,10 +880,7 @@ export class CodebaseAnalyzer {
    * These patterns indicate functional capabilities like auth, database, API, etc.
    */
   async detectFunctionalPatterns(projectPath: string): Promise<DetectedFunctionalPatterns> {
-    const files = await this.findCodeFiles(projectPath);
-    const analyses = await this.analyzeFiles(files);
-
-    return this.detectFunctionalPatternsFromAnalyses(files, analyses);
+    return (await this.analyzeBundle(projectPath)).functionalPatterns;
   }
 
   private detectFunctionalPatternsFromAnalyses(
