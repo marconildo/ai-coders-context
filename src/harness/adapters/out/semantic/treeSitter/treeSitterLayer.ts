@@ -15,6 +15,7 @@ import {
   LANGUAGE_EXTENSIONS,
   SupportedLanguage,
 } from '../types';
+import { BoundedLruCache } from '../../../../domain/retention/boundedLruCache';
 
 interface CacheEntry {
   mtime: number;
@@ -22,12 +23,21 @@ interface CacheEntry {
 }
 
 export class TreeSitterLayer {
-  private cache: Map<string, CacheEntry> = new Map();
+  private readonly cache: BoundedLruCache<string, CacheEntry>;
+  private readonly cacheEnabled: boolean;
   private treeSitterAvailable: boolean = false;
   private parsers: Map<string, any> = new Map();
   public readonly ready: Promise<void>;
 
-  constructor() {
+  constructor(options: { cacheEnabled?: boolean; maxEntries?: number; maxBytes?: number } = {}) {
+    this.cacheEnabled = options.cacheEnabled ?? true;
+    this.cache = new BoundedLruCache({
+      maxEntries: options.maxEntries ?? 5_000,
+      maxBytes: options.maxBytes ?? 128 * 1024 * 1024,
+      // File freshness is mtime-bound; this TTL bounds idle retention for long-lived processes.
+      ttlMs: 30 * 60 * 1000,
+      estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(JSON.stringify(entry.analysis)),
+    });
     this.ready = this.initializeParsers();
   }
 
@@ -70,7 +80,7 @@ export class TreeSitterLayer {
       const mtime = stat.mtimeMs;
 
       // Check cache
-      const cached = this.cache.get(filePath);
+      const cached = this.cacheEnabled ? this.cache.get(path.resolve(filePath)) : undefined;
       if (cached && cached.mtime === mtime) {
         return cached.analysis;
       }
@@ -84,7 +94,7 @@ export class TreeSitterLayer {
         analysis = this.analyzeWithRegex(filePath, content, language);
       }
 
-      this.cache.set(filePath, { mtime, analysis });
+      if (this.cacheEnabled) this.cache.set(path.resolve(filePath), { mtime, analysis });
       return analysis;
     } catch (error) {
       return this.emptyAnalysis(filePath, language);
@@ -559,6 +569,21 @@ export class TreeSitterLayer {
 
   clearCache(): void {
     this.cache.clear();
+  }
+
+  retainOnly(filePaths: Iterable<string>): void {
+    const retained = new Set([...filePaths].map(filePath => path.resolve(filePath)));
+    for (const cachedPath of [...this.cache.keys()]) {
+      if (!retained.has(cachedPath)) this.cache.delete(cachedPath);
+    }
+  }
+
+  get cacheSize(): number {
+    return this.cache.size;
+  }
+
+  dispose(): void {
+    this.cache.dispose();
   }
 
   async isTreeSitterAvailable(): Promise<boolean> {

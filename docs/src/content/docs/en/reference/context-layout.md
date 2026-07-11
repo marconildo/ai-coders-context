@@ -28,7 +28,8 @@ The rule of thumb: if a human wrote it, it is probably versioned and committed. 
 ├── config.json                  # versioned — generation config
 ├── config/
 │   ├── policy.json              # versioned — policy rules
-│   └── sensors.json             # versioned — sensor catalog
+│   ├── sensors.json             # versioned — sensor catalog
+│   └── runtime.json             # versioned — retention safety limits
 ├── docs/                        # versioned — documentation + semantic KB
 ├── agents/                      # versioned — agent playbooks
 ├── skills/                      # versioned — on-demand expertise
@@ -51,6 +52,7 @@ These files govern how the harness behaves. You write them, you review them, and
 | `.context/config/` | versioned | Yes | The authored config directory. |
 | `.context/config/policy.json` | versioned | Yes | Harness [policy](/concepts/policies/) rules and approval constraints. |
 | `.context/config/sensors.json` | versioned | Yes | Project [sensor](/concepts/sensors/) catalog plus detected stack info. Generated at bootstrap, then customized by the team. |
+| `.context/config/runtime.json` | versioned | Yes | Versioned retention limits for traces, sessions, replays, datasets, checkpoints, bindings, and caches. Unsafe values are clamped to absolute ceilings. |
 
 ## Durable project knowledge
 
@@ -80,9 +82,10 @@ One folder per [harness session](/concepts/harness-runtime/), holding its record
 | Path | Classification | Git-tracked | Purpose |
 | --- | --- | --- | --- |
 | `.context/runtime/sessions/` | runtime | No | Root for all session state. |
-| `.context/runtime/sessions/<id>/session.json` | runtime | No | The session record (status, counters, checkpoints). |
+| `.context/runtime/sessions/<id>/session.json` | runtime | No | The bounded session summary (status, counters, latest checkpoint). |
 | `.context/runtime/sessions/<id>/trace.jsonl` | runtime | No | Append-only event log, one JSON object per line. |
 | `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` | runtime | No | Individual artifact records produced during the session. |
+| `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` | runtime | No | Individual checkpoint records produced during the session. |
 
 ### Workflows
 

@@ -41,15 +41,18 @@ Cada session é dona de uma pasta em `.context/runtime/sessions/<sessionId>/`:
         └── <sessionId>/
             ├── session.json       # o registro da session
             ├── trace.jsonl        # log de eventos append-only (um JSON por linha)
-            └── artifacts/
-                └── <artifactId>.json
+            ├── artifacts/
+            │   └── <artifactId>.json
+            └── checkpoints/
+                └── <checkpointId>.json
 ```
 
 | Caminho | O que contém |
 | --- | --- |
-| `.context/runtime/sessions/<id>/session.json` | O registro da session — status, timestamps, contadores de atividade e checkpoints inline |
+| `.context/runtime/sessions/<id>/session.json` | O resumo limitado da session — status, timestamps, contadores e identidade do checkpoint mais recente |
 | `.context/runtime/sessions/<id>/trace.jsonl` | Log de eventos append-only, um objeto JSON por linha |
 | `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` | Um arquivo por artifact registrado |
+| `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` | Um registro limitado por checkpoint |
 
 ::: caution
 Tudo em `.context/runtime/` é regenerado conforme necessário e está no gitignore. Não edite esses arquivos manualmente — passe pelo harness para que os contadores e o trace permaneçam consistentes.
@@ -77,7 +80,7 @@ O registro da session é armazenado em `.context/runtime/sessions/<id>/session.j
   "checkpointCount": 1,
   "lastTraceAt": "2026-06-05T...",
   "lastCheckpointAt": "2026-06-05T...",
-  "checkpoints": [],
+  "lastCheckpointId": "ckpt_...",
   "metadata": {}
 }
 ```
@@ -157,7 +160,7 @@ Adicione artifacts com a action `addArtifact` da tool `harness` e leia-os com `l
 
 Um **checkpoint** é um marco nomeado dentro de uma session. Ele agrupa um conjunto de artifacts e estado opcional, dando a você um ponto significativo e recuperável para o qual voltar — útil entre fases PREVC, antes de um passo arriscado ou sempre que você quiser um snapshot rotulado.
 
-Checkpoints são armazenados **inline** no array `checkpoints` do registro da session (não como arquivos separados):
+Checkpoints são armazenados como registros individuais em `.context/runtime/sessions/<id>/checkpoints/`. O `session.json` mantém apenas o contador e a identidade do checkpoint mais recente, evitando que o histórico torne cada atualização da session progressivamente maior. Checkpoints legados inline continuam legíveis e são migrados na próxima gravação.
 
 ```json
 {

@@ -19,7 +19,7 @@ import { SemanticContextBuilder, type ContextFormat } from '../../harness/adapte
 import { ContextCache } from '../../harness/adapters/out/semantic/contextCache';
 import { VERSION } from '../../version';
 import { WorkflowService } from '../../harness/application/workflow';
-import { logMcpAction } from '../logging/actionLogger';
+import { clearMcpActionSessionCache, logMcpAction } from '../logging/actionLogger';
 import {
   PREVC_ROLES,
   getScaleName,
@@ -1136,6 +1136,8 @@ Actions:
    */
   async stop(): Promise<void> {
     await this.server.close();
+    this.contextCache.dispose();
+    clearMcpActionSessionCache();
     await this.contextBuilder.shutdown();
     this.log('MCP Server stopped');
   }

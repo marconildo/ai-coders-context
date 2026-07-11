@@ -44,8 +44,8 @@ export class CodebaseAnalyzer {
   private options: Required<AnalyzerOptions>;
 
   constructor(options: AnalyzerOptions = {}) {
-    this.treeSitter = new TreeSitterLayer();
     this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.treeSitter = new TreeSitterLayer({ cacheEnabled: this.options.cacheEnabled });
 
     // Create LSPLayer if LSP mode is enabled
     if (this.options.useLSP) {
@@ -61,6 +61,7 @@ export class CodebaseAnalyzer {
 
     // 2. Analyze with Tree-sitter
     const fileAnalyses = await this.analyzeFiles(files);
+    this.treeSitter.retainOnly?.(files);
 
     // 3. Build base context
     const context = this.buildBaseContext(fileAnalyses, projectPath);
@@ -596,6 +597,7 @@ export class CodebaseAnalyzer {
    * Shutdown LSP servers gracefully
    */
   async shutdown(): Promise<void> {
+    this.treeSitter.dispose?.();
     if (this.lspLayer) {
       await this.lspLayer.shutdown();
     }

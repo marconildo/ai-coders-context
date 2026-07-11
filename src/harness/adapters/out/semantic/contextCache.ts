@@ -13,6 +13,9 @@
 
 import * as fs from 'fs-extra';
 import * as path from 'path';
+import { createHash } from 'crypto';
+import { glob } from 'glob';
+import { BoundedLruCache, type BoundedLruCacheMetrics } from '../../../domain/retention/boundedLruCache';
 
 /**
  * A cached context entry with metadata for invalidation.
@@ -20,8 +23,6 @@ import * as path from 'path';
 interface CacheEntry {
     /** The cached context string */
     content: string;
-    /** Timestamp when this entry was created */
-    createdAt: number;
     /** Modification time hash of source directories at cache time */
     mtimeHash: string;
 }
@@ -31,19 +32,34 @@ export interface ContextCacheOptions {
     ttlMs?: number;
     /** Directories to monitor for changes (relative to repo root) */
     watchDirs?: string[];
+    /** Maximum cached contexts (default: 16) */
+    maxEntries?: number;
+    /** Estimated UTF-8 byte ceiling (default: 32 MiB) */
+    maxBytes?: number;
+    /** Proactive expiration sweep interval */
+    sweepIntervalMs?: number;
 }
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_WATCH_DIRS = ['src', '.context', 'lib', 'packages'];
+const DEFAULT_MAX_ENTRIES = 16;
+const DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
 
 export class ContextCache {
-    private readonly cache = new Map<string, CacheEntry>();
+    private readonly cache: BoundedLruCache<string, CacheEntry>;
     private readonly ttlMs: number;
     private readonly watchDirs: string[];
 
     constructor(options: ContextCacheOptions = {}) {
         this.ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
         this.watchDirs = options.watchDirs ?? DEFAULT_WATCH_DIRS;
+        this.cache = new BoundedLruCache({
+            maxEntries: options.maxEntries ?? DEFAULT_MAX_ENTRIES,
+            maxBytes: options.maxBytes ?? DEFAULT_MAX_BYTES,
+            ttlMs: this.ttlMs,
+            sweepIntervalMs: options.sweepIntervalMs,
+            estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(entry.content) + Buffer.byteLength(entry.mtimeHash),
+        });
     }
 
     /**
@@ -53,17 +69,11 @@ export class ContextCache {
      * @param contextType - Type of context (e.g., 'documentation', 'compact', 'full')
      * @returns Cached context string or null
      */
-    async get(repoPath: string, contextType: string): Promise<string | null> {
-        const key = this.buildKey(repoPath, contextType);
+    async get(repoPath: string, contextType: string, keyOptions?: unknown): Promise<string | null> {
+        const key = this.buildKey(repoPath, contextType, keyOptions);
         const entry = this.cache.get(key);
 
         if (!entry) {
-            return null;
-        }
-
-        // Check TTL expiration
-        if (Date.now() - entry.createdAt > this.ttlMs) {
-            this.cache.delete(key);
             return null;
         }
 
@@ -84,13 +94,12 @@ export class ContextCache {
      * @param contextType - Type of context
      * @param content - The context string to cache
      */
-    async set(repoPath: string, contextType: string, content: string): Promise<void> {
-        const key = this.buildKey(repoPath, contextType);
+    async set(repoPath: string, contextType: string, content: string, keyOptions?: unknown): Promise<void> {
+        const key = this.buildKey(repoPath, contextType, keyOptions);
         const mtimeHash = await this.computeMtimeHash(repoPath);
 
         this.cache.set(key, {
             content,
-            createdAt: Date.now(),
             mtimeHash,
         });
     }
@@ -114,6 +123,15 @@ export class ContextCache {
         this.cache.clear();
     }
 
+    /** Stop proactive sweeping and release all entries. */
+    dispose(): void {
+        this.cache.dispose();
+    }
+
+    metrics(): BoundedLruCacheMetrics {
+        return this.cache.metrics();
+    }
+
     /**
      * Get the number of cached entries (for monitoring/debugging).
      */
@@ -124,8 +142,9 @@ export class ContextCache {
     /**
      * Build a unique cache key from repo path and context type.
      */
-    private buildKey(repoPath: string, contextType: string): string {
-        return `${this.normalizeRepoPath(repoPath)}:${contextType}`;
+    private buildKey(repoPath: string, contextType: string, keyOptions?: unknown): string {
+        const optionsKey = keyOptions === undefined ? '' : `:${JSON.stringify(keyOptions)}`;
+        return `${this.normalizeRepoPath(repoPath)}:${contextType}${optionsKey}`;
     }
 
     /**
@@ -141,19 +160,27 @@ export class ContextCache {
      * of whether source files have changed.
      */
     private async computeMtimeHash(repoPath: string): Promise<string> {
-        const mtimes: number[] = [];
+        const hash = createHash('sha256');
 
         for (const dir of this.watchDirs) {
             const dirPath = path.join(repoPath, dir);
             try {
-                const stat = await fs.stat(dirPath);
-                mtimes.push(Math.floor(stat.mtimeMs));
+                const files = await glob('**/*', {
+                    cwd: dirPath,
+                    absolute: true,
+                    nodir: true,
+                    dot: true,
+                    ignore: dir === '.context' ? ['runtime/**', 'cache/**'] : [],
+                });
+                for (const file of files.sort()) {
+                    const stat = await fs.stat(file);
+                    hash.update(`${dir}/${path.relative(dirPath, file)}:${stat.size}:${stat.mtimeMs}\n`);
+                }
             } catch {
-                // Directory doesn't exist — that's fine, skip it
-                mtimes.push(0);
+                hash.update(`${dir}:missing\n`);
             }
         }
 
-        return mtimes.join('-');
+        return hash.digest('hex');
     }
 }

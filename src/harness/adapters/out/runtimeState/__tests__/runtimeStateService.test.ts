@@ -78,6 +78,46 @@ describe('HarnessRuntimeStateService', () => {
     expect(await fs.pathExists(sessionFile)).toBe(true);
     expect(await fs.pathExists(traceFile)).toBe(true);
     expect(await fs.pathExists(artifactFile)).toBe(true);
+    const sessionDocument = await fs.readJson(sessionFile);
+    expect(sessionDocument.checkpoints).toBeUndefined();
+    expect(sessionDocument.lastCheckpointId).toBe(checkpointed.checkpoints[0].id);
+    expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'checkpoints', `${checkpointed.checkpoints[0].id}.json`))).toBe(true);
+  });
+
+  it('reads legacy inline checkpoints and migrates them losslessly on the next write', async () => {
+    const session = await service.createSession({ name: 'legacy' });
+    const file = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'session.json');
+    const document = await fs.readJson(file);
+    document.checkpoints = [{
+      id: 'legacy-checkpoint',
+      note: 'legacy note',
+      data: { retained: true },
+      artifactIds: ['artifact-1'],
+      createdAt: '2020-01-01T00:00:00.000Z',
+    }];
+    document.checkpointCount = 1;
+    await fs.writeJson(file, document);
+
+    const before = await service.listCheckpoints(session.id);
+    expect(before.map(item => item.id)).toEqual(['legacy-checkpoint']);
+    await service.checkpointSession(session.id, { note: 'new checkpoint' });
+    const after = await service.listCheckpoints(session.id);
+    expect(after).toHaveLength(2);
+    expect(after.find(item => item.id === 'legacy-checkpoint')?.data).toEqual({ retained: true });
+    expect((await fs.readJson(file)).checkpoints).toBeUndefined();
+    expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'checkpoints', 'legacy-checkpoint.json'))).toBe(true);
+  });
+
+  it('enforces checkpoint payload and artifact limits from safe runtime config', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+      version: 1,
+      checkpoints: { maxDataBytes: 1024, maxArtifactIds: 1 },
+    });
+    const session = await service.createSession({ name: 'bounded' });
+    await expect(service.checkpointSession(session.id, { data: 'x'.repeat(2048) }))
+      .rejects.toThrow('Checkpoint data exceeds');
+    await expect(service.checkpointSession(session.id, { artifactIds: ['a', 'b'] }))
+      .rejects.toThrow('Checkpoint artifactIds exceed');
   });
 
   it('lists sessions sorted by recency', async () => {

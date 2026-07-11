@@ -10,6 +10,8 @@ import {
 import {
   ensureHookHarnessSession,
   getHookHarnessSessionId,
+  pruneHookSessionBindings,
+  saveHookHarnessSession,
 } from '../hookSessionStore';
 
 describe('hookDispatchCommands', () => {
@@ -56,5 +58,50 @@ describe('hookSessionStore', () => {
     });
 
     expect(stored).toBe(first);
+  });
+
+  it('prunes expired and missing harness-session bindings during explicit maintenance', async () => {
+    const old = '2020-01-01T00:00:00.000Z';
+    await saveHookHarnessSession({
+      repoPath: tempDir,
+      source: 'codex',
+      hostSessionId: 'expired',
+      harnessSessionId: 'missing-expired',
+      createdAt: old,
+      updatedAt: old,
+    });
+    await saveHookHarnessSession({
+      repoPath: tempDir,
+      source: 'codex',
+      hostSessionId: 'missing',
+      harnessSessionId: 'missing-current',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    const result = await pruneHookSessionBindings(tempDir);
+    expect(result.removedExpired).toBe(1);
+    expect(result.removedMissing).toBe(1);
+    expect(result.remaining).toBe(0);
+  });
+
+  it('caps host-sessions.json at the configured repository limit', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+      version: 1,
+      bindings: { maxEntries: 2 },
+    });
+    for (let index = 0; index < 3; index += 1) {
+      const timestamp = new Date(Date.now() + index * 1000).toISOString();
+      await saveHookHarnessSession({
+        repoPath: tempDir,
+        source: 'claude-code',
+        hostSessionId: `host-${index}`,
+        harnessSessionId: `harness-${index}`,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      });
+    }
+    const store = await fs.readJson(path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json'));
+    expect(Object.keys(store.bindings['claude-code'])).toHaveLength(2);
+    expect(store.bindings['claude-code']['host-0']).toBeUndefined();
   });
 });

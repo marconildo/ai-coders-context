@@ -41,15 +41,18 @@ Each session owns a folder under `.context/runtime/sessions/<sessionId>/`:
         └── <sessionId>/
             ├── session.json       # the session record
             ├── trace.jsonl        # append-only event log (one JSON per line)
-            └── artifacts/
-                └── <artifactId>.json
+            ├── artifacts/
+            │   └── <artifactId>.json
+            └── checkpoints/
+                └── <checkpointId>.json
 ```
 
 | Path | What it holds |
 | --- | --- |
-| `.context/runtime/sessions/<id>/session.json` | The session record — status, timestamps, activity counters, and inline checkpoints |
+| `.context/runtime/sessions/<id>/session.json` | The bounded session summary — status, timestamps, counters, and latest checkpoint identity |
 | `.context/runtime/sessions/<id>/trace.jsonl` | Append-only event log, one JSON object per line |
 | `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` | One file per recorded artifact |
+| `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` | One bounded record per checkpoint |
 
 ::: caution
 Everything under `.context/runtime/` is regenerated as needed and is gitignored. Don't hand-edit these files — go through the harness so counters and the trace stay consistent.
@@ -77,7 +80,7 @@ The session record is stored at `.context/runtime/sessions/<id>/session.json`:
   "checkpointCount": 1,
   "lastTraceAt": "2026-06-05T...",
   "lastCheckpointAt": "2026-06-05T...",
-  "checkpoints": [],
+  "lastCheckpointId": "ckpt_...",
   "metadata": {}
 }
 ```
@@ -157,7 +160,7 @@ Add artifacts with the `harness` tool's `addArtifact` action and read them with 
 
 A **checkpoint** is a named waypoint within a session. It bundles a set of artifacts and optional state so you have a meaningful, recoverable point to return to — useful between PREVC phases, before a risky step, or whenever you want a labeled snapshot.
 
-Checkpoints are stored **inline** in the session record's `checkpoints` array (not as separate files):
+Checkpoints are stored as individual records under `.context/runtime/sessions/<id>/checkpoints/`. `session.json` retains only the count and latest checkpoint identity, so checkpoint history does not make every session update progressively larger. Legacy inline checkpoints remain readable and migrate on the next checkpoint write.
 
 ```json
 {

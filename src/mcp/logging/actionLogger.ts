@@ -6,8 +6,10 @@
  */
 
 import * as fs from 'fs-extra';
+import * as path from 'path';
 
 import { HarnessRuntimeStateService } from '../../harness/adapters/out/runtimeState/runtimeStateService';
+import { BoundedLruCache } from '../../harness/domain/retention/boundedLruCache';
 import { HarnessWorkflowStateService } from '../../harness/adapters/out/workflowState/workflowStateService';
 import { resolveContextRoot } from '../../shared/context/contextRootResolver';
 
@@ -39,7 +41,24 @@ const MAX_ARRAY = 20;
 const MAX_STRING = 200;
 const MCP_ACTIVITY_NAME = 'mcp-activity';
 
-const sessionCache = new Map<string, string>();
+const sessionCache = new BoundedLruCache<string, string>({
+  maxEntries: 64,
+  maxBytes: 64 * 1024,
+  ttlMs: 30 * 60 * 1000,
+  estimateBytes: (sessionId, repoPath) => Buffer.byteLength(sessionId) + Buffer.byteLength(repoPath),
+});
+
+function normalizeRepoPath(repoPath: string): string {
+  return path.resolve(repoPath).toLowerCase();
+}
+
+export function clearMcpActionSessionCache(): void {
+  sessionCache.dispose();
+}
+
+export function getMcpActionSessionCacheSize(): number {
+  return sessionCache.size;
+}
 
 async function resolveContextPath(repoPath: string): Promise<string> {
   const resolution = await resolveContextRoot({
@@ -108,13 +127,15 @@ async function resolveMcpActivitySessionId(
   repoPath: string,
   state: HarnessRuntimeStateService
 ): Promise<string> {
-  const cached = sessionCache.get(repoPath);
+  const cacheKey = normalizeRepoPath(repoPath);
+  const cached = sessionCache.get(cacheKey);
   if (cached) {
     try {
-      await state.getSession(cached);
-      return cached;
+      const session = await state.getSession(cached);
+      if (session.status === 'active' || session.status === 'paused') return cached;
+      sessionCache.delete(cacheKey);
     } catch {
-      sessionCache.delete(repoPath);
+      sessionCache.delete(cacheKey);
     }
   }
 
@@ -124,7 +145,7 @@ async function resolveMcpActivitySessionId(
   );
 
   if (existing) {
-    sessionCache.set(repoPath, existing.id);
+    sessionCache.set(cacheKey, existing.id);
     return existing.id;
   }
 
@@ -135,7 +156,7 @@ async function resolveMcpActivitySessionId(
       purpose: 'tool-audit',
     },
   });
-  sessionCache.set(repoPath, created.id);
+  sessionCache.set(cacheKey, created.id);
   return created.id;
 }
 

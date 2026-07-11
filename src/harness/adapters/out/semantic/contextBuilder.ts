@@ -6,6 +6,9 @@
  */
 
 import * as path from 'path';
+import * as fs from 'fs/promises';
+import { createHash } from 'crypto';
+import { glob } from 'glob';
 import { CodebaseAnalyzer } from './codebaseAnalyzer';
 import type {
   SemanticContext,
@@ -25,6 +28,8 @@ export interface ContextBuilderOptions extends AnalyzerOptions {
   includeSignatures?: boolean;
   /** Maximum total context length (chars) */
   maxContextLength?: number;
+  /** Maximum estimated bytes retained by the single semantic context cache */
+  semanticCacheMaxBytes?: number;
 }
 
 export type ContextFormat = 'documentation' | 'playbook' | 'plan' | 'compact';
@@ -40,6 +45,7 @@ const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
   includeDocumentation: true,
   includeSignatures: true,
   maxContextLength: 32000,
+  semanticCacheMaxBytes: 64 * 1024 * 1024,
 };
 
 export class SemanticContextBuilder {
@@ -47,6 +53,7 @@ export class SemanticContextBuilder {
   private options: Required<ContextBuilderOptions>;
   private cachedContext: SemanticContext | null = null;
   private cachedProjectPath: string | null = null;
+  private cachedFingerprint: string | null = null;
 
   constructor(options: ContextBuilderOptions = {}) {
     this.options = { ...DEFAULT_OPTIONS, ...options };
@@ -57,13 +64,24 @@ export class SemanticContextBuilder {
    * Analyze the codebase and cache the result
    */
   async analyze(projectPath: string): Promise<SemanticContext> {
-    if (this.cachedContext && this.cachedProjectPath === projectPath) {
+    const normalizedProjectPath = path.resolve(projectPath);
+    const fingerprint = await this.computeProjectFingerprint(normalizedProjectPath);
+    if (
+      this.options.cacheEnabled &&
+      this.cachedContext &&
+      this.cachedProjectPath === normalizedProjectPath &&
+      this.cachedFingerprint === fingerprint
+    ) {
       return this.cachedContext;
     }
 
-    this.cachedContext = await this.analyzer.analyze(projectPath);
-    this.cachedProjectPath = projectPath;
-    return this.cachedContext;
+    const context = await this.analyzer.analyze(normalizedProjectPath);
+    if (this.options.cacheEnabled && this.estimateSemanticContextBytes(context) <= this.options.semanticCacheMaxBytes) {
+      this.cachedContext = context;
+      this.cachedProjectPath = normalizedProjectPath;
+      this.cachedFingerprint = fingerprint;
+    }
+    return context;
   }
 
   /**
@@ -807,6 +825,7 @@ export class SemanticContextBuilder {
   clearCache(): void {
     this.cachedContext = null;
     this.cachedProjectPath = null;
+    this.cachedFingerprint = null;
     this.analyzer.clearCache();
   }
 
@@ -814,6 +833,42 @@ export class SemanticContextBuilder {
    * Shutdown analyzer (cleanup LSP servers if enabled)
    */
   async shutdown(): Promise<void> {
+    this.clearCache();
     await this.analyzer.shutdown();
+  }
+
+  private async computeProjectFingerprint(projectPath: string): Promise<string> {
+    const extensions = ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'go'];
+    const files = await glob(`**/*.{${extensions.join(',')}}`, {
+      cwd: projectPath,
+      absolute: true,
+      nodir: true,
+      ignore: this.options.exclude.map((entry) => `**/${entry}/**`),
+    });
+    const hash = createHash('sha256');
+    for (const file of files.sort().slice(0, this.options.maxFiles)) {
+      try {
+        const stat = await fs.stat(file);
+        hash.update(`${path.relative(projectPath, file)}:${stat.size}:${stat.mtimeMs}\n`);
+      } catch {
+        hash.update(`${path.relative(projectPath, file)}:missing\n`);
+      }
+    }
+    return hash.digest('hex');
+  }
+
+  private estimateSemanticContextBytes(context: SemanticContext): number {
+    let bytes = Buffer.byteLength(JSON.stringify({
+      symbols: context.symbols,
+      architecture: context.architecture,
+      stats: context.stats,
+    }));
+    for (const [file, dependencies] of context.dependencies.graph) {
+      bytes += Buffer.byteLength(file) + dependencies.reduce((sum, dependency) => sum + Buffer.byteLength(dependency), 0);
+    }
+    for (const [file, dependants] of context.dependencies.reverseGraph) {
+      bytes += Buffer.byteLength(file) + dependants.reduce((sum, dependant) => sum + Buffer.byteLength(dependant), 0);
+    }
+    return bytes;
   }
 }

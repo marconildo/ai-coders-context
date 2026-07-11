@@ -3,6 +3,7 @@ import * as path from 'path';
 
 import { getContextRootPath } from '../../shared/context';
 import type { HarnessHookResponse } from '../../harness';
+import { loadRuntimeRetentionConfig } from '../../harness/application/retention/runtimeRetentionConfig';
 
 import { extractHarnessSessionId } from './extractHarnessSessionId';
 
@@ -19,6 +20,14 @@ export interface HookSessionBinding {
 
 interface HookSessionStoreDocument {
   bindings: Record<string, Record<string, HookSessionBinding>>;
+}
+
+export interface HookSessionPruneResult {
+  removedExpired: number;
+  removedMissing: number;
+  removedOverLimit: number;
+  remaining: number;
+  durationMs: number;
 }
 
 export interface HookSessionAdapter {
@@ -76,11 +85,65 @@ export async function getHookHarnessSessionId(options: {
 }
 
 export async function saveHookHarnessSession(binding: HookSessionBinding): Promise<void> {
-  const document = await readStore(binding.repoPath);
+  const normalizedRepoPath = path.resolve(binding.repoPath);
+  const document = await readStore(normalizedRepoPath);
   const sourceBindings = document.bindings[binding.source] ?? {};
-  sourceBindings[binding.hostSessionId] = binding;
+  sourceBindings[binding.hostSessionId] = { ...binding, repoPath: normalizedRepoPath };
   document.bindings[binding.source] = sourceBindings;
-  await writeStore(binding.repoPath, document);
+  const { config } = await loadRuntimeRetentionConfig(normalizedRepoPath);
+  capBindings(document, config.bindings.maxEntries);
+  await writeStore(normalizedRepoPath, document);
+}
+
+function allBindings(document: HookSessionStoreDocument): Array<{ source: string; hostSessionId: string; binding: HookSessionBinding }> {
+  return Object.entries(document.bindings).flatMap(([source, sourceBindings]) =>
+    Object.entries(sourceBindings).map(([hostSessionId, binding]) => ({ source, hostSessionId, binding })),
+  );
+}
+
+function capBindings(document: HookSessionStoreDocument, maxEntries: number): number {
+  const bindings = allBindings(document).sort((a, b) => b.binding.updatedAt.localeCompare(a.binding.updatedAt));
+  let removed = 0;
+  for (const entry of bindings.slice(maxEntries)) {
+    delete document.bindings[entry.source]?.[entry.hostSessionId];
+    removed += 1;
+  }
+  return removed;
+}
+
+/** Explicit maintenance used at SessionStart, never on each PostToolUse. */
+export async function pruneHookSessionBindings(repoPath: string): Promise<HookSessionPruneResult> {
+  const startedAt = Date.now();
+  const normalizedRepoPath = path.resolve(repoPath);
+  const contextRoot = await getContextRootPath(normalizedRepoPath);
+  const document = await readStore(normalizedRepoPath);
+  const { config } = await loadRuntimeRetentionConfig(normalizedRepoPath);
+  const cutoff = Date.now() - config.bindings.maxAgeMs;
+  let removedExpired = 0;
+  let removedMissing = 0;
+
+  for (const { source, hostSessionId, binding } of allBindings(document)) {
+    const updatedAt = Date.parse(binding.updatedAt);
+    if (!Number.isFinite(updatedAt) || updatedAt < cutoff) {
+      delete document.bindings[source]?.[hostSessionId];
+      removedExpired += 1;
+      continue;
+    }
+    const sessionFile = path.join(contextRoot, 'runtime', 'sessions', binding.harnessSessionId, 'session.json');
+    if (!await fs.pathExists(sessionFile)) {
+      delete document.bindings[source]?.[hostSessionId];
+      removedMissing += 1;
+    }
+  }
+  const removedOverLimit = capBindings(document, config.bindings.maxEntries);
+  await writeStore(normalizedRepoPath, document);
+  return {
+    removedExpired,
+    removedMissing,
+    removedOverLimit,
+    remaining: allBindings(document).length,
+    durationMs: Date.now() - startedAt,
+  };
 }
 
 export async function ensureHookHarnessSession(
@@ -91,6 +154,7 @@ export async function ensureHookHarnessSession(
     hostSessionId: string;
   }
 ): Promise<string> {
+  await pruneHookSessionBindings(options.repoPath);
   const existing = await getHookHarnessSessionId(options);
   if (existing) {
     return existing;

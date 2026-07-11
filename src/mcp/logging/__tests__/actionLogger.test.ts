@@ -4,7 +4,7 @@ import * as path from 'path';
 
 import { HarnessRuntimeStateService } from '../../../harness/adapters/out/runtimeState/runtimeStateService';
 import { WorkflowService } from '../../../harness/application/workflow/workflowService';
-import { logMcpAction } from '../actionLogger';
+import { clearMcpActionSessionCache, getMcpActionSessionCacheSize, logMcpAction } from '../actionLogger';
 
 describe('logMcpAction', () => {
   let tempDir: string;
@@ -22,6 +22,7 @@ describe('logMcpAction', () => {
   });
 
   afterEach(async () => {
+    clearMcpActionSessionCache();
     await fs.remove(tempDir);
   });
 
@@ -53,6 +54,7 @@ describe('logMcpAction', () => {
     expect((mcpTrace?.data as any).details.nested.content).toBe('[redacted]');
 
     expect(await fs.pathExists(path.join(tempDir, '.context', 'workflow', 'actions.jsonl'))).toBe(false);
+    expect(getMcpActionSessionCacheSize()).toBeLessThanOrEqual(64);
   });
 
   it('reuses the workflow harness session when one is active', async () => {

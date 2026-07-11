@@ -58,6 +58,13 @@ describe('ContextCache', () => {
     });
 
     describe('TTL expiration', () => {
+        it('proactively sweeps expired entries', async () => {
+            const cache = new ContextCache({ ttlMs: 20, sweepIntervalMs: 5 });
+            await cache.set(tempDir, 'compact', 'content');
+            await new Promise(resolve => setTimeout(resolve, 40));
+            expect(cache.size).toBe(0);
+            cache.dispose();
+        });
         it('should expire entries after TTL', async () => {
             // Create cache with very short TTL
             const cache = new ContextCache({ ttlMs: 50 });
@@ -143,6 +150,23 @@ describe('ContextCache', () => {
     });
 
     describe('overwrite behavior', () => {
+        it('evicts least recently used contexts over the entry limit', async () => {
+            const cache = new ContextCache({ maxEntries: 2 });
+            await cache.set(tempDir, 'compact', 'a');
+            await cache.set(tempDir, 'documentation', 'b');
+            await cache.get(tempDir, 'compact');
+            await cache.set(tempDir, 'plan', 'c');
+            expect(await cache.get(tempDir, 'documentation')).toBeNull();
+            expect(await cache.get(tempDir, 'compact')).toBe('a');
+            cache.dispose();
+        });
+
+        it('does not retain a single entry larger than the byte budget', async () => {
+            const cache = new ContextCache({ maxBytes: 32 });
+            await cache.set(tempDir, 'compact', 'x'.repeat(100));
+            expect(cache.size).toBe(0);
+            cache.dispose();
+        });
         it('should overwrite existing entries', async () => {
             const cache = new ContextCache();
 

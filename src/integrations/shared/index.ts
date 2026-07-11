@@ -46,8 +46,10 @@ export {
   ensureHookHarnessSession,
   getHookHarnessSessionId,
   saveHookHarnessSession,
+  pruneHookSessionBindings,
   type HookSessionAdapter,
   type HookSessionBinding,
+  type HookSessionPruneResult,
   type ShellHookSource,
 } from './hookSessionStore';
 
