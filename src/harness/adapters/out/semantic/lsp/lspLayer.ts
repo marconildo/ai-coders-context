@@ -1,11 +1,12 @@
 /**
- * LSP Layer - Language Server Protocol integration for semantic analysis
+ * LSP Layer - Language Server Protocol integration for semantic analysis.
  *
- * Provides deeper semantic understanding through LSP servers.
- * This layer is lazily initialized and optional.
+ * Every child process is owned by one ServerHandle. Buffers, pending requests,
+ * initialization and shutdown state therefore cannot leak across servers.
  */
 
 import { spawn, ChildProcess } from 'child_process';
+import { createHash } from 'crypto';
 import * as path from 'path';
 import {
   TypeInfo,
@@ -30,6 +31,52 @@ interface PendingRequest {
   timeout: NodeJS.Timeout;
 }
 
+export type LSPServerState = 'starting' | 'ready' | 'stopping' | 'stopped' | 'failed';
+
+export interface LSPLifecycleEvent {
+  language: string;
+  projectHash: string;
+  pid?: number;
+  state: LSPServerState;
+  timestamp: number;
+  pendingRequestCount: number;
+  reason?: string;
+  initializeDurationMs?: number;
+  exitCode?: number | null;
+  exitSignal?: NodeJS.Signals | null;
+  forcedKill?: boolean;
+  retrySuppressed?: boolean;
+}
+
+interface ServerHandle {
+  key: string;
+  language: string;
+  projectPath: string;
+  process: ChildProcess;
+  state: LSPServerState;
+  initialization: Promise<boolean>;
+  stopping?: Promise<void>;
+  pendingRequests: Map<number, PendingRequest>;
+  buffer: Buffer;
+  startedAt: number;
+  terminationReason?: string;
+  forcedKill: boolean;
+  closed: boolean;
+  closePromise: Promise<void>;
+  resolveClose: () => void;
+  exitCode?: number | null;
+  exitSignal?: NodeJS.Signals | null;
+}
+
+export interface LSPLayerOptions {
+  /** Primarily useful to provide explicitly installed or test language servers. */
+  serverConfigs?: Record<string, LSPServerConfig>;
+  requestTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
+  terminationGraceMs?: number;
+  onLifecycleEvent?: (event: LSPLifecycleEvent) => void;
+}
+
 const LSP_SERVER_CONFIGS: Record<string, LSPServerConfig> = {
   typescript: {
     command: 'typescript-language-server',
@@ -48,85 +95,136 @@ const LSP_SERVER_CONFIGS: Record<string, LSPServerConfig> = {
   },
 };
 
-const REQUEST_TIMEOUT_MS = 10000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 2_000;
+const DEFAULT_TERMINATION_GRACE_MS = 2_000;
 
 export class LSPLayer {
-  private servers: Map<string, ChildProcess> = new Map();
-  private messageId: number = 0;
-  private pendingRequests: Map<number, PendingRequest> = new Map();
-  private initialized: Map<string, boolean> = new Map();
-  private buffers: Map<string, string> = new Map();
+  private readonly handles = new Map<string, ServerHandle>();
+  private readonly failedCircuits = new Set<string>();
+  private readonly serverConfigs: Record<string, LSPServerConfig>;
+  private readonly requestTimeoutMs: number;
+  private readonly shutdownTimeoutMs: number;
+  private readonly terminationGraceMs: number;
+  private readonly onLifecycleEvent?: (event: LSPLifecycleEvent) => void;
+  private messageId = 0;
+  private shuttingDown?: Promise<void>;
+
+  constructor(options: LSPLayerOptions = {}) {
+    this.serverConfigs = options.serverConfigs || LSP_SERVER_CONFIGS;
+    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
+    this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
+    this.terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+    this.onLifecycleEvent = options.onLifecycleEvent;
+  }
 
   private detectLanguage(filePath: string): SupportedLanguage | null {
     const ext = path.extname(filePath);
     return LANGUAGE_EXTENSIONS[ext] || null;
   }
 
-  private getServerConfig(language: string): LSPServerConfig | null {
-    return LSP_SERVER_CONFIGS[language] || null;
+  private serverKey(language: string, projectPath: string): string {
+    return `${language}:${path.resolve(projectPath)}`;
   }
 
   async ensureServer(language: string, projectPath: string): Promise<boolean> {
-    if (this.initialized.get(language)) {
-      return true;
-    }
-
-    const config = this.getServerConfig(language);
-    if (!config) {
+    const key = this.serverKey(language, projectPath);
+    if (this.failedCircuits.has(key)) {
+      this.emitLifecycle(language, projectPath, 'failed', 0, { retrySuppressed: true });
       return false;
     }
+    if (this.shuttingDown) return false;
 
+    const existing = this.handles.get(key);
+    if (existing?.state === 'ready') return true;
+    if (existing?.state === 'starting') return existing.initialization;
+    if (existing) return false;
+
+    const config = this.serverConfigs[language];
+    if (!config) return false;
+
+    let resolveClose!: () => void;
+    const closePromise = new Promise<void>((resolve) => {
+      resolveClose = resolve;
+    });
+    const child = spawn(config.command, config.args, {
+      cwd: projectPath,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env },
+    });
+
+    const handle: ServerHandle = {
+      key,
+      language,
+      projectPath: path.resolve(projectPath),
+      process: child,
+      state: 'starting',
+      initialization: Promise.resolve(false),
+      pendingRequests: new Map(),
+      buffer: Buffer.alloc(0),
+      startedAt: Date.now(),
+      forcedKill: false,
+      closed: false,
+      closePromise,
+      resolveClose,
+    };
+
+    // Publish the owner before any asynchronous event can act on the process.
+    this.handles.set(key, handle);
+    this.emitHandleLifecycle(handle, 'starting');
+    this.attachProcessListeners(handle);
+    handle.initialization = this.initializeHandle(handle);
+    return handle.initialization;
+  }
+
+  private attachProcessListeners(handle: ServerHandle): void {
+    handle.process.stdout?.on('data', (data: Buffer) => this.handleServerData(handle, data));
+    // Drain stderr without retaining diagnostics in memory.
+    handle.process.stderr?.on('data', () => undefined);
+    handle.process.stdin?.on('error', () => undefined);
+    handle.process.once('error', (error) => {
+      if (handle.state !== 'stopping' && handle.state !== 'stopped') {
+        const reason = `process error: ${error.message}`;
+        handle.terminationReason = reason;
+        handle.state = 'failed';
+        this.failedCircuits.add(handle.key);
+        this.emitHandleLifecycle(handle, 'failed', { reason });
+        this.rejectPending(handle, new Error(`LSP server ${handle.language} failed`));
+        if (!handle.process.pid) this.markClosed(handle);
+        void this.terminateHandle(handle, reason);
+      }
+    });
+    handle.process.once('close', (code, signal) => {
+      handle.exitCode = code;
+      handle.exitSignal = signal;
+      this.markClosed(handle);
+      if (handle.state !== 'stopping' && handle.state !== 'stopped') {
+        handle.state = 'failed';
+        handle.terminationReason ||= 'process closed unexpectedly';
+        this.failedCircuits.add(handle.key);
+        this.emitHandleLifecycle(handle, 'failed', {
+          reason: handle.terminationReason,
+          exitCode: code,
+          exitSignal: signal,
+        });
+        this.rejectPending(handle, new Error(`LSP server ${handle.language} disconnected`));
+        this.releaseHandle(handle);
+      }
+    });
+  }
+
+  private markClosed(handle: ServerHandle): void {
+    if (handle.closed) return;
+    handle.closed = true;
+    handle.resolveClose();
+  }
+
+  private async initializeHandle(handle: ServerHandle): Promise<boolean> {
     try {
-      // Wrap spawn in a promise to properly handle ENOENT and other spawn errors
-      const serverProcess = await new Promise<ChildProcess>((resolve, reject) => {
-        const proc = spawn(config.command, config.args, {
-          cwd: projectPath,
-          stdio: ['pipe', 'pipe', 'pipe'],
-          env: { ...process.env },
-        });
-
-        // Handle spawn errors (e.g., command not found)
-        proc.on('error', (error) => {
-          reject(error);
-        });
-
-        // Give spawn a moment to fail or succeed
-        // If no error within a short time, assume spawn succeeded
-        setTimeout(() => {
-          if (proc.pid) {
-            resolve(proc);
-          } else {
-            reject(new Error(`Failed to spawn ${config.command}`));
-          }
-        }, 100);
-      });
-
-      this.servers.set(language, serverProcess);
-      this.buffers.set(language, '');
-
-      // Setup message handling
-      serverProcess.stdout?.on('data', (data: Buffer) => {
-        this.handleServerData(language, data);
-      });
-
-      serverProcess.stderr?.on('data', () => {
-        // Silently ignore stderr - LSP servers may output diagnostics
-      });
-
-      // Re-attach error handler for runtime errors (after spawn)
-      serverProcess.on('error', () => {
-        // Silently cleanup on error
-        this.cleanup(language);
-      });
-
-      serverProcess.on('exit', () => {
-        this.cleanup(language);
-      });
-
-      // Initialize the server
-      await this.sendRequest(language, 'initialize', {
+      await this.waitForSpawn(handle);
+      await this.sendRequest(handle, 'initialize', {
         processId: process.pid,
-        rootUri: `file://${projectPath}`,
+        rootUri: `file://${handle.projectPath}`,
         capabilities: {
           textDocument: {
             hover: { contentFormat: ['markdown', 'plaintext'] },
@@ -137,113 +235,253 @@ export class LSPLayer {
         },
       });
 
-      this.sendNotification(language, 'initialized', {});
-      this.initialized.set(language, true);
-
+      if (handle.state !== 'starting') throw new Error('LSP server stopped during initialize');
+      this.sendNotification(handle, 'initialized', {});
+      handle.state = 'ready';
+      this.emitHandleLifecycle(handle, 'ready', {
+        initializeDurationMs: Date.now() - handle.startedAt,
+      });
       return true;
-    } catch {
-      // LSP server not available - this is expected if the language server isn't installed
-      // Silently return false and fall back to non-LSP analysis
+    } catch (error) {
+      this.failedCircuits.add(handle.key);
+      const reason =
+        error instanceof Error ? `initialize failed: ${error.message}` : 'initialize failed';
+      handle.state = 'failed';
+      this.emitHandleLifecycle(handle, 'failed', {
+        reason,
+        initializeDurationMs: Date.now() - handle.startedAt,
+      });
+      await this.terminateHandle(
+        handle,
+        reason
+      );
       return false;
     }
   }
 
-  private handleServerData(language: string, data: Buffer): void {
-    let buffer = (this.buffers.get(language) || '') + data.toString();
-
-    while (true) {
-      const headerMatch = buffer.match(/Content-Length: (\d+)\r\n\r\n/);
-      if (!headerMatch) break;
-
-      const contentLength = parseInt(headerMatch[1], 10);
-      const headerEnd = headerMatch.index! + headerMatch[0].length;
-
-      if (buffer.length < headerEnd + contentLength) break;
-
-      const content = buffer.slice(headerEnd, headerEnd + contentLength);
-      buffer = buffer.slice(headerEnd + contentLength);
-
-      try {
-        const message: LSPMessage = JSON.parse(content);
-        this.handleMessage(message);
-      } catch {
-        // Silently ignore malformed messages
-      }
-    }
-
-    this.buffers.set(language, buffer);
-  }
-
-  private handleMessage(message: LSPMessage): void {
-    if (message.id !== undefined && this.pendingRequests.has(message.id)) {
-      const pending = this.pendingRequests.get(message.id)!;
-      this.pendingRequests.delete(message.id);
-      clearTimeout(pending.timeout);
-
-      if (message.error) {
-        pending.reject(new Error(message.error.message));
-      } else {
-        pending.resolve(message.result);
-      }
-    }
-  }
-
-  private sendRequest(language: string, method: string, params: unknown): Promise<unknown> {
+  private waitForSpawn(handle: ServerHandle): Promise<void> {
     return new Promise((resolve, reject) => {
-      const id = ++this.messageId;
-
-      const timeout = setTimeout(() => {
-        this.pendingRequests.delete(id);
-        reject(new Error(`LSP request timeout: ${method}`));
-      }, REQUEST_TIMEOUT_MS);
-
-      this.pendingRequests.set(id, { resolve, reject, timeout });
-
-      const message: LSPMessage = {
-        jsonrpc: '2.0',
-        id,
-        method,
-        params,
+      const onSpawn = (): void => {
+        cleanup();
+        resolve();
       };
-
-      this.sendMessage(language, message);
+      const onError = (error: Error): void => {
+        cleanup();
+        reject(error);
+      };
+      const onClose = (): void => {
+        cleanup();
+        reject(new Error('LSP server closed before spawn confirmation'));
+      };
+      const cleanup = (): void => {
+        handle.process.off('spawn', onSpawn);
+        handle.process.off('error', onError);
+        handle.process.off('close', onClose);
+      };
+      handle.process.once('spawn', onSpawn);
+      handle.process.once('error', onError);
+      handle.process.once('close', onClose);
     });
   }
 
-  private sendNotification(language: string, method: string, params: unknown): void {
-    const message: LSPMessage = {
-      jsonrpc: '2.0',
-      method,
-      params,
-    };
-    this.sendMessage(language, message);
+  private handleServerData(handle: ServerHandle, data: Buffer): void {
+    handle.buffer = Buffer.concat([handle.buffer, data]);
+
+    while (true) {
+      const headerEnd = handle.buffer.indexOf('\r\n\r\n');
+      if (headerEnd < 0) return;
+      const header = handle.buffer.subarray(0, headerEnd).toString('ascii');
+      const match = /(?:^|\r\n)Content-Length:\s*(\d+)/i.exec(header);
+      if (!match) {
+        handle.buffer = Buffer.alloc(0);
+        return;
+      }
+      const contentLength = Number(match[1]);
+      const bodyStart = headerEnd + 4;
+      if (handle.buffer.length < bodyStart + contentLength) return;
+
+      const body = handle.buffer.subarray(bodyStart, bodyStart + contentLength);
+      handle.buffer = handle.buffer.subarray(bodyStart + contentLength);
+      try {
+        this.handleMessage(handle, JSON.parse(body.toString('utf8')) as LSPMessage);
+      } catch {
+        // Malformed server messages are ignored without affecting another handle.
+      }
+    }
   }
 
-  private sendMessage(language: string, message: LSPMessage): void {
-    const server = this.servers.get(language);
-    if (!server?.stdin?.writable) return;
+  private handleMessage(handle: ServerHandle, message: LSPMessage): void {
+    if (message.id === undefined) return;
+    const pending = handle.pendingRequests.get(message.id);
+    if (!pending) return;
 
+    handle.pendingRequests.delete(message.id);
+    clearTimeout(pending.timeout);
+    if (message.error) pending.reject(new Error(message.error.message));
+    else pending.resolve(message.result);
+  }
+
+  private sendRequest(
+    handle: ServerHandle,
+    method: string,
+    params: unknown,
+    timeoutMs = this.requestTimeoutMs
+  ): Promise<unknown> {
+    return new Promise((resolve, reject) => {
+      const id = ++this.messageId;
+      const timeout = setTimeout(() => {
+        handle.pendingRequests.delete(id);
+        reject(new Error(`LSP request timeout: ${method}`));
+      }, timeoutMs);
+      handle.pendingRequests.set(id, { resolve, reject, timeout });
+
+      if (!this.sendMessage(handle, { jsonrpc: '2.0', id, method, params })) {
+        clearTimeout(timeout);
+        handle.pendingRequests.delete(id);
+        reject(new Error(`LSP server ${handle.language} is not writable`));
+      }
+    });
+  }
+
+  private sendNotification(handle: ServerHandle, method: string, params: unknown): boolean {
+    return this.sendMessage(handle, { jsonrpc: '2.0', method, params });
+  }
+
+  private sendMessage(handle: ServerHandle, message: LSPMessage): boolean {
+    const stdin = handle.process.stdin;
+    if (!stdin?.writable || stdin.destroyed) return false;
     const content = JSON.stringify(message);
     const header = `Content-Length: ${Buffer.byteLength(content)}\r\n\r\n`;
-
     try {
-      server.stdin.write(header + content);
+      stdin.write(header + content);
+      return true;
     } catch {
-      // Silently ignore send failures
+      return false;
     }
   }
 
-  private cleanup(language: string): void {
-    this.servers.delete(language);
-    this.initialized.delete(language);
-    this.buffers.delete(language);
-
-    // Reject all pending requests for this language
-    for (const [id, pending] of this.pendingRequests) {
+  private rejectPending(handle: ServerHandle, error: Error): void {
+    for (const pending of handle.pendingRequests.values()) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error(`LSP server ${language} disconnected`));
-      this.pendingRequests.delete(id);
+      pending.reject(error);
     }
+    handle.pendingRequests.clear();
+  }
+
+  private async terminateHandle(
+    handle: ServerHandle,
+    reason: string,
+    waitForNaturalExit = false
+  ): Promise<void> {
+    if (handle.stopping) return handle.stopping;
+    if (handle.state === 'stopped' && handle.closed) return;
+
+    handle.terminationReason = reason;
+    handle.state = 'stopping';
+    this.emitHandleLifecycle(handle, 'stopping', { reason });
+    handle.stopping = (async () => {
+      this.rejectPending(handle, new Error(`LSP server ${handle.language} terminated: ${reason}`));
+      handle.process.stdin?.end();
+
+      if (!handle.closed) {
+        const exitedNaturally =
+          waitForNaturalExit && (await this.waitForClose(handle, this.terminationGraceMs));
+        if (!exitedNaturally) {
+          this.signal(handle, 'SIGTERM');
+          if (!(await this.waitForClose(handle, this.terminationGraceMs))) {
+            handle.forcedKill = true;
+            this.signal(handle, 'SIGKILL');
+            await handle.closePromise;
+          }
+        }
+      }
+
+      handle.state = 'stopped';
+      this.emitHandleLifecycle(handle, 'stopped', {
+        reason,
+        exitCode: handle.exitCode,
+        exitSignal: handle.exitSignal,
+        forcedKill: handle.forcedKill,
+      });
+      this.releaseHandle(handle);
+    })();
+    return handle.stopping;
+  }
+
+  private signal(handle: ServerHandle, signal: NodeJS.Signals): void {
+    if (handle.closed || !handle.process.pid) return;
+    try {
+      handle.process.kill(signal);
+    } catch {
+      // A concurrent process exit is equivalent to successful termination.
+    }
+  }
+
+  private waitForClose(handle: ServerHandle, timeoutMs: number): Promise<boolean> {
+    if (handle.closed) return Promise.resolve(true);
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve(false), timeoutMs);
+      handle.closePromise.then(() => {
+        clearTimeout(timeout);
+        resolve(true);
+      });
+    });
+  }
+
+  private releaseHandle(handle: ServerHandle): void {
+    if (this.handles.get(handle.key) === handle) this.handles.delete(handle.key);
+    this.rejectPending(handle, new Error(`LSP server ${handle.language} released`));
+    handle.buffer = Buffer.alloc(0);
+    handle.process.stdin?.removeAllListeners();
+    handle.process.stdout?.removeAllListeners();
+    handle.process.stderr?.removeAllListeners();
+    handle.process.removeAllListeners();
+  }
+
+  private emitHandleLifecycle(
+    handle: ServerHandle,
+    state: LSPServerState,
+    details: Partial<LSPLifecycleEvent> = {}
+  ): void {
+    this.emitLifecycle(
+      handle.language,
+      handle.projectPath,
+      state,
+      handle.pendingRequests.size,
+      { pid: handle.process.pid, ...details }
+    );
+  }
+
+  private emitLifecycle(
+    language: string,
+    projectPath: string,
+    state: LSPServerState,
+    pendingRequestCount: number,
+    details: Partial<LSPLifecycleEvent> = {}
+  ): void {
+    if (!this.onLifecycleEvent) return;
+    const event: LSPLifecycleEvent = {
+      language,
+      projectHash: createHash('sha256').update(path.resolve(projectPath)).digest('hex').slice(0, 12),
+      state,
+      timestamp: Date.now(),
+      pendingRequestCount,
+      ...details,
+    };
+    try {
+      this.onLifecycleEvent(event);
+    } catch {
+      // Observability must never change process ownership or fallback behavior.
+    }
+  }
+
+  private async readyHandle(
+    language: string,
+    projectPath: string
+  ): Promise<ServerHandle | undefined> {
+    if (!(await this.ensureServer(language, projectPath))) return undefined;
+    const handle = this.handles.get(this.serverKey(language, projectPath));
+    return handle?.state === 'ready' ? handle : undefined;
   }
 
   async getTypeInfo(
@@ -254,23 +492,20 @@ export class LSPLayer {
   ): Promise<TypeInfo | null> {
     const language = this.detectLanguage(filePath);
     if (!language) return null;
-
-    const serverReady = await this.ensureServer(language, projectPath);
-    if (!serverReady) return null;
+    const handle = await this.readyHandle(language, projectPath);
+    if (!handle) return null;
 
     try {
-      const result = await this.sendRequest(language, 'textDocument/hover', {
+      const result = await this.sendRequest(handle, 'textDocument/hover', {
         textDocument: { uri: `file://${filePath}` },
         position: { line: line - 1, character: column },
       });
-
       if (result && typeof result === 'object' && 'contents' in result) {
         return this.parseHoverResult((result as { contents: unknown }).contents);
       }
     } catch {
-      // LSP request failed - return null to fall back to non-LSP analysis
+      // Fall back to the non-LSP analysis.
     }
-
     return null;
   }
 
@@ -282,17 +517,15 @@ export class LSPLayer {
   ): Promise<ReferenceLocation[]> {
     const language = this.detectLanguage(filePath);
     if (!language) return [];
-
-    const serverReady = await this.ensureServer(language, projectPath);
-    if (!serverReady) return [];
+    const handle = await this.readyHandle(language, projectPath);
+    if (!handle) return [];
 
     try {
-      const result = await this.sendRequest(language, 'textDocument/references', {
+      const result = await this.sendRequest(handle, 'textDocument/references', {
         textDocument: { uri: `file://${filePath}` },
         position: { line: line - 1, character: column },
         context: { includeDeclaration: true },
       });
-
       if (Array.isArray(result)) {
         return result.map((ref: { uri: string; range: { start: { line: number; character: number } } }) => ({
           file: ref.uri.replace('file://', ''),
@@ -301,9 +534,8 @@ export class LSPLayer {
         }));
       }
     } catch {
-      // LSP request failed - return empty array
+      // Fall back to an empty result.
     }
-
     return [];
   }
 
@@ -315,16 +547,14 @@ export class LSPLayer {
   ): Promise<ReferenceLocation | null> {
     const language = this.detectLanguage(filePath);
     if (!language) return null;
-
-    const serverReady = await this.ensureServer(language, projectPath);
-    if (!serverReady) return null;
+    const handle = await this.readyHandle(language, projectPath);
+    if (!handle) return null;
 
     try {
-      const result = await this.sendRequest(language, 'textDocument/definition', {
+      const result = await this.sendRequest(handle, 'textDocument/definition', {
         textDocument: { uri: `file://${filePath}` },
         position: { line: line - 1, character: column },
       });
-
       if (Array.isArray(result) && result.length > 0) {
         const def = result[0] as { uri: string; range: { start: { line: number; character: number } } };
         return {
@@ -334,9 +564,8 @@ export class LSPLayer {
         };
       }
     } catch {
-      // LSP request failed - return null
+      // Fall back to the non-LSP analysis.
     }
-
     return null;
   }
 
@@ -348,16 +577,14 @@ export class LSPLayer {
   ): Promise<ReferenceLocation[]> {
     const language = this.detectLanguage(filePath);
     if (!language) return [];
-
-    const serverReady = await this.ensureServer(language, projectPath);
-    if (!serverReady) return [];
+    const handle = await this.readyHandle(language, projectPath);
+    if (!handle) return [];
 
     try {
-      const result = await this.sendRequest(language, 'textDocument/implementation', {
+      const result = await this.sendRequest(handle, 'textDocument/implementation', {
         textDocument: { uri: `file://${filePath}` },
         position: { line: line - 1, character: column },
       });
-
       if (Array.isArray(result)) {
         return result.map((impl: { uri: string; range: { start: { line: number; character: number } } }) => ({
           file: impl.uri.replace('file://', ''),
@@ -366,18 +593,15 @@ export class LSPLayer {
         }));
       }
     } catch {
-      // LSP request failed - return empty array
+      // Fall back to an empty result.
     }
-
     return [];
   }
 
   private parseHoverResult(contents: unknown): TypeInfo {
     let text = '';
-
-    if (typeof contents === 'string') {
-      text = contents;
-    } else if (Array.isArray(contents)) {
+    if (typeof contents === 'string') text = contents;
+    else if (Array.isArray(contents)) {
       text = contents
         .map((c) => (typeof c === 'string' ? c : (c as { value?: string }).value || ''))
         .join('\n');
@@ -385,10 +609,8 @@ export class LSPLayer {
       text = (contents as { value?: string }).value || '';
     }
 
-    // Extract type from markdown code blocks
     const codeMatch = text.match(/```\w*\n?([\s\S]*?)\n?```/);
     const typeText = codeMatch ? codeMatch[1] : text;
-
     return {
       name: typeText.split('\n')[0] || 'unknown',
       fullType: typeText,
@@ -397,30 +619,34 @@ export class LSPLayer {
   }
 
   async shutdown(): Promise<void> {
-    const shutdownPromises: Promise<void>[] = [];
+    if (this.shuttingDown) return this.shuttingDown;
+    this.shuttingDown = (async () => {
+      const handles = [...this.handles.values()];
+      await Promise.all(handles.map((handle) => this.shutdownHandle(handle)));
+    })();
+    return this.shuttingDown;
+  }
 
-    for (const [language] of this.servers) {
-      shutdownPromises.push(
-        (async () => {
-          try {
-            await this.sendRequest(language, 'shutdown', null);
-            this.sendNotification(language, 'exit', null);
-          } catch {
-            // Ignore shutdown errors
-          }
-          this.cleanup(language);
-        })()
-      );
+  private async shutdownHandle(handle: ServerHandle): Promise<void> {
+    if (handle.stopping) return handle.stopping;
+    if (handle.state === 'ready') {
+      try {
+        await this.sendRequest(handle, 'shutdown', null, this.shutdownTimeoutMs);
+        this.sendNotification(handle, 'exit', null);
+      } catch {
+        // Process termination below is authoritative even if the protocol fails.
+      }
     }
-
-    await Promise.all(shutdownPromises);
+    await this.terminateHandle(handle, 'layer shutdown', true);
   }
 
   isServerAvailable(language: string): boolean {
-    return this.initialized.get(language) === true;
+    return [...this.handles.values()].some(
+      (handle) => handle.language === language && handle.state === 'ready'
+    );
   }
 
   getAvailableLanguages(): string[] {
-    return Object.keys(LSP_SERVER_CONFIGS);
+    return Object.keys(this.serverConfigs);
   }
 }
