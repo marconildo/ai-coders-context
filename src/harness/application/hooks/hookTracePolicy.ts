@@ -75,6 +75,18 @@ function configuredValue(config: Record<string, unknown>, key: string, section: 
 
 export function parseHookTracePolicy(value: unknown): HookTracePolicy {
   const config = isRecord(value) ? value : {};
+  const maxSessionTraceBytes = finiteInteger(
+    configuredValue(config, 'maxSessionTraceBytes', 'trace', 'maxSessionBytes'),
+    DEFAULT_HOOK_TRACE_POLICY.maxSessionTraceBytes,
+    64 * 1024,
+    GLOBAL_SESSION_TRACE_MAX_BYTES
+  );
+  const traceRotationBytes = finiteInteger(
+    configuredValue(config, 'traceRotationBytes', 'trace', 'rotationBytes'),
+    DEFAULT_HOOK_TRACE_POLICY.traceRotationBytes,
+    64 * 1024,
+    GLOBAL_TRACE_ROTATION_MAX_BYTES
+  );
   return {
     maxInputBytes: finiteInteger(
       configuredValue(config, 'maxInputBytes', 'stdin', 'maxBytes'),
@@ -106,24 +118,16 @@ export function parseHookTracePolicy(value: unknown): HookTracePolicy {
       1024,
       GLOBAL_HOOK_TRACE_MAX_BYTES
     ),
-    traceRotationBytes: finiteInteger(
-      configuredValue(config, 'traceRotationBytes', 'trace', 'rotationBytes'),
-      DEFAULT_HOOK_TRACE_POLICY.traceRotationBytes,
-      64 * 1024,
-      GLOBAL_TRACE_ROTATION_MAX_BYTES
-    ),
+    // The active segment is never pruned, so it must fit inside the total
+    // session budget even when configuration supplies contradictory limits.
+    traceRotationBytes: Math.min(traceRotationBytes, maxSessionTraceBytes),
     retainedTraceSegments: finiteInteger(
       configuredValue(config, 'retainedTraceSegments', 'trace', 'retainedSegments'),
       DEFAULT_HOOK_TRACE_POLICY.retainedTraceSegments,
       0,
       GLOBAL_TRACE_RETAINED_SEGMENTS
     ),
-    maxSessionTraceBytes: finiteInteger(
-      configuredValue(config, 'maxSessionTraceBytes', 'trace', 'maxSessionBytes'),
-      DEFAULT_HOOK_TRACE_POLICY.maxSessionTraceBytes,
-      64 * 1024,
-      GLOBAL_SESSION_TRACE_MAX_BYTES
-    ),
+    maxSessionTraceBytes,
   };
 }
 
@@ -199,20 +203,97 @@ function commandBasename(command: string): string | undefined {
   return match?.[1] ? path.basename(match[1]) : undefined;
 }
 
+const COMMAND_SECRET_KEY = /(?<![A-Za-z0-9])(?:authorization|api[-_]?key|access[-_]?token|token|password|secret)\b/gi;
+const COMMAND_VALUE_BOUNDARY = /[\s,}\];&|]/;
+
+function precedingFlag(command: string, keyStart: number): boolean {
+  const prefix = command.slice(Math.max(0, keyStart - 3), keyStart);
+  return /--?$/.test(prefix);
+}
+
+function skipJsonKeyQuote(command: string, cursor: number): number {
+  if (command[cursor] === '"' || command[cursor] === "'") return cursor + 1;
+  if (command[cursor] === '\\' && (command[cursor + 1] === '"' || command[cursor + 1] === "'")) {
+    return cursor + 2;
+  }
+  return cursor;
+}
+
+function quotedValueEnd(command: string, start: number): number | undefined {
+  const escapedQuote = command[start] === '\\' && (command[start + 1] === '"' || command[start + 1] === "'");
+  const quote = escapedQuote ? command[start + 1] : command[start];
+  if (quote !== '"' && quote !== "'") return undefined;
+  const openingWidth = escapedQuote ? 2 : 1;
+  for (let cursor = start + openingWidth; cursor < command.length; cursor += 1) {
+    if (escapedQuote) {
+      if (command[cursor] === '\\' && command[cursor + 1] === quote) return cursor + 2;
+    } else if (command[cursor] === quote && command[cursor - 1] !== '\\') {
+      return cursor + 1;
+    }
+  }
+  // An unterminated quoted value has no trustworthy boundary. Omitting the
+  // tail is safer than allowing a partial credential into the preview.
+  return command.length;
+}
+
+function enclosingShellQuote(command: string, index: number): '"' | "'" | undefined {
+  let quote: '"' | "'" | undefined;
+  for (let cursor = 0; cursor < index; cursor += 1) {
+    const character = command[cursor];
+    if (character === '\\' && quote !== "'") {
+      cursor += 1;
+      continue;
+    }
+    if ((character === '"' || character === "'") && (!quote || quote === character)) {
+      quote = quote ? undefined : character;
+    }
+  }
+  return quote;
+}
+
+function unquotedValueEnd(command: string, start: number, enclosingQuote?: '"' | "'"): number {
+  if (enclosingQuote) {
+    for (let cursor = start; cursor < command.length; cursor += 1) {
+      if (command[cursor] === enclosingQuote && command[cursor - 1] !== '\\') return cursor + 1;
+    }
+    return command.length;
+  }
+  let cursor = start;
+  while (cursor < command.length && !COMMAND_VALUE_BOUNDARY.test(command[cursor])) cursor += 1;
+  if (/^bearer$/i.test(command.slice(start, cursor))) {
+    while (cursor < command.length && /\s/.test(command[cursor])) cursor += 1;
+    while (cursor < command.length && !COMMAND_VALUE_BOUNDARY.test(command[cursor])) cursor += 1;
+  }
+  return cursor;
+}
+
 function redactCommandSecrets(command: string): { value: string; redacted: number } {
+  let value = '';
+  let sourceCursor = 0;
   let redacted = 0;
-  const replace = (pattern: RegExp, replacement: string): void => {
-    command = command.replace(pattern, (...args: unknown[]) => {
-      redacted += 1;
-      const key = typeof args[1] === 'string' ? args[1] : '';
-      return replacement.replace('$KEY', key);
-    });
-  };
-  replace(/['"](authorization)\s*:\s*(?:bearer\s+)?[^'"]+['"]/gi, '$KEY=[REDACTED]');
-  replace(/\b(authorization)\s*[:=]\s*(?:bearer\s+)?[^\s;&|]+/gi, '$KEY=[REDACTED]');
-  replace(/--?(api[-_]?key|token|password|secret)(?:=|\s+)(?:"[^"]*"|'[^']*'|[^\s;&|]+)/gi, '--$KEY=[REDACTED]');
-  replace(/\b(api[-_]?key|token|password|secret)=(?:"[^"]*"|'[^']*'|[^\s;&|]+)/gi, '$KEY=[REDACTED]');
-  return { value: command, redacted };
+  COMMAND_SECRET_KEY.lastIndex = 0;
+  for (let match = COMMAND_SECRET_KEY.exec(command); match; match = COMMAND_SECRET_KEY.exec(command)) {
+    if (match.index < sourceCursor) continue;
+    let cursor = skipJsonKeyQuote(command, match.index + match[0].length);
+    while (cursor < command.length && /\s/.test(command[cursor])) cursor += 1;
+
+    if (command[cursor] === ':' || command[cursor] === '=') {
+      cursor += 1;
+    } else if (precedingFlag(command, match.index) && cursor > match.index + match[0].length) {
+      // A space-delimited --token value form.
+    } else {
+      continue;
+    }
+    while (cursor < command.length && /\s/.test(command[cursor])) cursor += 1;
+
+    const quotedEnd = quotedValueEnd(command, cursor);
+    const end = quotedEnd ?? unquotedValueEnd(command, cursor, enclosingShellQuote(command, match.index));
+    value += `${command.slice(sourceCursor, cursor)}[REDACTED]`;
+    sourceCursor = end;
+    redacted += 1;
+    COMMAND_SECRET_KEY.lastIndex = Math.max(COMMAND_SECRET_KEY.lastIndex, end);
+  }
+  return { value: value + command.slice(sourceCursor), redacted };
 }
 
 function countSensitiveFields(value: unknown, policy: HookTracePolicy, depth = 0): number {

@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Prevented Claude Code, Codex, and Pi Write/Edit hooks from retaining source bodies or sensitive fields by persisting bounded metadata summaries instead.
+- Redacted Bash credentials across header, JSON, assignment, camel-case, and flag forms, omitting ambiguous command tails rather than risking secret disclosure.
 - Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
 - Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
+- Made stale trace-lock takeover verify process ownership, token, device, and inode across competing processes; same-millisecond rotations now use a monotonic segment sequence.
+- Kept the active rotation threshold and individual events within the configured per-session trace quota, including contradictory configurations and a single oversized event.
 
 ## [1.1.1] - 2026-06-27
 

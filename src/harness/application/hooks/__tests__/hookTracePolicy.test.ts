@@ -137,6 +137,36 @@ describe('hook trace policy', () => {
     expect(unknown.capture.truncatedFieldCount).toBe(1);
   });
 
+  it.each([
+    ['header', `curl -H 'X-API-Key: header-supersecret' https://example.test`],
+    ['authorization header', `curl --header="Authorization: Bearer bearer-supersecret" https://example.test`],
+    ['JSON', `curl -d '{"token":"json-supersecret"}' https://example.test`],
+    ['escaped JSON', String.raw`curl -d "{\"apiKey\":\"escaped-supersecret\"}" https://example.test`],
+    ['colon', 'deploy password:colon-supersecret'],
+    ['equals', 'TOKEN=equals-supersecret npm test'],
+    ['camelCase flag', 'deploy --apiKey=camel-supersecret --safe true'],
+    ['space flag', 'deploy --secret flag-supersecret --safe true'],
+  ])('redacts case-insensitive Bash secrets in %s form', (_label, command) => {
+    const data = sanitizeHookTraceData('Bash', { command });
+    const preview = String(data.tool_input.commandPreview);
+
+    expect(preview).toContain('[REDACTED]');
+    expect(preview.toLowerCase()).not.toContain('supersecret');
+    expect(data.capture.redactedFieldCount).toBeGreaterThan(0);
+  });
+
+  it('omits the remaining Bash preview when a quoted secret has no reliable boundary', () => {
+    const data = sanitizeHookTraceData('Bash', {
+      command: `curl -H 'X-API-Key: never-persist --next also-sensitive`,
+    });
+    const preview = String(data.tool_input.commandPreview);
+
+    expect(preview).toContain('[REDACTED]');
+    expect(preview).not.toContain('never-persist');
+    expect(preview).not.toContain('--next');
+    expect(preview).not.toContain('also-sensitive');
+  });
+
   it('omits pathological unknown key names and enforces the hook quota before persistence', () => {
     const secretInKey = `secret-key-material-${'private-key-fragment-'.repeat(20_000)}`;
     const data = sanitizeHookTraceData('CustomTool', {
@@ -221,5 +251,17 @@ describe('hook trace policy', () => {
     expect(policy.maxObjectDepth).toBe(1);
     expect(policy.retainedTraceSegments).toBe(16);
     expect(DEFAULT_HOOK_TRACE_POLICY.maxSerializedTraceBytes).toBe(16 * 1024);
+  });
+
+  it('caps the active rotation threshold at the total session quota', () => {
+    const policy = parseHookTracePolicy({
+      trace: {
+        rotationBytes: 64 * 1024 * 1024,
+        maxSessionBytes: 64 * 1024,
+      },
+    });
+
+    expect(policy.traceRotationBytes).toBe(64 * 1024);
+    expect(policy.maxSessionTraceBytes).toBe(64 * 1024);
   });
 });

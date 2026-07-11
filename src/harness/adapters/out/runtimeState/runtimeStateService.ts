@@ -19,6 +19,20 @@ import {
 } from '../../../application/hooks/hookTracePolicy';
 
 const traceWriteQueues = new Map<string, Promise<void>>();
+const TRACE_LOCK_STALE_MS = 60_000;
+const ROTATION_EVENT_RESERVE_BYTES = 2 * 1024;
+
+interface TraceLockIdentity {
+  pid: number;
+  token: string;
+}
+
+interface TraceFileLock extends TraceLockIdentity {
+  lockFile: string;
+  handle: FileHandle;
+  inode: bigint | number;
+  device: bigint | number;
+}
 
 function waitForLock(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -34,29 +48,103 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-async function acquireTraceFileLock(
-  traceFile: string
-): Promise<{ lockFile: string; handle: FileHandle; inode: bigint | number }> {
+function parseTraceLockIdentity(value: string): TraceLockIdentity {
+  try {
+    const parsed = JSON.parse(value) as Partial<TraceLockIdentity>;
+    return {
+      pid: typeof parsed.pid === 'number' ? parsed.pid : Number.NaN,
+      token: typeof parsed.token === 'string' ? parsed.token : '',
+    };
+  } catch {
+    // Preserve takeover compatibility with locks written by the first F-02
+    // implementation (`pid timestamp`).
+    return { pid: Number.parseInt(value.split(/\s/, 1)[0], 10), token: value.trim() };
+  }
+}
+
+async function sameLockIdentity(
+  file: string,
+  expected: { inode: bigint | number; device: bigint | number; token: string }
+): Promise<boolean> {
+  try {
+    const handle = await nodeFs.open(file, 'r');
+    try {
+      const [stat, contents] = await Promise.all([
+        handle.stat({ bigint: true }),
+        handle.readFile('utf8'),
+      ]);
+      const identity = parseTraceLockIdentity(contents);
+      return stat.ino === expected.inode && stat.dev === expected.device && identity.token === expected.token;
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function tryTakeOverStaleTraceLock(lockFile: string): Promise<boolean> {
+  const takeoverFile = `${lockFile}.takeover`;
+  try {
+    // link(2) is the atomic election: exactly one waiter creates the fixed
+    // takeover name, and the hard link pins the inode it inspected.
+    await nodeFs.link(lockFile, takeoverFile);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === 'EEXIST' || code === 'ENOENT') return false;
+    throw error;
+  }
+
+  try {
+    const handle = await nodeFs.open(takeoverFile, 'r');
+    try {
+      const [stat, contents] = await Promise.all([
+        handle.stat({ bigint: true }),
+        handle.readFile('utf8'),
+      ]);
+      const identity = parseTraceLockIdentity(contents);
+      const age = Date.now() - Number(stat.mtimeMs);
+      const observed = { inode: stat.ino, device: stat.dev, token: identity.token };
+      if (age <= TRACE_LOCK_STALE_MS || isProcessAlive(identity.pid)) return false;
+      if (!(await sameLockIdentity(lockFile, observed))) return false;
+      // No second reaper can race this unlink while the fixed takeover link
+      // exists, and a dead owner cannot replace its own inode/token.
+      await nodeFs.unlink(lockFile);
+      return true;
+    } finally {
+      await handle.close();
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return false;
+  } finally {
+    await nodeFs.unlink(takeoverFile).catch(() => undefined);
+  }
+}
+
+async function acquireTraceFileLock(traceFile: string): Promise<TraceFileLock> {
   const lockFile = `${traceFile}.lock`;
+  const takeoverFile = `${lockFile}.takeover`;
   const deadline = Date.now() + 10_000;
   while (true) {
+    if (await nodeFs.stat(takeoverFile).then(() => true).catch(() => false)) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for trace lock takeover: ${path.basename(traceFile)}`);
+      }
+      await waitForLock(10 + Math.floor(Math.random() * 20));
+      continue;
+    }
     try {
       const handle = await nodeFs.open(lockFile, 'wx');
-      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`, 'utf8');
+      const token = randomUUID();
+      await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }), 'utf8');
       const stat = await handle.stat({ bigint: true });
-      return { lockFile, handle, inode: stat.ino };
+      return { lockFile, handle, inode: stat.ino, device: stat.dev, pid: process.pid, token };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw error;
 
-      const [age, ownerPid] = await Promise.all([
-        nodeFs.stat(lockFile).then((stat) => Date.now() - stat.mtimeMs).catch(() => 0),
-        nodeFs.readFile(lockFile, 'utf8')
-          .then((value) => Number.parseInt(value.split(/\s/, 1)[0], 10))
-          .catch(() => Number.NaN),
-      ]);
-      if (age > 60_000 && !isProcessAlive(ownerPid)) {
-        await nodeFs.unlink(lockFile).catch(() => undefined);
+      if (await tryTakeOverStaleTraceLock(lockFile)) {
         continue;
       }
       if (Date.now() >= deadline) {
@@ -73,10 +161,7 @@ async function withCrossProcessTraceLock<T>(traceFile: string, operation: () => 
     return await operation();
   } finally {
     await lock.handle.close().catch(() => undefined);
-    const currentInode = await nodeFs.stat(lock.lockFile, { bigint: true })
-      .then((stat) => stat.ino)
-      .catch(() => undefined);
-    if (currentInode === lock.inode) {
+    if (await sameLockIdentity(lock.lockFile, lock)) {
       await nodeFs.unlink(lock.lockFile).catch(() => undefined);
     }
   }
@@ -279,11 +364,38 @@ export class HarnessRuntimeStateService {
     if (!(await fs.pathExists(sessionDir))) {
       return [];
     }
-    const entries = await fs.readdir(sessionDir);
-    return entries
-      .filter((entry) => /^trace\..+\.jsonl$/.test(entry))
-      .sort()
-      .map((entry) => path.join(sessionDir, entry));
+    const entries = (await fs.readdir(sessionDir)).filter((entry) => /^trace\..+\.jsonl$/.test(entry));
+    const segments = await Promise.all(entries.map(async (entry) => {
+      const file = path.join(sessionDir, entry);
+      const stat = await fs.stat(file);
+      const sequence = /^trace\.(\d{12})\./.exec(entry)?.[1];
+      return { file, entry, mtimeMs: stat.mtimeMs, sequence: sequence ? Number(sequence) : undefined };
+    }));
+    return segments.sort((a, b) => {
+      if (a.sequence !== undefined && b.sequence !== undefined) return a.sequence - b.sequence;
+      return a.mtimeMs - b.mtimeMs || (a.sequence ?? 0) - (b.sequence ?? 0) || a.entry.localeCompare(b.entry);
+    }).map(({ file }) => file);
+  }
+
+  private async nextTraceSegmentSequence(sessionId: string): Promise<number> {
+    const sequenceFile = path.join(this.layout.sessionDir(sessionId), 'trace.sequence');
+    const configured = await fs.readFile(sequenceFile, 'utf8')
+      .then((value) => Number.parseInt(value, 10))
+      .catch(() => 0);
+    const existing = await this.listTraceSegmentFiles(sessionId);
+    const maximumExisting = existing.reduce((maximum, file) => {
+      const sequence = Number(/^trace\.(\d{12})\./.exec(path.basename(file))?.[1] ?? 0);
+      return Math.max(maximum, sequence);
+    }, 0);
+    const next = Math.max(Number.isSafeInteger(configured) ? configured : 0, maximumExisting) + 1;
+    const temporary = `${sequenceFile}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, `${next}\n`, 'utf8');
+      await fs.rename(temporary, sequenceFile);
+    } finally {
+      await fs.remove(temporary).catch(() => undefined);
+    }
+    return next;
   }
 
   private async pruneTraceSegments(sessionId: string): Promise<void> {
@@ -319,7 +431,8 @@ export class HarnessRuntimeStateService {
     let rotationTrace: HarnessTraceRecord | undefined;
 
     if (activeBytes > 0 && activeBytes + Buffer.byteLength(serialized, 'utf8') > policy.traceRotationBytes) {
-      const rotationId = `${new Date().toISOString().replace(/[:.]/g, '-')}.${randomUUID()}`;
+      const sequence = await this.nextTraceSegmentSequence(sessionId);
+      const rotationId = `${String(sequence).padStart(12, '0')}.${new Date().toISOString().replace(/[:.]/g, '-')}.${randomUUID()}`;
       const segmentFile = `${this.traceSegmentPrefix(sessionId)}${rotationId}.jsonl`;
       await fs.rename(activeFile, segmentFile);
       rotationTrace = boundGenericTraceRecord<HarnessTraceRecord>({
@@ -350,7 +463,16 @@ export class HarnessRuntimeStateService {
     }
     return withTraceWriteLock(this.traceFile(sessionId), async () => {
       const session = await this.readSession(sessionId);
-      const boundedTrace = boundGenericTraceRecord(trace, loadGenericTraceEventMaxBytes(this.repoPath));
+      const policy = loadHookTracePolicy(this.repoPath);
+      const traceBudget = Math.max(
+        1024,
+        Math.min(
+          loadGenericTraceEventMaxBytes(this.repoPath),
+          policy.traceRotationBytes - ROTATION_EVENT_RESERVE_BYTES,
+          policy.maxSessionTraceBytes - ROTATION_EVENT_RESERVE_BYTES
+        )
+      );
+      const boundedTrace = boundGenericTraceRecord(trace, traceBudget);
       const rotationTrace = await this.appendTraceLine(sessionId, boundedTrace);
 
       session.traceCount += rotationTrace ? 2 : 1;

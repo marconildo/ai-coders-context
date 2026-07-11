@@ -1,6 +1,8 @@
 import * as fs from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
+import { spawn } from 'child_process';
+import { pathToFileURL } from 'url';
 import {
   HarnessRuntimeStateService,
 } from '../runtimeStateService';
@@ -167,5 +169,121 @@ describe('HarnessRuntimeStateService', () => {
       message: 'continued',
     })).resolves.toMatchObject({ event: 'after.stale.lock' });
     expect(await fs.pathExists(lockFile)).toBe(false);
+  });
+
+  it('serializes multiprocess writers racing to take over the same stale lock', async () => {
+    const session = await service.createSession({ name: 'stale-lock-race' });
+    const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+    const lockFile = path.join(sessionDir, 'trace.jsonl.lock');
+    await fs.writeJson(lockFile, {
+      pid: 999999,
+      token: 'stale-owner-token',
+      createdAt: '2000-01-01T00:00:00.000Z',
+    });
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lockFile, old, old);
+
+    const moduleUrl = pathToFileURL(path.resolve(__dirname, '../runtimeStateService.ts')).href;
+    const worker = `
+      (async () => {
+        const loaded = await import(${JSON.stringify(moduleUrl)});
+        const HarnessRuntimeStateService = loaded.HarnessRuntimeStateService ?? loaded.default?.HarnessRuntimeStateService;
+        const runtime = new HarnessRuntimeStateService({ repoPath: process.argv[1] });
+        await runtime.appendTrace(process.argv[2], {
+          level: 'info', event: 'worker.event', message: 'worker-' + process.argv[3],
+          data: { worker: Number(process.argv[3]), payload: 'x'.repeat(8192) }
+        });
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const runWorker = (index: number): Promise<void> => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', 'tsx', '-e', worker, tempDir, session.id, String(index)], {
+        cwd: path.resolve(__dirname, '../../../../../..'),
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`worker ${index} failed: ${stderr}`)));
+    });
+
+    await Promise.all(Array.from({ length: 8 }, (_, index) => runWorker(index)));
+
+    const traceText = await fs.readFile(path.join(sessionDir, 'trace.jsonl'), 'utf8');
+    const lines = traceText.trim().split('\n');
+    expect(() => lines.forEach((line) => JSON.parse(line))).not.toThrow();
+    const traces = await service.listTraces(session.id);
+    expect(traces.filter((trace) => trace.event === 'worker.event')).toHaveLength(8);
+    expect(new Set(traces.filter((trace) => trace.event === 'worker.event').map((trace) => trace.data?.worker)).size)
+      .toBe(8);
+    expect(await fs.pathExists(lockFile)).toBe(false);
+    expect(await fs.pathExists(`${lockFile}.takeover`)).toBe(false);
+  }, 30_000);
+
+  it('uses monotonic segment sequences for same-millisecond rotation and pruning', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'hooks.json'), {
+      trace: {
+        rotationBytes: 64 * 1024,
+        retainedSegments: 2,
+        maxSessionBytes: 512 * 1024,
+      },
+    });
+    jest.useFakeTimers({ doNotFake: ['nextTick', 'setImmediate', 'setTimeout'] });
+    jest.setSystemTime(new Date('2026-07-11T20:00:00.123Z'));
+    try {
+      const session = await service.createSession({ name: 'same-ms-rotation' });
+      for (let index = 0; index < 6; index += 1) {
+        await service.appendTrace(session.id, {
+          level: 'info',
+          event: 'same-ms.event',
+          message: `event-${index}`,
+          data: { index, payload: 'x'.repeat(60 * 1024) },
+        });
+      }
+
+      const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+      const segments = (await fs.readdir(sessionDir))
+        .filter((entry) => /^trace\.\d{12}\..+\.jsonl$/.test(entry))
+        .sort();
+      expect(segments).toHaveLength(2);
+      const sequences = segments.map((entry) => Number(/^trace\.(\d{12})\./.exec(entry)?.[1]));
+      expect(sequences[1]).toBe(sequences[0] + 1);
+
+      const traces = await service.listTraces(session.id);
+      const retainedIndexes = traces
+        .filter((trace) => trace.event === 'same-ms.event')
+        .map((trace) => trace.data?.index);
+      expect(retainedIndexes).toEqual([...retainedIndexes].sort((a, b) => Number(a) - Number(b)));
+      expect(retainedIndexes).toContain(5);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  it('keeps a single oversized event and active trace within a smaller session quota', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'hooks.json'), {
+      trace: {
+        rotationBytes: 64 * 1024 * 1024,
+        retainedSegments: 16,
+        maxSessionBytes: 64 * 1024,
+      },
+    });
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+      trace: { maxSerializedBytes: 1024 * 1024 },
+    });
+    const session = await service.createSession({ name: 'cross-limit-budget' });
+    const marker = `must-not-persist-${'x'.repeat(512 * 1024)}`;
+
+    const trace = await service.appendTrace(session.id, {
+      level: 'info', event: 'oversized.single', message: marker, data: { marker },
+    });
+    const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+    const traceFiles = (await fs.readdir(sessionDir)).filter((entry) => entry.endsWith('.jsonl'));
+    const totalBytes = (await Promise.all(traceFiles.map((entry) => fs.stat(path.join(sessionDir, entry)))))
+      .reduce((sum, stat) => sum + stat.size, 0);
+
+    expect(totalBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(trace.data).toMatchObject({ traceDataOmitted: true });
+    expect((await fs.readFile(path.join(sessionDir, 'trace.jsonl'), 'utf8'))).not.toContain(marker);
   });
 });
