@@ -98,6 +98,13 @@ export class SemanticContextBuilder {
 
     let discovered: Awaited<ReturnType<SemanticContextBuilder['computeProjectFingerprint']>> | undefined;
     if (owner.fingerprint && owner.snapshot) {
+      if (owner.snapshot.partial) {
+        owner.cache.clear();
+        owner.fingerprint = undefined;
+        owner.snapshot = undefined;
+      }
+    }
+    if (owner.fingerprint && owner.snapshot) {
       const freshness = await isBoundedSnapshotFresh(owner.snapshot);
       owner.freshness.signalsChecked += freshness.signalsChecked;
       if (freshness.fresh) {
@@ -106,6 +113,13 @@ export class SemanticContextBuilder {
       } else {
         discovered = await this.computeProjectFingerprint(normalizedProjectPath);
         this.recordDiscoveryMetrics(owner.freshness, discovered.metrics);
+        if (discovered.snapshot.partial) {
+          owner.cache.clear();
+          owner.fingerprint = undefined;
+          owner.snapshot = undefined;
+          owner.freshness.invalidations += 1;
+          return this.analyzer.analyze(normalizedProjectPath);
+        }
         if (discovered.fingerprint === owner.fingerprint) {
           owner.snapshot = discovered.snapshot;
           const cached = owner.cache.get(owner.fingerprint);
@@ -120,6 +134,12 @@ export class SemanticContextBuilder {
     if (!discovered) {
       discovered = await this.computeProjectFingerprint(normalizedProjectPath);
       this.recordDiscoveryMetrics(owner.freshness, discovered.metrics);
+    }
+    if (discovered.snapshot.partial) {
+      owner.cache.clear();
+      owner.fingerprint = undefined;
+      owner.snapshot = undefined;
+      return this.analyzer.analyze(normalizedProjectPath);
     }
     const fingerprint = discovered.fingerprint;
     if (owner.fingerprint && owner.fingerprint !== fingerprint) owner.cache.clear();

@@ -128,6 +128,14 @@ export class ContextCache {
         const key = this.buildKey(repoPath, contextType, keyOptions);
         const freshness = await this.captureFreshness(repoPath);
 
+        // Without an injected strong fingerprint, partial discovery cannot
+        // observe changes outside its selected prefix. Do not retain an entry
+        // that could later authorize a stale hit.
+        if (!this.options.fingerprintProvider && freshness.freshnessSnapshot?.partial) {
+            cache.delete(key);
+            return;
+        }
+
         cache.set(key, {
             content,
             ...freshness,
@@ -281,10 +289,12 @@ export class ContextCache {
             return await this.options.fingerprintProvider(repoPath) === entry.freshnessFingerprint;
         }
         if (!entry.freshnessSnapshot) return false;
+        if (entry.freshnessSnapshot.partial) return false;
         const result = await isBoundedSnapshotFresh(entry.freshnessSnapshot);
         this.freshness.signalsChecked += result.signalsChecked;
         if (result.fresh) return true;
         const refreshed = await this.captureFreshness(repoPath);
+        if (refreshed.freshnessSnapshot?.partial) return false;
         if (refreshed.freshnessFingerprint === entry.freshnessFingerprint && refreshed.freshnessSnapshot) {
             entry.freshnessSnapshot = refreshed.freshnessSnapshot;
             return true;

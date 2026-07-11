@@ -124,6 +124,45 @@ describe('ContextCache', () => {
             expect(cache.freshnessMetrics().invalidations).toBe(1);
             cache.dispose();
         });
+
+        it('does not cache partial discoveries that cannot prove full freshness', async () => {
+            await fs.outputFile(path.join(tempDir, 'src', 'a.ts'), 'export const a = 1;');
+            await fs.outputFile(path.join(tempDir, 'src', 'b.ts'), 'export const b = 1;');
+            await fs.outputFile(path.join(tempDir, 'src', 'z.ts'), 'export const z = 1;');
+            const cache = new ContextCache({ watchDirs: ['src'], freshnessMaxFiles: 2 });
+
+            await cache.set(tempDir, 'compact', 'stale-content');
+            expect(cache.freshnessMetrics().partialDiscoveries).toBe(1);
+            expect(cache.size).toBe(0);
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+
+            await fs.writeFile(path.join(tempDir, 'src', 'z.ts'), 'export const z = 222;');
+            await cache.set(tempDir, 'compact', 'still-not-cacheable');
+            await fs.outputFile(path.join(tempDir, 'src', 'zz-added.ts'), 'export const added = true;');
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            await fs.remove(path.join(tempDir, 'src', 'z.ts'));
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            cache.dispose();
+        });
+
+        it('allows cache hits when an injected strong fingerprint proves freshness', async () => {
+            let fingerprint = 'source-v1';
+            const cache = new ContextCache({
+                watchDirs: ['src'],
+                freshnessMaxFiles: 1,
+                fingerprintProvider: async () => fingerprint,
+            });
+            await fs.outputFile(path.join(tempDir, 'src', 'a.ts'), 'export const a = 1;');
+            await fs.outputFile(path.join(tempDir, 'src', 'b.ts'), 'export const b = 1;');
+            await cache.set(tempDir, 'compact', 'strong-content');
+
+            expect(await cache.get(tempDir, 'compact')).toBe('strong-content');
+            await fs.writeFile(path.join(tempDir, 'src', 'b.ts'), 'export const b = 222;');
+            expect(await cache.get(tempDir, 'compact')).toBe('strong-content');
+            fingerprint = 'source-v2';
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            cache.dispose();
+        });
     });
 
     describe('invalidation and clearing', () => {

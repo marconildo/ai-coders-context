@@ -148,6 +148,11 @@ export async function isBoundedSnapshotFresh(snapshot: BoundedFreshnessSnapshot)
   durationMs: number;
 }> {
   const started = Date.now();
+  // A partial snapshot has no signal for unvisited directories/files, so it
+  // can never prove that the complete source identity is still fresh.
+  if (snapshot.partial) {
+    return { fresh: false, signalsChecked: 0, durationMs: Date.now() - started };
+  }
   let signalsChecked = 0;
   for (const directory of snapshot.directories) {
     try {

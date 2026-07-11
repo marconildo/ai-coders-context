@@ -28,6 +28,10 @@ describe('bounded semantic file discovery', () => {
     expect(result.metrics).toMatchObject({ filesSelected: 10, partial: true });
     expect(result.metrics.entriesScanned).toBeLessThan(200);
     expect(result.snapshot.files).toHaveLength(10);
+    await expect(isBoundedSnapshotFresh(result.snapshot)).resolves.toMatchObject({
+      fresh: false,
+      signalsChecked: 0,
+    });
   });
 
   it('ignores irrelevant trees and detects dirty, new, and deleted relevant files', async () => {

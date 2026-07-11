@@ -83,7 +83,7 @@ describe('semantic cache retention', () => {
     expect(analyzer.fileAnalysisCacheMetrics().entries).toBe(0);
   });
 
-  it('limits semantic fingerprint discovery before materialization and reuses bounded hit signals', async () => {
+  it('never reuses semantic context from a partial bounded discovery', async () => {
     for (let index = 0; index < 40; index += 1) {
       await fs.outputFile(path.join(repo, 'src', `${index}.ts`), `export const value${index} = ${index};`);
     }
@@ -93,14 +93,22 @@ describe('semantic cache retention', () => {
 
     await builder.analyze(repo);
     await builder.analyze(repo);
-    expect(analyze).toHaveBeenCalledTimes(1);
+    expect(analyze).toHaveBeenCalledTimes(2);
     expect(builder.freshnessMetrics(repo)).toMatchObject({
-      discoveries: 1,
-      filesSelected: 5,
-      partialDiscoveries: 1,
+      discoveries: 2,
+      filesSelected: 10,
+      partialDiscoveries: 2,
     });
     expect(builder.freshnessMetrics(repo)!.entriesScanned).toBeLessThan(40);
-    expect(builder.freshnessMetrics(repo)!.signalsChecked).toBeGreaterThan(0);
+    expect(builder.semanticCacheMetrics(repo)).toMatchObject({ entries: 0 });
+
+    await fs.writeFile(path.join(repo, 'src', '39.ts'), 'export const changedBeyondBudget = true;');
+    await builder.analyze(repo);
+    await fs.outputFile(path.join(repo, 'src', 'added-beyond-budget.ts'), 'export const added = true;');
+    await builder.analyze(repo);
+    await fs.remove(path.join(repo, 'src', '39.ts'));
+    await builder.analyze(repo);
+    expect(analyze).toHaveBeenCalledTimes(5);
     await builder.shutdown();
   });
 });
