@@ -1,6 +1,6 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 
 import { resolveRuntimeLayoutFromRepo } from '../../../shared/fs/pathHelpers';
 import {
@@ -60,7 +60,14 @@ export interface BuildHarnessDatasetOptions {
   includeSuccessfulSessions?: boolean;
   concurrency?: number;
   maxFailures?: number;
+  maxFailureBytes?: number;
+  maxBytes?: number;
 }
+
+export const DEFAULT_DATASET_MAX_BYTES = 16 * 1024 * 1024;
+export const MAX_DATASET_BYTES = 64 * 1024 * 1024;
+export const DEFAULT_FAILURE_RECORD_MAX_BYTES = 64 * 1024;
+export const MAX_FAILURE_RECORD_BYTES = 1024 * 1024;
 
 export interface HarnessDatasetSummary {
   id: string;
@@ -82,15 +89,27 @@ function nowIso(): string {
 }
 
 function normalizeSignature(value: string): string {
-  return value
+  const normalized = value
     .toLowerCase()
     .replace(/\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b/g, ':uuid')
     .replace(/\s+/g, ' ')
     .trim();
+  if (Buffer.byteLength(normalized, 'utf8') <= 512) return normalized;
+  return `${normalized.slice(0, 384)}:sha256:${createHash('sha256').update(normalized).digest('hex')}`;
+}
+
+function replayRecords<T>(replay: HarnessReplayRecord, source: HarnessReplayRecord['events'][number]['source']): T[] {
+  const events = replay.events ?? [];
+  const current = events
+    .filter(event => event.source === source && event.record)
+    .map(event => event.record as T);
+  if (current.length > 0 || events.length > 0) return current;
+  const legacyKey = ({ trace: 'traces', artifact: 'artifacts', checkpoint: 'checkpoints', sensor: 'sensorRuns', task: 'tasks', handoff: 'handoffs' } as const)[source as Exclude<typeof source, 'session'>];
+  return legacyKey ? (((replay as unknown as Record<string, unknown>)[legacyKey] as T[] | undefined) ?? []) : [];
 }
 
 function buildSensorFailures(replay: HarnessReplayRecord): HarnessFailureRecord[] {
-  return replay.sensorRuns
+  return replayRecords<import('../sensors/sensorsService').HarnessSensorRun>(replay, 'sensor')
     .filter(run => run.status === 'failed' || run.status === 'blocked')
     .map(run => ({
       id: randomUUID(),
@@ -115,7 +134,7 @@ async function buildTaskFailures(
 ): Promise<HarnessFailureRecord[]> {
   const taskFailures: HarnessFailureRecord[] = [];
 
-  for (const task of replay.tasks.filter(item => item.sessionId === replay.sessionId)) {
+  for (const task of replayRecords<import('../contracts/taskContractsService').HarnessTaskContract>(replay, 'task').filter(item => item.sessionId === replay.sessionId)) {
     const result = await taskContractsService.evaluateTaskCompletion(task.id, replay.sessionId);
     if (result.canComplete) {
       continue;
@@ -147,7 +166,7 @@ function buildSessionFailure(replay: HarnessReplayRecord): HarnessFailureRecord[
     return [];
   }
 
-  const lastErrorTrace = [...replay.traces].reverse().find(trace => trace.level === 'error' || trace.event.includes('failed'));
+  const lastErrorTrace = replayRecords<import('../../adapters/out/runtimeState/runtimeStateService').HarnessTraceRecord>(replay, 'trace').reverse().find(trace => trace.level === 'error' || trace.event.includes('failed'));
   const message = lastErrorTrace?.message || `Session failed: ${replay.session.name}`;
 
   return [{
@@ -167,7 +186,7 @@ function buildSessionFailure(replay: HarnessReplayRecord): HarnessFailureRecord[
 }
 
 function buildTraceFailures(replay: HarnessReplayRecord): HarnessFailureRecord[] {
-  return replay.traces
+  return replayRecords<import('../../adapters/out/runtimeState/runtimeStateService').HarnessTraceRecord>(replay, 'trace')
     .filter(trace => trace.event !== 'sensor.run')
     .filter(trace => trace.level === 'error' || /failed|blocked/i.test(trace.event) || /failed|blocked/i.test(trace.message))
     .map(trace => ({
@@ -196,7 +215,7 @@ function clusterFailures(failures: HarnessFailureRecord[]): HarnessFailureCluste
         signature: failure.signature,
         count: 1,
         sessionIds: [failure.sessionId],
-        exampleMessages: [failure.message],
+        exampleMessages: [failure.message.slice(0, 1024)],
         firstSeenAt: failure.createdAt,
         lastSeenAt: failure.createdAt,
       });
@@ -204,11 +223,11 @@ function clusterFailures(failures: HarnessFailureRecord[]): HarnessFailureCluste
     }
 
     existing.count += 1;
-    if (!existing.sessionIds.includes(failure.sessionId)) {
+    if (existing.sessionIds.length < 100 && !existing.sessionIds.includes(failure.sessionId)) {
       existing.sessionIds.push(failure.sessionId);
     }
     if (existing.exampleMessages.length < 3) {
-      existing.exampleMessages.push(failure.message);
+      existing.exampleMessages.push(failure.message.slice(0, 1024));
     }
     if (failure.createdAt < existing.firstSeenAt) {
       existing.firstSeenAt = failure.createdAt;
@@ -264,6 +283,10 @@ export class HarnessDatasetService {
     return path.join(this.datasetsPath, `${datasetId}.json`);
   }
 
+  private datasetMetadataFile(datasetId: string): string {
+    return path.join(this.datasetsPath, `${datasetId}.meta.json`);
+  }
+
   private async ensureLayout(): Promise<void> {
     await fs.ensureDir(this.datasetsPath);
   }
@@ -271,22 +294,39 @@ export class HarnessDatasetService {
   async buildFailureDataset(options: BuildHarnessDatasetOptions = {}): Promise<HarnessFailureDataset> {
     const concurrency = boundedLimit(options.concurrency, 1, 4, 'dataset concurrency');
     const maxFailures = boundedLimit(options.maxFailures, 10_000, 10_000, 'dataset failures');
+    const maxDatasetBytes = boundedPageBytes(options.maxBytes, 'dataset persistence', DEFAULT_DATASET_MAX_BYTES, MAX_DATASET_BYTES);
+    const maxFailureBytes = boundedPageBytes(options.maxFailureBytes, 'dataset failure records', DEFAULT_FAILURE_RECORD_MAX_BYTES, MAX_FAILURE_RECORD_BYTES);
+    const aggregateFailureByteBudget = Math.floor(maxDatasetBytes / 2);
     const failures: HarnessFailureRecord[] = [];
+    let retainedFailureBytes = 2;
+    let failureByteLimited = false;
     let omittedFailureCount = 0;
     let sessionCount = 0;
     let replayCount = 0;
     const retain = (records: HarnessFailureRecord[]) => {
-      const available = Math.max(0, maxFailures - failures.length);
-      failures.push(...records.slice(0, available));
-      omittedFailureCount += Math.max(0, records.length - available);
+      for (const record of records) {
+        if (failures.length >= maxFailures || failureByteLimited) {
+          omittedFailureCount += 1;
+          continue;
+        }
+        const bytes = serializedHistoryItemBytes(record);
+        if (bytes > maxFailureBytes || retainedFailureBytes + bytes + (failures.length > 0 ? 1 : 0) > aggregateFailureByteBudget) {
+          omittedFailureCount += 1;
+          failureByteLimited = true;
+          continue;
+        }
+        failures.push(record);
+        retainedFailureBytes += bytes + (failures.length > 1 ? 1 : 0);
+      }
     };
 
     const processSession = async (session: HarnessSessionRecord): Promise<void> => {
       if (!options.includeSuccessfulSessions && session.status === 'completed') return;
       sessionCount += 1;
       const replay = await this.replayService.buildReplay(session.id, {
-        includePayloads: false,
+        includePayloads: true,
         maxEvents: 1000,
+        maxBytes: Math.min(maxDatasetBytes, MAX_RUNTIME_HISTORY_PAGE_BYTES),
       });
       replayCount += 1;
       retain(buildSensorFailures(replay));
@@ -344,8 +384,27 @@ export class HarnessDatasetService {
       omittedFailureCount,
     };
 
+    let serialized = JSON.stringify(dataset);
+    while (Buffer.byteLength(serialized, 'utf8') > maxDatasetBytes && dataset.clusters.length > 0) {
+      dataset.clusters.pop();
+      dataset.clusterCount = dataset.clusters.length;
+      dataset.partial = true;
+      serialized = JSON.stringify(dataset);
+    }
+    if (Buffer.byteLength(serialized, 'utf8') > maxDatasetBytes) {
+      throw new Error(`Dataset persistence budget exceeded after bounded compaction (${maxDatasetBytes} bytes)`);
+    }
     await this.ensureLayout();
-    await fs.writeJson(this.datasetFile(dataset.id), dataset, { spaces: 2 });
+    await fs.writeFile(this.datasetFile(dataset.id), serialized, 'utf8');
+    await fs.writeJson(this.datasetMetadataFile(dataset.id), {
+      version: 1,
+      id: dataset.id,
+      createdAt: dataset.createdAt,
+      sessionCount: dataset.sessionCount,
+      failureCount: dataset.failureCount,
+      clusterCount: dataset.clusterCount,
+      partial: dataset.partial,
+    });
     return dataset;
   }
 
@@ -368,14 +427,17 @@ export class HarnessDatasetService {
     let oversizedRecordsSkipped = 0;
     const directory = await fs.opendir(this.datasetsPath);
     for await (const entry of directory) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name.endsWith('.meta.json')) continue;
       try {
         const file = path.join(this.datasetsPath, entry.name);
-        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
-          oversizedRecordsSkipped += 1;
-          continue;
-        }
-        const dataset = await fs.readJson(file) as HarnessFailureDataset;
+        const metadataFile = this.datasetMetadataFile(entry.name.slice(0, -'.json'.length));
+        const metadataBytes = await fs.stat(metadataFile).then(stat => stat.size).catch(() => Number.POSITIVE_INFINITY);
+        const dataset = metadataBytes <= MAX_RUNTIME_HISTORY_PAGE_BYTES
+          ? await fs.readJson(metadataFile) as HarnessFailureDataset
+          : (await fs.stat(file)).size <= MAX_RUNTIME_HISTORY_PAGE_BYTES
+              ? await fs.readJson(file) as HarnessFailureDataset
+              : undefined;
+        if (!dataset) { oversizedRecordsSkipped += 1; continue; }
         recordsScanned += 1;
         const key = `${dataset.createdAt}\0${dataset.id}`;
         if (boundary && key >= `${boundary.createdAt}\0${boundary.id}`) continue;

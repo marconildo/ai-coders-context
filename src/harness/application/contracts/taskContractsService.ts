@@ -19,7 +19,10 @@ import type { HarnessSensorRun } from '../sensors/sensorsService';
 import {
   boundedLimit,
   boundedPageBytes,
+  decodeHistoryCursor,
+  encodeHistoryCursor,
   MAX_RUNTIME_HISTORY_PAGE_BYTES,
+  queryBinding,
   serializedHistoryItemBytes,
 } from '../history/runtimeHistory';
 
@@ -195,6 +198,8 @@ export interface HarnessHandoffContract {
 export interface BoundedSessionContracts<T> {
   items: T[];
   total: number;
+  nextCursor?: string;
+  hasMore: boolean;
   returnedBytes: number;
   byteBudget: number;
   byteLimited: boolean;
@@ -313,13 +318,16 @@ export class HarnessTaskContractsService {
   async listSessionTaskContracts(
     sessionId: string,
     limit = 100,
-    maxBytes?: number
+    maxBytes?: number,
+    cursor?: string
   ): Promise<BoundedSessionContracts<HarnessTaskContract>> {
     return this.listBoundedSessionContracts<HarnessTaskContract>(
       this.tasksPath,
       sessionId,
       boundedLimit(limit, 100, 1000, 'session task contracts'),
-      boundedPageBytes(maxBytes, 'session task contracts')
+      boundedPageBytes(maxBytes, 'session task contracts'),
+      cursor,
+      'session-task-contracts'
     );
   }
 
@@ -401,13 +409,16 @@ export class HarnessTaskContractsService {
   async listSessionHandoffContracts(
     sessionId: string,
     limit = 100,
-    maxBytes?: number
+    maxBytes?: number,
+    cursor?: string
   ): Promise<BoundedSessionContracts<HarnessHandoffContract>> {
     return this.listBoundedSessionContracts<HarnessHandoffContract>(
       this.handoffsPath,
       sessionId,
       boundedLimit(limit, 100, 1000, 'session handoff contracts'),
-      boundedPageBytes(maxBytes, 'session handoff contracts')
+      boundedPageBytes(maxBytes, 'session handoff contracts'),
+      cursor,
+      'session-handoff-contracts'
     );
   }
 
@@ -415,9 +426,13 @@ export class HarnessTaskContractsService {
     directoryPath: string,
     sessionId: string,
     limit: number,
-    byteBudget: number
+    byteBudget: number,
+    cursor: string | undefined,
+    scope: string
   ): Promise<BoundedSessionContracts<T>> {
     await this.ensureLayout();
+    const binding = queryBinding({ sessionId, direction: 'oldest' });
+    const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(cursor, scope, binding);
     const selected: Array<{ file: string; createdAt: string; id: string; bytes: number }> = [];
     let total = 0;
     let oversizedRecordsSkipped = 0;
@@ -433,6 +448,7 @@ export class HarnessTaskContractsService {
         const contract = await fs.readJson(file) as T;
         if (contract.sessionId !== sessionId) continue;
         total += 1;
+        if (boundary && `${contract.createdAt}\0${contract.id}` <= `${boundary.createdAt}\0${boundary.id}`) continue;
         const bytes = serializedHistoryItemBytes(contract);
         if (bytes + 2 > byteBudget) {
           oversizedRecordsSkipped += 1;
@@ -442,7 +458,7 @@ export class HarnessTaskContractsService {
         selected.sort((left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
         );
-        if (selected.length > limit) selected.pop();
+        if (selected.length > limit + 1) selected.pop();
       } catch {
         // A malformed unrelated contract must not make replay unavailable.
       }
@@ -450,7 +466,7 @@ export class HarnessTaskContractsService {
     const chosen: typeof selected = [];
     let returnedBytes = 2;
     let byteLimited = false;
-    for (const candidate of selected) {
+    for (const candidate of selected.slice(0, limit + 1)) {
       if (chosen.length === limit) break;
       const candidateTotal = returnedBytes + candidate.bytes + (chosen.length > 0 ? 1 : 0);
       if (candidateTotal > byteBudget) {
@@ -462,9 +478,15 @@ export class HarnessTaskContractsService {
     }
     const items: T[] = [];
     for (const candidate of chosen) items.push(await fs.readJson(candidate.file) as T);
+    const hasMore = selected.length > chosen.length;
+    const last = chosen.at(-1);
     return {
       items,
       total,
+      nextCursor: hasMore && last
+        ? encodeHistoryCursor(scope, binding, { createdAt: last.createdAt, id: last.id })
+        : undefined,
+      hasMore,
       returnedBytes,
       byteBudget,
       byteLimited,

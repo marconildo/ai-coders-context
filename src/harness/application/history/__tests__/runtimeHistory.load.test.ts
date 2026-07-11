@@ -2,6 +2,7 @@ import * as fs from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
 import { HarnessRuntimeStateService } from '../../../adapters/out/runtimeState/runtimeStateService';
+import { HarnessReplayService } from '../../replay/replayService';
 
 const loadDescribe = process.env.DOTCONTEXT_RUNTIME_LOAD_TESTS === '1' ? describe : describe.skip;
 
@@ -25,6 +26,14 @@ loadDescribe('runtime history load acceptance', () => {
     global.gc?.();
     expect(page.items).toHaveLength(100);
     expect(process.memoryUsage().rss - before).toBeLessThan(32 * 1024 * 1024);
+
+    global.gc?.();
+    const replayBefore = process.memoryUsage().rss;
+    const replay = await new HarnessReplayService({ repoPath: tempDir }).buildReplay(session.id, { maxEvents: 100, includePayloads: false });
+    global.gc?.();
+    expect(replay.events).toHaveLength(100);
+    expect(replay.events.every(event => event.record === undefined)).toBe(true);
+    expect(process.memoryUsage().rss - replayBefore).toBeLessThan(32 * 1024 * 1024);
   });
 
   it('keeps a 1,000-session page bounded', async () => {

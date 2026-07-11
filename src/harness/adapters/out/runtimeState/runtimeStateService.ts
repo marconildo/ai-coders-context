@@ -8,7 +8,7 @@
 
 import * as fs from 'fs-extra';
 import * as path from 'path';
-import { randomUUID } from 'crypto';
+import { createHash, randomUUID } from 'crypto';
 import { promises as nodeFs } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { resolveRuntimeLayout, type RuntimeLayout } from '../../../../shared/fs/pathHelpers';
@@ -193,6 +193,18 @@ export interface HarnessSensorSummary {
   version: 1;
   updatedAt: string;
   latestBySensor: Record<string, unknown>;
+  runCount?: number;
+}
+
+export const MAX_SENSOR_SUMMARY_ENTRIES = 256;
+export const MAX_SENSOR_SUMMARY_BYTES = 1024 * 1024;
+export const MAX_SENSOR_SUMMARY_ENTRY_BYTES = 64 * 1024;
+
+interface HarnessSensorSummaryShard {
+  version: 1;
+  sensorId: string;
+  updatedAt: string;
+  run: Record<string, unknown>;
 }
 
 interface TraceCursorPosition {
@@ -422,6 +434,19 @@ export class HarnessRuntimeStateService {
     return path.join(this.layout.sessionDir(sessionId), 'sensor-summary.json');
   }
 
+  private sensorSummaryDir(sessionId: string): string {
+    return path.join(this.layout.sessionDir(sessionId), 'sensor-summary');
+  }
+
+  private sensorSummaryShardFile(sessionId: string, sensorId: string): string {
+    const key = createHash('sha256').update(sensorId).digest('hex');
+    return path.join(this.sensorSummaryDir(sessionId), `${key}.json`);
+  }
+
+  private sensorSummaryMetadataFile(sessionId: string): string {
+    return path.join(this.sensorSummaryDir(sessionId), 'meta.json');
+  }
+
   private async ensureSessionDir(sessionId: string): Promise<void> {
     await fs.ensureDir(this.layout.sessionDir(sessionId));
   }
@@ -525,29 +550,140 @@ export class HarnessRuntimeStateService {
     if (trace.event !== 'sensor.run' || !trace.data?.run || typeof trace.data.run !== 'object') return;
     const run = trace.data.run as Record<string, unknown>;
     if (typeof run.sensorId !== 'string') return;
-    const current = await this.getSensorSummary(sessionId);
-    current.latestBySensor[run.sensorId] = run;
-    current.updatedAt = trace.createdAt;
-    const target = this.sensorSummaryFile(sessionId);
+    const sensorId = run.sensorId;
+    let boundedRun = run;
+    if (Buffer.byteLength(JSON.stringify(run), 'utf8') > MAX_SENSOR_SUMMARY_ENTRY_BYTES) {
+      boundedRun = {
+        id: run.id,
+        sensorId,
+        sessionId: run.sessionId,
+        contractId: run.contractId,
+        severity: run.severity,
+        blocking: run.blocking,
+        createdAt: run.createdAt,
+        status: run.status,
+        summary: typeof run.summary === 'string' ? run.summary.slice(0, 8 * 1024) : String(run.summary ?? ''),
+        truncated: true,
+      };
+    }
+    const shard: HarnessSensorSummaryShard = {
+      version: 1,
+      sensorId,
+      updatedAt: trace.createdAt,
+      run: boundedRun,
+    };
+    await fs.ensureDir(this.sensorSummaryDir(sessionId));
+    const target = this.sensorSummaryShardFile(sessionId, sensorId);
     const temporary = `${target}.${process.pid}.${randomUUID()}.tmp`;
-    await fs.writeJson(temporary, current, { spaces: 2 });
+    await fs.writeJson(temporary, shard);
     await fs.rename(temporary, target);
+    const metadataFile = this.sensorSummaryMetadataFile(sessionId);
+    const metadata = await nodeFs.stat(metadataFile).then(stat => stat.size <= 4096 ? fs.readJson(metadataFile) : undefined).catch(() => undefined) as { runCount?: number } | undefined;
+    const metadataTemporary = `${metadataFile}.${process.pid}.${randomUUID()}.tmp`;
+    await fs.writeJson(metadataTemporary, { version: 1, updatedAt: trace.createdAt, runCount: Math.max(0, metadata?.runCount ?? 0) + 1 });
+    await fs.rename(metadataTemporary, metadataFile);
+    await this.pruneSensorSummaryShards(sessionId);
+  }
+
+  private async pruneSensorSummaryShards(sessionId: string): Promise<void> {
+    const directoryPath = this.sensorSummaryDir(sessionId);
+    if (!(await fs.pathExists(directoryPath))) return;
+    const entries: Array<{ file: string; bytes: number; mtime: number }> = [];
+    const directory = await nodeFs.opendir(directoryPath);
+    for await (const entry of directory) {
+      if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'meta.json') continue;
+      const file = path.join(directoryPath, entry.name);
+      const stat = await nodeFs.stat(file);
+      entries.push({ file, bytes: stat.size, mtime: stat.mtimeMs });
+    }
+    entries.sort((a, b) => b.mtime - a.mtime);
+    let retainedBytes = 0;
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      if (index >= MAX_SENSOR_SUMMARY_ENTRIES || entry.bytes > MAX_SENSOR_SUMMARY_ENTRY_BYTES || retainedBytes + entry.bytes > MAX_SENSOR_SUMMARY_BYTES) {
+        await fs.remove(entry.file);
+      } else {
+        retainedBytes += entry.bytes;
+      }
+    }
+  }
+
+  private async readShardedSensorSummary(sessionId: string): Promise<HarnessSensorSummary | undefined> {
+    const directoryPath = this.sensorSummaryDir(sessionId);
+    if (!(await fs.pathExists(directoryPath))) return undefined;
+    const entries: Array<{ file: string; bytes: number; mtime: number }> = [];
+    const directory = await nodeFs.opendir(directoryPath);
+    for await (const entry of directory) {
+      if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name === 'meta.json') continue;
+      const file = path.join(directoryPath, entry.name);
+      const stat = await nodeFs.stat(file);
+      if (stat.size <= MAX_SENSOR_SUMMARY_ENTRY_BYTES) entries.push({ file, bytes: stat.size, mtime: stat.mtimeMs });
+    }
+    entries.sort((a, b) => b.mtime - a.mtime);
+    const latestBySensor: Record<string, unknown> = {};
+    let totalBytes = 0;
+    let updatedAt = '';
+    for (const entry of entries.slice(0, MAX_SENSOR_SUMMARY_ENTRIES)) {
+      if (totalBytes + entry.bytes > MAX_SENSOR_SUMMARY_BYTES) break;
+      try {
+        const shard = await fs.readJson(entry.file) as HarnessSensorSummaryShard;
+        if (typeof shard.sensorId !== 'string' || !shard.run) continue;
+        latestBySensor[shard.sensorId] = shard.run;
+        updatedAt = updatedAt > shard.updatedAt ? updatedAt : shard.updatedAt;
+        totalBytes += entry.bytes;
+      } catch { /* skip a corrupt shard */ }
+    }
+    const metadataFile = this.sensorSummaryMetadataFile(sessionId);
+    const metadata = await nodeFs.stat(metadataFile).then(stat => stat.size <= 4096 ? fs.readJson(metadataFile) : undefined).catch(() => undefined) as { runCount?: number; updatedAt?: string } | undefined;
+    return { version: 1, updatedAt: metadata?.updatedAt ?? (updatedAt || nowIso()), latestBySensor, runCount: Math.max(Object.keys(latestBySensor).length, metadata?.runCount ?? 0) };
   }
 
   async getSensorSummary(sessionId: string): Promise<HarnessSensorSummary> {
+    const sharded = await this.readShardedSensorSummary(sessionId);
+    if (sharded) return sharded;
     const target = this.sensorSummaryFile(sessionId);
+    let legacyFallback: HarnessSensorSummary | undefined;
     if (await fs.pathExists(target)) {
-      try { return await fs.readJson(target) as HarnessSensorSummary; } catch { /* migrate below */ }
+      try {
+        const stat = await nodeFs.stat(target);
+        if (stat.size <= MAX_SENSOR_SUMMARY_BYTES) {
+          legacyFallback = await fs.readJson(target) as HarnessSensorSummary;
+          await fs.remove(target);
+        }
+      } catch { /* migrate from bounded trace records below */ }
     }
     const latestBySensor: Record<string, unknown> = {};
+    let retainedBytes = 0;
+    let runCount = 0;
     for await (const trace of this.iterateTraces(sessionId)) {
       const run = trace.data?.run as Record<string, unknown> | undefined;
-      if (trace.event === 'sensor.run' && typeof run?.sensorId === 'string') latestBySensor[run.sensorId] = run;
+      if (trace.event !== 'sensor.run' || typeof run?.sensorId !== 'string') continue;
+      runCount += 1;
+      const bytes = Buffer.byteLength(JSON.stringify(run), 'utf8');
+      if (!(run.sensorId in latestBySensor) && Object.keys(latestBySensor).length >= MAX_SENSOR_SUMMARY_ENTRIES) continue;
+      if (bytes > MAX_SENSOR_SUMMARY_ENTRY_BYTES || retainedBytes + bytes > MAX_SENSOR_SUMMARY_BYTES) continue;
+      const previous = latestBySensor[run.sensorId];
+      if (previous) retainedBytes -= Buffer.byteLength(JSON.stringify(previous), 'utf8');
+      latestBySensor[run.sensorId] = run;
+      retainedBytes += bytes;
     }
-    const summary: HarnessSensorSummary = { version: 1, updatedAt: nowIso(), latestBySensor };
+    if (runCount === 0 && legacyFallback) {
+      for (const [sensorId, run] of Object.entries(legacyFallback.latestBySensor).slice(0, MAX_SENSOR_SUMMARY_ENTRIES)) {
+        latestBySensor[sensorId] = run;
+      }
+      runCount = Math.max(Object.keys(latestBySensor).length, legacyFallback.runCount ?? 0);
+    }
+    const summary: HarnessSensorSummary = { version: 1, updatedAt: nowIso(), latestBySensor, runCount };
     await this.ensureSessionDir(sessionId);
-    await fs.writeJson(target, summary, { spaces: 2 });
-    return summary;
+    await fs.ensureDir(this.sensorSummaryDir(sessionId));
+    for (const [sensorId, run] of Object.entries(latestBySensor)) {
+      await this.updateSensorSummary(sessionId, {
+        id: randomUUID(), sessionId, level: 'info', event: 'sensor.run', message: 'sensor summary migration',
+        createdAt: (run as Record<string, unknown>).createdAt as string ?? summary.updatedAt, data: { run: run as Record<string, unknown> },
+      });
+    }
+    await fs.writeJson(this.sensorSummaryMetadataFile(sessionId), { version: 1, updatedAt: summary.updatedAt, runCount });
+    return (await this.readShardedSensorSummary(sessionId)) ?? summary;
   }
 
   private async recordTrace(sessionId: string, trace: HarnessTraceRecord): Promise<HarnessTraceRecord> {

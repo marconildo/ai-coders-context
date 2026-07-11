@@ -95,6 +95,7 @@ export interface HarnessActionInput {
   createdBefore?: string;
   concurrency?: number;
   maxFailures?: number;
+  maxFailureBytes?: number;
   scope?: 'sensor' | 'artifact' | 'handoff' | 'workflow' | 'task' | 'risk';
   effect?: 'allow' | 'deny' | 'require_approval';
   target?: 'tool' | 'action' | 'path' | 'risk';
@@ -366,6 +367,7 @@ export class HarnessActionService {
             includePayloads: params.includePayloads,
             maxEvents: params.maxEvents,
             maxBytes: params.maxBytes,
+            cursor: params.cursor,
           }),
         };
       case 'listReplays':
@@ -389,6 +391,8 @@ export class HarnessActionService {
             includeSuccessfulSessions: params.includeSuccessfulSessions,
             concurrency: params.concurrency,
             maxFailures: params.maxFailures,
+            maxFailureBytes: params.maxFailureBytes,
+            maxBytes: params.maxBytes,
           }),
         };
       case 'listDatasets':

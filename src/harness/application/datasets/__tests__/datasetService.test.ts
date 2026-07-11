@@ -147,4 +147,39 @@ describe('HarnessDatasetService', () => {
     expect(dataset.sessionCount).toBe(3);
     expect(dataset.replayCount).toBe(3);
   });
+
+  it('stops on per-record and aggregate byte budgets and persists a bounded dataset', async () => {
+    const session = await execution.createSession({ name: 'byte-budget' });
+    const replay = new HarnessReplayService({ repoPath: tempDir });
+    const base = await replay.buildReplay(session.id);
+    const records = Array.from({ length: 12 }, (_, index) => ({
+      id: `trace-${index}`,
+      sessionId: session.id,
+      level: 'error' as const,
+      event: 'task.failed',
+      message: `${index}:${'x'.repeat(index === 0 ? 4096 : 700)}`,
+      createdAt: new Date(1_700_000_000_000 + index).toISOString(),
+    }));
+    const bounded = new HarnessDatasetService({
+      repoPath: tempDir,
+      dependencies: {
+        replayService: {
+          buildReplay: async () => ({ ...base, events: records.map(record => ({ id: record.id, sessionId: session.id, createdAt: record.createdAt, source: 'trace' as const, label: record.event, record })) }),
+        },
+      },
+    });
+
+    const dataset = await bounded.buildFailureDataset({
+      sessionIds: [session.id],
+      includeSuccessfulSessions: true,
+      maxFailureBytes: 2048,
+      maxBytes: 4096,
+    });
+    const file = path.join(tempDir, '.context', 'runtime', 'evaluations', 'datasets', `${dataset.id}.json`);
+    expect(dataset.partial).toBe(true);
+    expect(dataset.omittedFailureCount).toBeGreaterThan(0);
+    expect(dataset.failures.every(failure => Buffer.byteLength(JSON.stringify(failure)) <= 2048)).toBe(true);
+    expect((await fs.stat(file)).size).toBeLessThanOrEqual(4096);
+    expect(await fs.pathExists(file.replace(/\.json$/, '.meta.json'))).toBe(true);
+  });
 });

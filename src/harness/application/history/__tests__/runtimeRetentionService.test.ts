@@ -35,4 +35,33 @@ describe('HarnessRuntimeRetentionService', () => {
     expect(await fs.pathExists(expiredFile)).toBe(false);
     expect(await fs.pathExists(boundFile)).toBe(true);
   });
+
+  it('reads only bounded metadata from oversized legacy evaluations', async () => {
+    const replayDir = path.join(tempDir, '.context', 'runtime', 'evaluations', 'replays');
+    const replayFile = path.join(replayDir, 'legacy.json');
+    await fs.outputFile(replayFile, `{"id":"legacy","sessionId":"session-1","createdAt":"2020-01-01T00:00:00.000Z","events":["${'x'.repeat(12 * 1024 * 1024)}"]}`);
+    global.gc?.();
+    const before = process.memoryUsage().rss;
+    const report = await new HarnessRuntimeRetentionService(tempDir).prune({ dryRun: true, now: new Date('2026-01-01T00:00:00.000Z') });
+    global.gc?.();
+    expect(report.candidates.map(item => item.path)).toContain(replayFile);
+    expect(process.memoryUsage().rss - before).toBeLessThan(16 * 1024 * 1024);
+  });
+
+  it('uses young terminal sessions as quota candidates while protecting active sessions', async () => {
+    const state = new HarnessRuntimeStateService({ repoPath: tempDir });
+    const active = await state.createSession({ name: 'active' });
+    const terminal = await state.createSession({ name: 'terminal' });
+    await state.completeSession(terminal.id);
+    const report = await new HarnessRuntimeRetentionService(tempDir).prune({
+      dryRun: true,
+      now: new Date(),
+      sessionRetentionDays: 30,
+      quotaBytes: 1,
+    });
+    expect(report.candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: path.join(tempDir, '.context', 'runtime', 'sessions', terminal.id), kind: 'session', reason: 'quota' }),
+    ]));
+    expect(report.candidates.map(item => item.path)).not.toContain(path.join(tempDir, '.context', 'runtime', 'sessions', active.id));
+  });
 });

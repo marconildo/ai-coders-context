@@ -60,6 +60,7 @@ describe('HarnessReplayService', () => {
     expect(list).toHaveLength(1);
     expect(list[0].sessionId).toBe(session.id);
     expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'evaluations', 'replays', `${replay.id}.json`))).toBe(true);
+    expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'evaluations', 'replays', `${replay.id}.meta.json`))).toBe(true);
   });
 
   it('applies maxEvents to materialization, response, and persistence', async () => {
@@ -73,10 +74,9 @@ describe('HarnessReplayService', () => {
     expect(replay.events).toHaveLength(10);
     expect(replay.fidelity).toBe('partial');
     expect(replay.omittedCounts.trace).toBeGreaterThan(0);
-    for (const source of ['artifacts', 'checkpoints', 'traces', 'sensorRuns', 'tasks', 'handoffs']) {
-      expect((replay[source as keyof typeof replay] as unknown[]).length).toBeLessThanOrEqual(10);
-      expect((persisted[source] as unknown[]).length).toBeLessThanOrEqual(10);
-    }
+    expect(Object.keys(replay)).not.toEqual(expect.arrayContaining(['artifacts', 'checkpoints', 'traces', 'sensorRuns', 'tasks', 'handoffs']));
+    expect(Object.keys(persisted)).not.toEqual(expect.arrayContaining(['artifacts', 'checkpoints', 'traces', 'sensorRuns', 'tasks', 'handoffs']));
+    expect(Buffer.byteLength(JSON.stringify(persisted.events))).toBeLessThanOrEqual(1024 * 1024);
   });
 
   it('reads bounded session-scoped contracts without global materialization', async () => {
@@ -93,15 +93,44 @@ describe('HarnessReplayService', () => {
     const scopedTasks = jest.spyOn(HarnessTaskContractsService.prototype, 'listSessionTaskContracts');
     const scopedHandoffs = jest.spyOn(HarnessTaskContractsService.prototype, 'listSessionHandoffContracts');
 
-    const replay = await service.buildReplay(target.id, { maxEvents: 2 });
+    const replay = await service.buildReplay(target.id, { maxEvents: 30 });
 
     expect(listTasks).not.toHaveBeenCalled();
     expect(listHandoffs).not.toHaveBeenCalled();
-    expect(scopedTasks).toHaveBeenCalledWith(target.id, 2);
-    expect(scopedHandoffs).toHaveBeenCalledWith(target.id, 2);
-    expect(replay.tasks).toHaveLength(2);
-    expect(replay.handoffs).toHaveLength(2);
+    expect(scopedTasks).toHaveBeenCalledWith(target.id, 30, 1024 * 1024, undefined);
+    expect(scopedHandoffs).toHaveBeenCalledWith(target.id, 30, 1024 * 1024, undefined);
+    expect(replay.events.filter(event => event.source === 'task')).toHaveLength(5);
+    expect(replay.events.filter(event => event.source === 'handoff')).toHaveLength(5);
     expect(replay.sourceCounts.task).toBe(5);
     expect(replay.sourceCounts.handoff).toBe(5);
+  });
+
+  it('continues every merged source with one global cursor and no duplicates', async () => {
+    const session = await execution.createSession({ name: 'merged-cursor' });
+    await execution.addArtifact(session.id, { name: 'evidence', kind: 'text', content: 'ok' });
+    await execution.checkpointSession(session.id, { note: 'checkpoint' });
+    await execution.createTaskContract({ title: 'task', sessionId: session.id });
+    await execution.createHandoffContract({ from: 'author', to: 'reviewer', sessionId: session.id });
+    await execution.runSensor({ id: 'tests', name: 'Tests', execute: () => ({ status: 'passed', summary: 'ok' }) }, { sessionId: session.id });
+
+    const seen = new Set<string>();
+    const sources = new Set<string>();
+    let cursor: string | undefined;
+    let pageIndex = 0;
+    do {
+      const page = await service.buildReplay(session.id, { maxEvents: 3, cursor });
+      expect(page.events.length).toBeLessThanOrEqual(3);
+      for (const event of page.events) {
+        const key = `${event.createdAt}:${event.source}:${event.id}`;
+        expect(seen.has(key)).toBe(false);
+        seen.add(key);
+        sources.add(event.source);
+      }
+      if (pageIndex === 0) expect(page.nextCursor).toBeDefined();
+      cursor = page.nextCursor;
+      pageIndex += 1;
+    } while (cursor);
+
+    expect([...sources]).toEqual(expect.arrayContaining(['session', 'trace', 'artifact', 'checkpoint', 'sensor', 'task', 'handoff']));
   });
 });

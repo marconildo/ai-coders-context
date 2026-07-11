@@ -3,6 +3,8 @@ import * as os from 'os';
 import * as path from 'path';
 import {
   HarnessRuntimeStateService,
+  MAX_SENSOR_SUMMARY_ENTRIES,
+  MAX_SENSOR_SUMMARY_ENTRY_BYTES,
   MAX_STREAMED_TRACE_LINE_BYTES,
 } from '../runtimeStateService';
 
@@ -299,6 +301,21 @@ describe('HarnessRuntimeStateService', () => {
 
     const summary = await service.getSensorSummary(session.id);
     expect(summary.latestBySensor.tests).toMatchObject({ status: 'passed' });
-    expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'sensor-summary.json'))).toBe(true);
+    expect(await fs.pathExists(path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'sensor-summary'))).toBe(true);
+  });
+
+  it('shards and caps sensor summaries by entry count and bytes', async () => {
+    const session = await service.createSession({ name: 'bounded-sensor-summary' });
+    for (let index = 0; index < MAX_SENSOR_SUMMARY_ENTRIES + 4; index += 1) {
+      await service.appendTrace(session.id, {
+        level: 'error', event: 'sensor.run', message: `sensor-${index}`,
+        data: { run: { id: `run-${index}`, sensorId: `sensor-${index}`, sessionId: session.id, status: 'failed', createdAt: new Date(1_700_000_000_000 + index).toISOString(), output: 'x'.repeat(80 * 1024) } },
+      });
+    }
+    const summaryDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'sensor-summary');
+    const files = (await fs.readdir(summaryDir)).filter(file => file.endsWith('.json') && file !== 'meta.json');
+    expect(files.length).toBeLessThanOrEqual(MAX_SENSOR_SUMMARY_ENTRIES);
+    for (const file of files) expect((await fs.stat(path.join(summaryDir, file))).size).toBeLessThanOrEqual(MAX_SENSOR_SUMMARY_ENTRY_BYTES);
+    expect(Object.keys((await service.getSensorSummary(session.id)).latestBySensor).length).toBeLessThanOrEqual(MAX_SENSOR_SUMMARY_ENTRIES);
   });
 });

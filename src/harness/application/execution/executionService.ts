@@ -192,6 +192,10 @@ export class HarnessExecutionService {
     return this.sensors.getSessionSensorRuns(sessionId);
   }
 
+  getSessionSensorRunPage(sessionId: string, query: Parameters<HarnessSensorsService['getSessionSensorRunPage']>[1] = {}) {
+    return this.sensors.getSessionSensorRunPage(sessionId, query);
+  }
+
   async createTaskContract(input: Parameters<HarnessTaskContractsService['createTaskContract']>[0]) {
     await this.policy.authorize({
       tool: 'harness',
@@ -332,7 +336,7 @@ export class HarnessExecutionService {
   ): Promise<HarnessSessionQualitySnapshot> {
     const [session, sensorRuns, taskEvaluation] = await Promise.all([
       this.state.getSession(sessionId),
-      this.sensors.getSessionSensorRuns(sessionId),
+      this.sensors.getLatestSessionSensorRuns(sessionId),
       options.taskId
         ? this.contracts.evaluateTaskCompletion(options.taskId, sessionId)
         : Promise.resolve(null),

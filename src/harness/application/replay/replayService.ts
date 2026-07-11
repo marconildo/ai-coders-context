@@ -45,6 +45,7 @@ export interface HarnessReplayEvent {
   source: HarnessReplayEventSource;
   label: string;
   payload?: Record<string, unknown>;
+  record?: HarnessArtifactRecord | HarnessSessionCheckpoint | HarnessTraceRecord | HarnessSensorRun | HarnessTaskContract | HarnessHandoffContract;
 }
 
 export interface HarnessReplayRecord {
@@ -61,12 +62,6 @@ export interface HarnessReplayRecord {
   summary: string;
   events: HarnessReplayEvent[];
   session: Omit<HarnessSessionRecord, 'checkpoints'> & { checkpoints?: never };
-  artifacts: HarnessArtifactRecord[];
-  checkpoints: HarnessSessionCheckpoint[];
-  traces: HarnessTraceRecord[];
-  sensorRuns: HarnessSensorRun[];
-  tasks: HarnessTaskContract[];
-  handoffs: HarnessHandoffContract[];
 }
 
 export interface HarnessReplayServiceOptions {
@@ -78,6 +73,7 @@ export interface ReplaySessionOptions {
   includePayloads?: boolean;
   maxEvents?: number;
   maxBytes?: number;
+  cursor?: string;
 }
 
 export interface HarnessReplaySummary {
@@ -91,7 +87,7 @@ export interface HarnessReplaySummary {
 
 export interface HarnessReplayDependencies {
   stateService: HarnessRuntimeStatePort;
-  sensorsService: Pick<HarnessSensorsService, 'getSessionSensorRuns'>;
+  sensorsService: Pick<HarnessSensorsService, 'getSessionSensorRunPage'>;
   contractsService: Pick<
     HarnessTaskContractsService,
     'listSessionTaskContracts' | 'listSessionHandoffContracts'
@@ -104,6 +100,24 @@ function nowIso(): string {
 
 function sortByCreatedAt<T extends { createdAt: string }>(items: T[]): T[] {
   return [...items].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
+}
+
+interface ReplayCursorPosition {
+  createdAt: string;
+  source: HarnessReplayEventSource;
+  id: string;
+}
+
+const REPLAY_SOURCE_ORDER: Record<HarnessReplayEventSource, number> = {
+  session: 0, trace: 1, artifact: 2, checkpoint: 3, sensor: 4, task: 5, handoff: 6,
+};
+
+function replayEventKey(event: Pick<HarnessReplayEvent, 'createdAt' | 'source' | 'id'>): string {
+  return `${event.createdAt}\0${String(REPLAY_SOURCE_ORDER[event.source]).padStart(2, '0')}\0${event.id}`;
+}
+
+function replayCursorKey(position: ReplayCursorPosition): string {
+  return `${position.createdAt}\0${String(REPLAY_SOURCE_ORDER[position.source]).padStart(2, '0')}\0${position.id}`;
 }
 
 export class HarnessReplayService {
@@ -139,6 +153,10 @@ export class HarnessReplayService {
     return path.join(this.replaysPath, `${replayId}.json`);
   }
 
+  private replayMetadataFile(replayId: string): string {
+    return path.join(this.replaysPath, `${replayId}.meta.json`);
+  }
+
   private async ensureLayout(): Promise<void> {
     await fs.ensureDir(this.replaysPath);
   }
@@ -146,6 +164,15 @@ export class HarnessReplayService {
   private async saveReplay(replay: HarnessReplayRecord): Promise<void> {
     await this.ensureLayout();
     await fs.writeJson(this.replayFile(replay.id), replay, { spaces: 2 });
+    await fs.writeJson(this.replayMetadataFile(replay.id), {
+      version: 1,
+      id: replay.id,
+      sessionId: replay.sessionId,
+      createdAt: replay.createdAt,
+      fidelity: replay.fidelity,
+      eventCount: replay.eventCount,
+      summary: replay.summary,
+    });
   }
 
   private async readReplay(replayId: string): Promise<HarnessReplayRecord> {
@@ -162,136 +189,118 @@ export class HarnessReplayService {
     options: ReplaySessionOptions = {}
   ): Promise<HarnessReplayRecord> {
     const maxEvents = boundedLimit(options.maxEvents, 100, 1000, 'replay events');
+    const byteBudget = boundedPageBytes(options.maxBytes, 'replay events');
     const session = await this.stateService.getSession(sessionId);
-    const [tracePage, artifactPage, allSensorRuns, taskScan, handoffScan] = await Promise.all([
-      this.stateService.listTracePage(sessionId, { limit: maxEvents, direction: 'oldest', maxBytes: options.maxBytes }),
-      this.stateService.listArtifactPage(sessionId, { limit: Math.min(maxEvents, 200), direction: 'oldest', maxBytes: options.maxBytes }),
-      this.sensorsService.getSessionSensorRuns(sessionId),
-      options.maxBytes === undefined
-        ? this.contractsService.listSessionTaskContracts(sessionId, maxEvents)
-        : this.contractsService.listSessionTaskContracts(sessionId, maxEvents, options.maxBytes),
-      options.maxBytes === undefined
-        ? this.contractsService.listSessionHandoffContracts(sessionId, maxEvents)
-        : this.contractsService.listSessionHandoffContracts(sessionId, maxEvents, options.maxBytes),
-    ]);
-
-    const traces = tracePage.items;
-    const artifacts = artifactPage.items;
-    const checkpoints = session.checkpoints.slice(0, maxEvents);
-    const sensorRuns = sortByCreatedAt(allSensorRuns).slice(0, maxEvents);
-    const sessionTasks = taskScan.items;
-    const sessionHandoffs = handoffScan.items;
-
-    const events: HarnessReplayEvent[] = [
-      {
-        id: randomUUID(),
-        sessionId,
-        createdAt: session.createdAt,
-        source: 'session',
-        label: `session:${session.name}`,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              id: session.id,
-              status: session.status,
-              metadata: session.metadata ?? null,
-            },
-      },
-      ...traces.map((trace) => ({
-        id: randomUUID(),
-        sessionId,
-        createdAt: trace.createdAt,
-        source: 'trace' as const,
-        label: trace.event,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              level: trace.level,
-              message: trace.message,
-              data: trace.data ?? null,
-            },
-      })),
-      ...artifacts.map((artifact) => ({
-        id: randomUUID(),
-        sessionId,
-        createdAt: artifact.createdAt,
-        source: 'artifact' as const,
-        label: artifact.name,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              kind: artifact.kind,
-              path: artifact.path ?? null,
-              metadata: artifact.metadata ?? null,
-            },
-      })),
-      ...checkpoints.map((checkpoint) => ({
-        id: randomUUID(),
-        sessionId,
-        createdAt: checkpoint.createdAt,
-        source: 'checkpoint' as const,
-        label: checkpoint.note || checkpoint.id,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              artifactIds: checkpoint.artifactIds,
-              data: checkpoint.data ?? null,
-            },
-      })),
-      ...sensorRuns.map((run) => ({
-        id: randomUUID(),
-        sessionId,
-        createdAt: run.createdAt,
-        source: 'sensor' as const,
-        label: run.sensorId,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              status: run.status,
-              summary: run.summary,
-              severity: run.severity,
-              blocking: run.blocking,
-            },
-      })),
-      ...sessionTasks.map((task) => ({
-        id: randomUUID(),
-        sessionId,
-        createdAt: task.createdAt,
-        source: 'task' as const,
-        label: task.title,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              status: task.status,
-              requiredSensors: task.requiredSensors,
-              requiredArtifacts: task.requiredArtifacts,
-              acceptanceCriteria: task.acceptanceCriteria,
-            },
-      })),
-      ...sessionHandoffs.map((handoff) => ({
-        id: randomUUID(),
-        sessionId,
-        createdAt: handoff.createdAt,
-        source: 'handoff' as const,
-        label: `${handoff.from} -> ${handoff.to}`,
-        payload: options.includePayloads === false
-          ? undefined
-          : {
-              artifacts: handoff.artifacts,
-              evidence: handoff.evidence,
-            },
-      })),
-    ];
-
-    const orderedEvents = sortByCreatedAt(events).slice(0, maxEvents);
-    const sourceCounts: Record<HarnessReplayEventSource, number> = {
+    const binding = queryBinding({ sessionId, direction: 'oldest', includePayloads: options.includePayloads !== false });
+    const boundary = decodeHistoryCursor<ReplayCursorPosition>(options.cursor, 'replay-events', binding);
+    const boundaryKey = boundary ? replayCursorKey(boundary) : undefined;
+    const pageSize = Math.min(32, maxEvents);
+    const sourceTotals: Record<HarnessReplayEventSource, number> = {
       session: 1,
       trace: session.traceCount,
       artifact: session.artifactCount,
       checkpoint: session.checkpointCount,
-      sensor: allSensorRuns.length,
-      task: taskScan.total,
-      handoff: handoffScan.total,
+      sensor: 0,
+      task: 0,
+      handoff: 0,
+    };
+
+    const afterBoundary = (event: HarnessReplayEvent) => !boundaryKey || replayEventKey(event) > boundaryKey;
+    const recordFor = <T extends NonNullable<HarnessReplayEvent['record']>>(record: T): T | undefined =>
+      options.includePayloads === false ? undefined : record;
+    const paged = async function* <T>(
+      fetch: (cursor?: string) => Promise<{ items: T[]; nextCursor?: string }>,
+      map: (item: T) => HarnessReplayEvent
+    ): AsyncGenerator<HarnessReplayEvent> {
+      let cursor: string | undefined;
+      do {
+        const page = await fetch(cursor);
+        for (const item of page.items) {
+          const event = map(item);
+          if (afterBoundary(event)) yield event;
+        }
+        cursor = page.nextCursor;
+      } while (cursor);
+    };
+
+    const sessionSource = async function* (): AsyncGenerator<HarnessReplayEvent> {
+      const event: HarnessReplayEvent = {
+        id: `session:${session.id}`, sessionId, createdAt: session.createdAt, source: 'session', label: `session:${session.name}`,
+        payload: options.includePayloads === false ? undefined : { id: session.id, status: session.status, metadata: session.metadata ?? null },
+      };
+      if (afterBoundary(event)) yield event;
+    };
+    const traceSource = paged(
+      cursor => this.stateService.listTracePage(sessionId, { limit: pageSize, cursor, direction: 'oldest', maxBytes: byteBudget }),
+      trace => ({ id: trace.id, sessionId, createdAt: trace.createdAt, source: 'trace', label: trace.event, record: recordFor(trace) })
+    );
+    const artifactSource = paged(
+      cursor => this.stateService.listArtifactPage(sessionId, { limit: pageSize, cursor, direction: 'oldest', maxBytes: byteBudget }),
+      artifact => ({ id: artifact.id, sessionId, createdAt: artifact.createdAt, source: 'artifact', label: artifact.name, record: recordFor(artifact) })
+    );
+    const checkpointSource = (async function* (): AsyncGenerator<HarnessReplayEvent> {
+      for (const checkpoint of sortByCreatedAt(session.checkpoints)) {
+        const event: HarnessReplayEvent = { id: checkpoint.id, sessionId, createdAt: checkpoint.createdAt, source: 'checkpoint', label: checkpoint.note || checkpoint.id, record: recordFor(checkpoint) };
+        if (afterBoundary(event)) yield event;
+      }
+    })();
+    const sensorSource = paged(
+      cursor => this.sensorsService.getSessionSensorRunPage(sessionId, { limit: pageSize, cursor, direction: 'oldest', maxBytes: byteBudget }),
+      run => {
+        sourceTotals.sensor += 1;
+        return { id: run.id, sessionId, createdAt: run.createdAt, source: 'sensor', label: run.sensorId, record: recordFor(run) };
+      }
+    );
+    const taskSource = paged(
+      async cursor => {
+        const page = await this.contractsService.listSessionTaskContracts(sessionId, pageSize, byteBudget, cursor);
+        sourceTotals.task = page.total;
+        return page;
+      },
+      task => ({ id: task.id, sessionId, createdAt: task.createdAt, source: 'task', label: task.title, record: recordFor(task) })
+    );
+    const handoffSource = paged(
+      async cursor => {
+        const page = await this.contractsService.listSessionHandoffContracts(sessionId, pageSize, byteBudget, cursor);
+        sourceTotals.handoff = page.total;
+        return page;
+      },
+      handoff => ({ id: handoff.id, sessionId, createdAt: handoff.createdAt, source: 'handoff', label: `${handoff.from} -> ${handoff.to}`, record: recordFor(handoff) })
+    );
+
+    const iterators = [sessionSource(), traceSource, artifactSource, checkpointSource, sensorSource, taskSource, handoffSource];
+    const heads = await Promise.all(iterators.map(iterator => iterator.next()));
+    const orderedEvents: HarnessReplayEvent[] = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    let lastConsumed: HarnessReplayEvent | undefined;
+    while (orderedEvents.length < maxEvents) {
+      let selectedIndex = -1;
+      for (let index = 0; index < heads.length; index += 1) {
+        if (heads[index].done) continue;
+        if (selectedIndex < 0 || replayEventKey(heads[index].value) < replayEventKey(heads[selectedIndex].value)) selectedIndex = index;
+      }
+      if (selectedIndex < 0) break;
+      const candidate = heads[selectedIndex].value;
+      const bytes = serializedHistoryItemBytes(candidate);
+      const candidateTotal = returnedBytes + bytes + (orderedEvents.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget && orderedEvents.length > 0) {
+        byteLimited = true;
+        break;
+      }
+      lastConsumed = candidate;
+      heads[selectedIndex] = await iterators[selectedIndex].next();
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        continue;
+      }
+      orderedEvents.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const hasMore = heads.some(head => !head.done);
+    const sourceCounts: Record<HarnessReplayEventSource, number> = {
+      ...sourceTotals,
+      sensor: sourceTotals.sensor,
     };
     const includedCounts = orderedEvents.reduce((counts, event) => {
       counts[event.source] += 1;
@@ -302,7 +311,7 @@ export class HarnessReplayService {
       Math.max(0, count - includedCounts[source as HarnessReplayEventSource]),
     ])) as Record<HarnessReplayEventSource, number>;
     const { checkpoints: _embeddedCheckpoints, ...boundedSession } = session;
-    const partial = Object.values(omittedCounts).some(count => count > 0);
+    const partial = hasMore || byteLimited || Object.values(omittedCounts).some(count => count > 0);
     const replay: HarnessReplayRecord = {
       id: randomUUID(),
       sessionId,
@@ -313,16 +322,12 @@ export class HarnessReplayService {
       eventCount: orderedEvents.length,
       sourceCounts,
       omittedCounts,
-      nextCursor: tracePage.nextCursor,
+      nextCursor: hasMore && lastConsumed
+        ? encodeHistoryCursor('replay-events', binding, { createdAt: lastConsumed.createdAt, source: lastConsumed.source, id: lastConsumed.id })
+        : undefined,
       summary: `Replayed ${orderedEvents.length} events for session ${session.name}`,
       events: orderedEvents,
       session: boundedSession,
-      artifacts: artifacts.slice(0, maxEvents),
-      checkpoints: checkpoints.slice(0, maxEvents),
-      traces: traces.slice(0, maxEvents),
-      sensorRuns: sensorRuns.slice(0, maxEvents),
-      tasks: sessionTasks.slice(0, maxEvents),
-      handoffs: sessionHandoffs.slice(0, maxEvents),
     };
 
     return replay;
@@ -356,14 +361,17 @@ export class HarnessReplayService {
     let oversizedRecordsSkipped = 0;
     const directory = await fs.opendir(this.replaysPath);
     for await (const entry of directory) {
-      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      if (!entry.isFile() || !entry.name.endsWith('.json') || entry.name.endsWith('.meta.json')) continue;
       try {
         const file = path.join(this.replaysPath, entry.name);
-        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
-          oversizedRecordsSkipped += 1;
-          continue;
-        }
-        const replay = await fs.readJson(file) as HarnessReplayRecord;
+        const metadataFile = this.replayMetadataFile(entry.name.slice(0, -'.json'.length));
+        const metadataBytes = await fs.stat(metadataFile).then(stat => stat.size).catch(() => Number.POSITIVE_INFINITY);
+        const replay = metadataBytes <= MAX_RUNTIME_HISTORY_PAGE_BYTES
+          ? await fs.readJson(metadataFile) as HarnessReplayRecord
+          : (await fs.stat(file)).size <= MAX_RUNTIME_HISTORY_PAGE_BYTES
+              ? await fs.readJson(file) as HarnessReplayRecord
+              : undefined;
+        if (!replay) { oversizedRecordsSkipped += 1; continue; }
         recordsScanned += 1;
         if (query.sessionId && replay.sessionId !== query.sessionId) continue;
         const key = `${replay.createdAt}\0${replay.id}`;
