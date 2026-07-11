@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
 - Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
 - Replaced whole-file trace reads and post-materialization replay limits with rotation-aware streaming and source-level event bounds.
+- Added aggregate UTF-8 page budgets to runtime history so large valid records cannot multiply count limits into unbounded materialization.
 
 ## [1.1.1] - 2026-06-27
 

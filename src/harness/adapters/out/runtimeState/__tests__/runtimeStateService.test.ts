@@ -197,6 +197,9 @@ describe('HarnessRuntimeStateService', () => {
     expect(page.items).toHaveLength(1);
     expect(page.malformedCount).toBe(1);
     await expect(service.listTracePage(session.id, { limit: 1001 })).rejects.toThrow('between 1 and 1000');
+    await expect(service.listTracePage(session.id, { maxBytes: 1023 })).rejects.toThrow('between 1024');
+    await expect(service.listTracePage(session.id, { maxBytes: 16 * 1024 * 1024 + 1 }))
+      .rejects.toThrow('between 1024');
     await expect(service.listSessionPage({ limit: 201 })).rejects.toThrow('between 1 and 200');
     await expect(service.listTracePage(session.id, { cursor: 'not-a-cursor' })).rejects.toMatchObject({
       code: 'INVALID_RUNTIME_HISTORY_CURSOR',
@@ -227,6 +230,66 @@ describe('HarnessRuntimeStateService', () => {
     expect(reverse.malformedCount).toBe(1);
     expect(forward.scannedBytes).toBe(Buffer.byteLength(contents));
     expect(reverse.scannedBytes).toBe(Buffer.byteLength(contents));
+  });
+
+  it('limits aggregate trace page bytes and continues every record by cursor', async () => {
+    const session = await service.createSession({ name: 'byte-pages' });
+    const traceFile = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'trace.jsonl');
+    const records = Array.from({ length: 100 }, (_, index) => ({
+      id: `large-${index}`,
+      sessionId: session.id,
+      level: 'info',
+      event: 'large.page',
+      message: `record-${index}`,
+      createdAt: new Date(1_700_000_000_000 + index).toISOString(),
+      data: { index, payload: 'x'.repeat(64 * 1024) },
+    }));
+    await fs.writeFile(traceFile, `${records.map(record => JSON.stringify(record)).join('\n')}\n`);
+
+    const seen: string[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await service.listTracePage(session.id, {
+        direction: 'oldest',
+        limit: 100,
+        maxBytes: 256 * 1024,
+        cursor,
+      });
+      expect(page.returnedBytes).toBeLessThanOrEqual(256 * 1024);
+      expect(page.items.length).toBeLessThan(100);
+      seen.push(...page.items.map(record => record.id));
+      cursor = page.nextCursor;
+    } while (cursor);
+
+    expect(seen).toEqual(records.map(record => record.id));
+  });
+
+  it('skips a single valid record larger than the byte budget without looping', async () => {
+    const session = await service.createSession({ name: 'single-oversize' });
+    const traceFile = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'trace.jsonl');
+    const oversized = {
+      id: 'oversized-valid', sessionId: session.id, level: 'info', event: 'valid',
+      message: 'x'.repeat(2048), createdAt: '2026-01-01T00:00:00.000Z',
+    };
+    const small = {
+      id: 'small', sessionId: session.id, level: 'info', event: 'valid',
+      message: 'small', createdAt: '2026-01-02T00:00:00.000Z',
+    };
+    await fs.writeFile(traceFile, `${JSON.stringify(oversized)}\n${JSON.stringify(small)}\n`);
+
+    const page = await service.listTracePage(session.id, {
+      direction: 'oldest',
+      limit: 10,
+      maxBytes: 1024,
+    });
+
+    expect(page.items.map(record => record.id)).toEqual(['small']);
+    expect(page).toMatchObject({
+      byteLimited: true,
+      oversizedRecordsSkipped: 1,
+      returnedBytes: expect.any(Number),
+    });
+    expect(page.returnedBytes).toBeLessThanOrEqual(1024);
   });
 
   it('maintains a latest sensor summary without scanning trace history', async () => {

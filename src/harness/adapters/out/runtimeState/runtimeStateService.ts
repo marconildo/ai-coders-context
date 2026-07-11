@@ -18,10 +18,12 @@ import {
   loadHookTracePolicy,
 } from '../../../application/hooks/hookTracePolicy';
 import {
+  boundedPageBytes,
   boundedLimit,
   decodeHistoryCursor,
   encodeHistoryCursor,
   queryBinding,
+  serializedHistoryItemBytes,
   RuntimeHistoryCursorError,
   type RuntimeHistoryDirection,
   type RuntimeHistoryPage,
@@ -612,39 +614,74 @@ export class HarnessRuntimeStateService {
   async listSessionPage(query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessSessionRecord>> {
     const started = Date.now();
     const limit = boundedLimit(query.limit, 50, 200, 'sessions');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'sessions');
     const direction = query.direction ?? 'newest';
     const binding = queryBinding({ direction });
     const boundary = decodeHistoryCursor<{ updatedAt: string; id: string }>(query.cursor, 'sessions', binding);
     await this.ensureLayout();
-    const selected: HarnessSessionRecord[] = [];
+    const selected: Array<{ file: string; updatedAt: string; id: string; bytes: number }> = [];
     let recordsScanned = 0;
+    let eligibleRecords = 0;
+    let oversizedRecordsSkipped = 0;
     const directory = await nodeFs.opendir(this.sessionsPath);
     for await (const entry of directory) {
       if (!entry.isDirectory()) continue;
       try {
-        const session = await fs.readJson(this.sessionFile(entry.name)) as HarnessSessionRecord;
+        const file = this.sessionFile(entry.name);
+        const stat = await nodeFs.stat(file);
+        if (stat.size + 2 > byteBudget) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const session = JSON.parse(await nodeFs.readFile(file, 'utf8')) as HarnessSessionRecord;
         recordsScanned += 1;
         const key = `${session.updatedAt}\0${session.id}`;
         const boundaryKey = boundary ? `${boundary.updatedAt}\0${boundary.id}` : undefined;
         if (boundaryKey && (direction === 'newest' ? key >= boundaryKey : key <= boundaryKey)) continue;
-        selected.push(session);
+        const bytes = serializedHistoryItemBytes(session);
+        if (bytes + 2 > byteBudget) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        eligibleRecords += 1;
+        selected.push({ file, updatedAt: session.updatedAt, id: session.id, bytes });
         selected.sort((a, b) => direction === 'newest'
           ? b.updatedAt.localeCompare(a.updatedAt) || b.id.localeCompare(a.id)
           : a.updatedAt.localeCompare(b.updatedAt) || a.id.localeCompare(b.id));
         if (selected.length > limit + 1) selected.pop();
       } catch { /* skip corrupt legacy records */ }
     }
-    const hasMore = selected.length > limit;
-    const items = selected.slice(0, limit);
-    const last = items.at(-1);
+    const chosen: typeof selected = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected) {
+      if (chosen.length === limit) break;
+      const candidateTotal = returnedBytes + candidate.bytes + (chosen.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        break;
+      }
+      chosen.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const items: HarnessSessionRecord[] = [];
+    for (const candidate of chosen) {
+      items.push(JSON.parse(await nodeFs.readFile(candidate.file, 'utf8')) as HarnessSessionRecord);
+    }
+    const hasMore = eligibleRecords > chosen.length;
+    const last = chosen.at(-1);
     return {
       items,
       nextCursor: hasMore && last ? encodeHistoryCursor('sessions', binding, { updatedAt: last.updatedAt, id: last.id }) : undefined,
       hasMore,
       recordsReturned: items.length,
       recordsScanned,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
       cursorVersion: 1,
-      partial: hasMore,
+      partial: hasMore || oversizedRecordsSkipped > 0,
       durationMs: Date.now() - started,
     };
   }
@@ -724,23 +761,38 @@ export class HarnessRuntimeStateService {
   async listArtifactPage(sessionId: string, query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessArtifactRecord>> {
     const started = Date.now();
     const limit = boundedLimit(query.limit, 50, 200, 'artifacts');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'artifacts');
     const direction = query.direction ?? 'newest';
     const binding = queryBinding({ sessionId, direction });
     const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'artifacts', binding);
     const dir = this.layout.sessionArtifactsDir(sessionId);
-    const selected: HarnessArtifactRecord[] = [];
+    const selected: Array<{ file: string; createdAt: string; id: string; bytes: number }> = [];
     let recordsScanned = 0;
+    let eligibleRecords = 0;
+    let oversizedRecordsSkipped = 0;
     if (await fs.pathExists(dir)) {
       const directory = await nodeFs.opendir(dir);
       for await (const entry of directory) {
         if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
         try {
-          const artifact = await fs.readJson(path.join(dir, entry.name)) as HarnessArtifactRecord;
+          const file = path.join(dir, entry.name);
+          const stat = await nodeFs.stat(file);
+          if (stat.size + 2 > byteBudget) {
+            oversizedRecordsSkipped += 1;
+            continue;
+          }
+          const artifact = JSON.parse(await nodeFs.readFile(file, 'utf8')) as HarnessArtifactRecord;
           recordsScanned += 1;
           const key = `${artifact.createdAt}\0${artifact.id}`;
           const boundaryKey = boundary ? `${boundary.createdAt}\0${boundary.id}` : undefined;
           if (boundaryKey && (direction === 'newest' ? key >= boundaryKey : key <= boundaryKey)) continue;
-          selected.push(artifact);
+          const bytes = serializedHistoryItemBytes(artifact);
+          if (bytes + 2 > byteBudget) {
+            oversizedRecordsSkipped += 1;
+            continue;
+          }
+          eligibleRecords += 1;
+          selected.push({ file, createdAt: artifact.createdAt, id: artifact.id, bytes });
           selected.sort((a, b) => direction === 'newest'
             ? b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id)
             : a.createdAt.localeCompare(b.createdAt) || a.id.localeCompare(b.id));
@@ -748,17 +800,37 @@ export class HarnessRuntimeStateService {
         } catch { /* skip corrupt legacy records */ }
       }
     }
-    const hasMore = selected.length > limit;
-    const items = selected.slice(0, limit);
-    const last = items.at(-1);
+    const chosen: typeof selected = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected) {
+      if (chosen.length === limit) break;
+      const candidateTotal = returnedBytes + candidate.bytes + (chosen.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        break;
+      }
+      chosen.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const items: HarnessArtifactRecord[] = [];
+    for (const candidate of chosen) {
+      items.push(JSON.parse(await nodeFs.readFile(candidate.file, 'utf8')) as HarnessArtifactRecord);
+    }
+    const hasMore = eligibleRecords > chosen.length;
+    const last = chosen.at(-1);
     return {
       items,
       nextCursor: hasMore && last ? encodeHistoryCursor('artifacts', binding, { createdAt: last.createdAt, id: last.id }) : undefined,
       hasMore,
       recordsReturned: items.length,
       recordsScanned,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
       cursorVersion: 1,
-      partial: hasMore,
+      partial: hasMore || oversizedRecordsSkipped > 0,
       durationMs: Date.now() - started,
     };
   }
@@ -784,6 +856,7 @@ export class HarnessRuntimeStateService {
   async listTracePage(sessionId: string, query: HarnessTracePageQuery = {}): Promise<RuntimeHistoryPage<HarnessTraceRecord>> {
     const started = Date.now();
     const limit = boundedLimit(query.limit, 100, 1000, 'traces');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'traces');
     const direction: RuntimeHistoryDirection = query.direction ?? 'newest';
     const filters = { sessionId, direction, event: query.event, level: query.level, createdAfter: query.createdAfter, createdBefore: query.createdBefore };
     const binding = queryBinding(filters);
@@ -807,6 +880,9 @@ export class HarnessRuntimeStateService {
     let recordsScanned = 0;
     let scannedBytes = 0;
     let malformedCount = 0;
+    let returnedBytes = 2;
+    let oversizedRecordsSkipped = 0;
+    let byteLimited = false;
     let hasMore = false;
     let nextPosition: TraceCursorPosition | undefined;
     outer: for (let index = startIndex; index < files.length; index += 1) {
@@ -825,7 +901,24 @@ export class HarnessRuntimeStateService {
         if (query.createdAfter && trace.createdAt <= query.createdAfter) continue;
         if (query.createdBefore && trace.createdAt >= query.createdBefore) continue;
         if (items.length === limit) { hasMore = true; break outer; }
+        const traceBytes = serializedHistoryItemBytes(trace);
+        const candidateBytes = returnedBytes + traceBytes + (items.length > 0 ? 1 : 0);
+        if (candidateBytes > byteBudget) {
+          if (items.length > 0) {
+            hasMore = true;
+            byteLimited = true;
+            break outer;
+          }
+          // A record larger than an otherwise empty page can never be returned
+          // under this budget. Consume it, report the typed skip, and continue
+          // so a cursor can never loop forever on the same valid line.
+          oversizedRecordsSkipped += 1;
+          byteLimited = true;
+          nextPosition = { file: path.basename(file), offset: line.nextOffset, fingerprint };
+          continue;
+        }
         items.push(trace);
+        returnedBytes = candidateBytes;
         nextPosition = { file: path.basename(file), offset: line.nextOffset, fingerprint };
       }
       if (items.length > 0) nextPosition = { file: path.basename(files[index + 1] ?? file), offset: direction === 'newest' ? Number.MAX_SAFE_INTEGER : 0, fingerprint };
@@ -837,9 +930,13 @@ export class HarnessRuntimeStateService {
       recordsReturned: items.length,
       recordsScanned,
       scannedBytes,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
       malformedCount,
       cursorVersion: 1,
-      partial: hasMore,
+      partial: hasMore || oversizedRecordsSkipped > 0,
       durationMs: Date.now() - started,
     };
   }

@@ -11,7 +11,7 @@ import {
 import { HarnessReplayService, type HarnessReplayRecord } from '../replay/replayService';
 import { HarnessSensorsService } from '../sensors/sensorsService';
 import { HarnessTaskContractsService } from '../contracts/taskContractsService';
-import { boundedLimit, decodeHistoryCursor, encodeHistoryCursor, queryBinding, type RuntimeHistoryPage, type RuntimeHistoryQuery } from '../history/runtimeHistory';
+import { boundedPageBytes, boundedLimit, decodeHistoryCursor, encodeHistoryCursor, MAX_RUNTIME_HISTORY_PAGE_BYTES, queryBinding, serializedHistoryItemBytes, type RuntimeHistoryPage, type RuntimeHistoryQuery } from '../history/runtimeHistory';
 
 export type HarnessFailureKind = 'sensor' | 'task' | 'session' | 'trace';
 
@@ -359,16 +359,23 @@ export class HarnessDatasetService {
   async listDatasetPage(query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessDatasetSummary>> {
     const started = Date.now();
     const limit = boundedLimit(query.limit, 25, 100, 'dataset summaries');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'dataset summaries');
     const binding = queryBinding({ resource: 'datasets' });
     const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'datasets', binding);
     await this.ensureLayout();
     const selected: HarnessDatasetSummary[] = [];
     let recordsScanned = 0;
+    let oversizedRecordsSkipped = 0;
     const directory = await fs.opendir(this.datasetsPath);
     for await (const entry of directory) {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
       try {
-        const dataset = await fs.readJson(path.join(this.datasetsPath, entry.name)) as HarnessFailureDataset;
+        const file = path.join(this.datasetsPath, entry.name);
+        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const dataset = await fs.readJson(file) as HarnessFailureDataset;
         recordsScanned += 1;
         const key = `${dataset.createdAt}\0${dataset.id}`;
         if (boundary && key >= `${boundary.createdAt}\0${boundary.id}`) continue;
@@ -377,10 +384,28 @@ export class HarnessDatasetService {
         if (selected.length > limit + 1) selected.pop();
       } catch { /* skip corrupt records */ }
     }
-    const hasMore = selected.length > limit;
-    const items = selected.slice(0, limit);
+    const items: HarnessDatasetSummary[] = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected.slice(0, limit + 1)) {
+      if (items.length === limit) break;
+      const bytes = serializedHistoryItemBytes(candidate);
+      const candidateTotal = returnedBytes + bytes + (items.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        if (items.length > 0) {
+          byteLimited = true;
+          break;
+        }
+        oversizedRecordsSkipped += 1;
+        byteLimited = true;
+        continue;
+      }
+      items.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const hasMore = selected.length > items.length;
     const last = items.at(-1);
-    return { items, nextCursor: hasMore && last ? encodeHistoryCursor('datasets', binding, { createdAt: last.createdAt, id: last.id }) : undefined, hasMore, recordsReturned: items.length, recordsScanned, cursorVersion: 1, partial: hasMore, durationMs: Date.now() - started };
+    return { items, nextCursor: hasMore && last ? encodeHistoryCursor('datasets', binding, { createdAt: last.createdAt, id: last.id }) : undefined, hasMore, recordsReturned: items.length, recordsScanned, returnedBytes, byteBudget, byteLimited, oversizedRecordsSkipped, cursorVersion: 1, partial: hasMore || oversizedRecordsSkipped > 0, durationMs: Date.now() - started };
   }
 
   async getDataset(datasetId: string): Promise<HarnessFailureDataset> {

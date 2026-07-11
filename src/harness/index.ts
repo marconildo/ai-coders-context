@@ -180,6 +180,8 @@ export {
   type HarnessFailureDataset,
   type HarnessDatasetSummary,
   HarnessRuntimeRetentionService,
+  DEFAULT_RUNTIME_HISTORY_PAGE_BYTES,
+  MAX_RUNTIME_HISTORY_PAGE_BYTES,
   RuntimeHistoryCursorError,
   type RuntimeHistoryDirection,
   type RuntimeHistoryQuery,

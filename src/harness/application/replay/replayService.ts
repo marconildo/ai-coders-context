@@ -18,10 +18,13 @@ import {
   type HarnessTaskContract,
 } from '../contracts/taskContractsService';
 import {
+  boundedPageBytes,
   boundedLimit,
   decodeHistoryCursor,
   encodeHistoryCursor,
   queryBinding,
+  serializedHistoryItemBytes,
+  MAX_RUNTIME_HISTORY_PAGE_BYTES,
   type RuntimeHistoryPage,
   type RuntimeHistoryQuery,
 } from '../history/runtimeHistory';
@@ -74,6 +77,7 @@ export interface HarnessReplayServiceOptions {
 export interface ReplaySessionOptions {
   includePayloads?: boolean;
   maxEvents?: number;
+  maxBytes?: number;
 }
 
 export interface HarnessReplaySummary {
@@ -160,11 +164,15 @@ export class HarnessReplayService {
     const maxEvents = boundedLimit(options.maxEvents, 100, 1000, 'replay events');
     const session = await this.stateService.getSession(sessionId);
     const [tracePage, artifactPage, allSensorRuns, taskScan, handoffScan] = await Promise.all([
-      this.stateService.listTracePage(sessionId, { limit: maxEvents, direction: 'oldest' }),
-      this.stateService.listArtifactPage(sessionId, { limit: Math.min(maxEvents, 200), direction: 'oldest' }),
+      this.stateService.listTracePage(sessionId, { limit: maxEvents, direction: 'oldest', maxBytes: options.maxBytes }),
+      this.stateService.listArtifactPage(sessionId, { limit: Math.min(maxEvents, 200), direction: 'oldest', maxBytes: options.maxBytes }),
       this.sensorsService.getSessionSensorRuns(sessionId),
-      this.contractsService.listSessionTaskContracts(sessionId, maxEvents),
-      this.contractsService.listSessionHandoffContracts(sessionId, maxEvents),
+      options.maxBytes === undefined
+        ? this.contractsService.listSessionTaskContracts(sessionId, maxEvents)
+        : this.contractsService.listSessionTaskContracts(sessionId, maxEvents, options.maxBytes),
+      options.maxBytes === undefined
+        ? this.contractsService.listSessionHandoffContracts(sessionId, maxEvents)
+        : this.contractsService.listSessionHandoffContracts(sessionId, maxEvents, options.maxBytes),
     ]);
 
     const traces = tracePage.items;
@@ -339,16 +347,23 @@ export class HarnessReplayService {
   async listReplayPage(query: RuntimeHistoryQuery & { sessionId?: string } = {}): Promise<RuntimeHistoryPage<HarnessReplaySummary>> {
     const started = Date.now();
     const limit = boundedLimit(query.limit, 25, 100, 'replay summaries');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'replay summaries');
     const binding = queryBinding({ sessionId: query.sessionId });
     const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'replays', binding);
     await this.ensureLayout();
     const selected: HarnessReplaySummary[] = [];
     let recordsScanned = 0;
+    let oversizedRecordsSkipped = 0;
     const directory = await fs.opendir(this.replaysPath);
     for await (const entry of directory) {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
       try {
-        const replay = await fs.readJson(path.join(this.replaysPath, entry.name)) as HarnessReplayRecord;
+        const file = path.join(this.replaysPath, entry.name);
+        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const replay = await fs.readJson(file) as HarnessReplayRecord;
         recordsScanned += 1;
         if (query.sessionId && replay.sessionId !== query.sessionId) continue;
         const key = `${replay.createdAt}\0${replay.id}`;
@@ -358,10 +373,28 @@ export class HarnessReplayService {
         if (selected.length > limit + 1) selected.pop();
       } catch { /* skip corrupt records */ }
     }
-    const hasMore = selected.length > limit;
-    const items = selected.slice(0, limit);
+    const items: HarnessReplaySummary[] = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected.slice(0, limit + 1)) {
+      if (items.length === limit) break;
+      const bytes = serializedHistoryItemBytes(candidate);
+      const candidateTotal = returnedBytes + bytes + (items.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        if (items.length > 0) {
+          byteLimited = true;
+          break;
+        }
+        oversizedRecordsSkipped += 1;
+        byteLimited = true;
+        continue;
+      }
+      items.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const hasMore = selected.length > items.length;
     const last = items.at(-1);
-    return { items, nextCursor: hasMore && last ? encodeHistoryCursor('replays', binding, { createdAt: last.createdAt, id: last.id }) : undefined, hasMore, recordsReturned: items.length, recordsScanned, cursorVersion: 1, partial: hasMore, durationMs: Date.now() - started };
+    return { items, nextCursor: hasMore && last ? encodeHistoryCursor('replays', binding, { createdAt: last.createdAt, id: last.id }) : undefined, hasMore, recordsReturned: items.length, recordsScanned, returnedBytes, byteBudget, byteLimited, oversizedRecordsSkipped, cursorVersion: 1, partial: hasMore || oversizedRecordsSkipped > 0, durationMs: Date.now() - started };
   }
 
   async getReplay(replayId: string): Promise<HarnessReplayRecord> {

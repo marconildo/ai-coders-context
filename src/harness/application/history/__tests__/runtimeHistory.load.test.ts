@@ -38,4 +38,31 @@ loadDescribe('runtime history load acceptance', () => {
     expect(page.hasMore).toBe(true);
     expect(page.recordsScanned).toBe(1000);
   });
+
+  it('keeps a page of 100 valid near-limit records within the byte and RSS budgets', async () => {
+    const state = new HarnessRuntimeStateService({ repoPath: tempDir });
+    const session = await state.createSession({ name: 'large-records' });
+    const traceFile = path.join(tempDir, '.context', 'runtime', 'sessions', session.id, 'trace.jsonl');
+    const records = Array.from({ length: 100 }, (_, index) => JSON.stringify({
+      id: `large-${index}`,
+      sessionId: session.id,
+      level: 'info',
+      event: 'large',
+      message: `large-${index}`,
+      createdAt: new Date(1_700_000_000_000 + index).toISOString(),
+      data: { payload: 'x'.repeat(900 * 1024) },
+    }));
+    await fs.writeFile(traceFile, `${records.join('\n')}\n`);
+    global.gc?.();
+    const before = process.memoryUsage().rss;
+
+    const page = await state.listTracePage(session.id, { limit: 100, direction: 'oldest' });
+
+    global.gc?.();
+    expect(page.items).toHaveLength(1);
+    expect(page.returnedBytes).toBeLessThanOrEqual(page.byteBudget);
+    expect(page.byteLimited).toBe(true);
+    expect(page.nextCursor).toBeDefined();
+    expect(process.memoryUsage().rss - before).toBeLessThan(32 * 1024 * 1024);
+  });
 });

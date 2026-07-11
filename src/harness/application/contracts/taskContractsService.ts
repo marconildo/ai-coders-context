@@ -16,7 +16,12 @@ import type {
   HarnessRuntimeStatePort,
 } from '../../adapters/out/runtimeState/runtimeStateService';
 import type { HarnessSensorRun } from '../sensors/sensorsService';
-import { boundedLimit } from '../history/runtimeHistory';
+import {
+  boundedLimit,
+  boundedPageBytes,
+  MAX_RUNTIME_HISTORY_PAGE_BYTES,
+  serializedHistoryItemBytes,
+} from '../history/runtimeHistory';
 
 /**
  * Structured artifact requirement.
@@ -190,6 +195,10 @@ export interface HarnessHandoffContract {
 export interface BoundedSessionContracts<T> {
   items: T[];
   total: number;
+  returnedBytes: number;
+  byteBudget: number;
+  byteLimited: boolean;
+  oversizedRecordsSkipped: number;
 }
 
 export interface HarnessTaskCompletionResult {
@@ -303,12 +312,14 @@ export class HarnessTaskContractsService {
 
   async listSessionTaskContracts(
     sessionId: string,
-    limit = 100
+    limit = 100,
+    maxBytes?: number
   ): Promise<BoundedSessionContracts<HarnessTaskContract>> {
     return this.listBoundedSessionContracts<HarnessTaskContract>(
       this.tasksPath,
       sessionId,
-      boundedLimit(limit, 100, 1000, 'session task contracts')
+      boundedLimit(limit, 100, 1000, 'session task contracts'),
+      boundedPageBytes(maxBytes, 'session task contracts')
     );
   }
 
@@ -389,31 +400,45 @@ export class HarnessTaskContractsService {
 
   async listSessionHandoffContracts(
     sessionId: string,
-    limit = 100
+    limit = 100,
+    maxBytes?: number
   ): Promise<BoundedSessionContracts<HarnessHandoffContract>> {
     return this.listBoundedSessionContracts<HarnessHandoffContract>(
       this.handoffsPath,
       sessionId,
-      boundedLimit(limit, 100, 1000, 'session handoff contracts')
+      boundedLimit(limit, 100, 1000, 'session handoff contracts'),
+      boundedPageBytes(maxBytes, 'session handoff contracts')
     );
   }
 
   private async listBoundedSessionContracts<T extends { id: string; sessionId?: string; createdAt: string }>(
     directoryPath: string,
     sessionId: string,
-    limit: number
+    limit: number,
+    byteBudget: number
   ): Promise<BoundedSessionContracts<T>> {
     await this.ensureLayout();
-    const selected: T[] = [];
+    const selected: Array<{ file: string; createdAt: string; id: string; bytes: number }> = [];
     let total = 0;
+    let oversizedRecordsSkipped = 0;
     const directory = await fs.opendir(directoryPath);
     for await (const entry of directory) {
       if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
       try {
-        const contract = await fs.readJson(path.join(directoryPath, entry.name)) as T;
+        const file = path.join(directoryPath, entry.name);
+        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const contract = await fs.readJson(file) as T;
         if (contract.sessionId !== sessionId) continue;
         total += 1;
-        selected.push(contract);
+        const bytes = serializedHistoryItemBytes(contract);
+        if (bytes + 2 > byteBudget) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        selected.push({ file, createdAt: contract.createdAt, id: contract.id, bytes });
         selected.sort((left, right) =>
           left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
         );
@@ -422,7 +447,29 @@ export class HarnessTaskContractsService {
         // A malformed unrelated contract must not make replay unavailable.
       }
     }
-    return { items: selected, total };
+    const chosen: typeof selected = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected) {
+      if (chosen.length === limit) break;
+      const candidateTotal = returnedBytes + candidate.bytes + (chosen.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        break;
+      }
+      chosen.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const items: T[] = [];
+    for (const candidate of chosen) items.push(await fs.readJson(candidate.file) as T);
+    return {
+      items,
+      total,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
+    };
   }
 
   async evaluateTaskCompletion(taskId: string, sessionId?: string): Promise<HarnessTaskCompletionResult> {
