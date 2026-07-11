@@ -9,6 +9,8 @@
 import * as fs from 'fs-extra';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
+import { promises as nodeFs } from 'fs';
+import type { FileHandle } from 'fs/promises';
 import { resolveRuntimeLayout, type RuntimeLayout } from '../../../../shared/fs/pathHelpers';
 import {
   boundGenericTraceRecord,
@@ -18,6 +20,68 @@ import {
 
 const traceWriteQueues = new Map<string, Promise<void>>();
 
+function waitForLock(milliseconds: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isProcessAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+async function acquireTraceFileLock(
+  traceFile: string
+): Promise<{ lockFile: string; handle: FileHandle; inode: bigint | number }> {
+  const lockFile = `${traceFile}.lock`;
+  const deadline = Date.now() + 10_000;
+  while (true) {
+    try {
+      const handle = await nodeFs.open(lockFile, 'wx');
+      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`, 'utf8');
+      const stat = await handle.stat({ bigint: true });
+      return { lockFile, handle, inode: stat.ino };
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code !== 'EEXIST') throw error;
+
+      const [age, ownerPid] = await Promise.all([
+        nodeFs.stat(lockFile).then((stat) => Date.now() - stat.mtimeMs).catch(() => 0),
+        nodeFs.readFile(lockFile, 'utf8')
+          .then((value) => Number.parseInt(value.split(/\s/, 1)[0], 10))
+          .catch(() => Number.NaN),
+      ]);
+      if (age > 60_000 && !isProcessAlive(ownerPid)) {
+        await nodeFs.unlink(lockFile).catch(() => undefined);
+        continue;
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for trace lock: ${path.basename(traceFile)}`);
+      }
+      await waitForLock(10 + Math.floor(Math.random() * 20));
+    }
+  }
+}
+
+async function withCrossProcessTraceLock<T>(traceFile: string, operation: () => Promise<T>): Promise<T> {
+  const lock = await acquireTraceFileLock(traceFile);
+  try {
+    return await operation();
+  } finally {
+    await lock.handle.close().catch(() => undefined);
+    const currentInode = await nodeFs.stat(lock.lockFile, { bigint: true })
+      .then((stat) => stat.ino)
+      .catch(() => undefined);
+    if (currentInode === lock.inode) {
+      await nodeFs.unlink(lock.lockFile).catch(() => undefined);
+    }
+  }
+}
+
 async function withTraceWriteLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
   const previous = traceWriteQueues.get(key) ?? Promise.resolve();
   let release!: () => void;
@@ -26,7 +90,7 @@ async function withTraceWriteLock<T>(key: string, operation: () => Promise<T>): 
   traceWriteQueues.set(key, tail);
   await previous.catch(() => undefined);
   try {
-    return await operation();
+    return await withCrossProcessTraceLock(key, operation);
   } finally {
     release();
     if (traceWriteQueues.get(key) === tail) {
@@ -280,6 +344,10 @@ export class HarnessRuntimeStateService {
   }
 
   private async recordTrace(sessionId: string, trace: HarnessTraceRecord): Promise<HarnessTraceRecord> {
+    // Preserve the established missing/corrupt-session error contract before creating a lock file.
+    if (!fs.pathExistsSync(this.sessionFile(sessionId))) {
+      throw new Error(`Harness session not found: ${sessionId}`);
+    }
     return withTraceWriteLock(this.traceFile(sessionId), async () => {
       const session = await this.readSession(sessionId);
       const boundedTrace = boundGenericTraceRecord(trace, loadGenericTraceEventMaxBytes(this.repoPath));

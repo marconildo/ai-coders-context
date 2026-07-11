@@ -144,5 +144,28 @@ describe('HarnessRuntimeStateService', () => {
     expect(traces.filter((trace) => trace.event === 'concurrent.event').map((trace) => trace.data?.index))
       .toEqual(Array.from({ length: 12 }, (_, index) => index));
     expect((await service.getSession(session.id)).traceCount).toBe(traces.length);
+    expect(await fs.pathExists(path.join(sessionDir, 'trace.jsonl.lock'))).toBe(false);
+  });
+
+  it('recovers a stale cross-process trace lock', async () => {
+    const session = await service.createSession({ name: 'stale-lock' });
+    const lockFile = path.join(
+      tempDir,
+      '.context',
+      'runtime',
+      'sessions',
+      session.id,
+      'trace.jsonl.lock'
+    );
+    await fs.writeFile(lockFile, '999999 2000-01-01T00:00:00.000Z\n', 'utf8');
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lockFile, old, old);
+
+    await expect(service.appendTrace(session.id, {
+      level: 'info',
+      event: 'after.stale.lock',
+      message: 'continued',
+    })).resolves.toMatchObject({ event: 'after.stale.lock' });
+    expect(await fs.pathExists(lockFile)).toBe(false);
   });
 });
