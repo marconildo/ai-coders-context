@@ -4,6 +4,7 @@ const fs = require('fs');
 
 const mode = process.argv[2] || 'normal';
 const pidFile = process.argv[3];
+const attackSize = Number(process.argv[4]) || 4096;
 if (pidFile) fs.appendFileSync(pidFile, `${process.pid}\n`);
 
 if (mode === 'ignore-shutdown') {
@@ -19,7 +20,15 @@ function send(message) {
 
 function respond(message) {
   if (message.method === 'initialize') {
-    if (mode === 'crash-after-spawn') {
+    if (mode === 'incomplete-huge-header') {
+      process.stdout.write('X'.repeat(attackSize));
+    } else if (mode === 'incomplete-huge-body') {
+      process.stdout.write(
+        `Content-Length: ${attackSize * 2}\r\n\r\n${'X'.repeat(attackSize)}`
+      );
+    } else if (mode === 'abusive-content-length') {
+      process.stdout.write('Content-Length: 999999999999999999999999\r\n\r\n');
+    } else if (mode === 'crash-after-spawn') {
       process.exit(19);
     } else if (mode === 'reject-initialize') {
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32002, message: 'initialize rejected' } });

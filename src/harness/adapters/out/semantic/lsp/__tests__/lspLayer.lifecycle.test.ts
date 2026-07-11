@@ -1,20 +1,40 @@
 import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
+import type { ChildProcess } from 'child_process';
 import { LSPLayer, LSPLayerOptions, LSPLifecycleEvent } from '../lspLayer';
 import type { LSPServerConfig } from '../../types';
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'fake-lsp-server.js');
 const TIMEOUT_MS = 150;
 
-function server(mode: string, pidFile: string): LSPServerConfig {
-  return { command: process.execPath, args: [FIXTURE, mode, pidFile] };
+function server(mode: string, pidFile: string, attackSize?: number): LSPServerConfig {
+  const args = [FIXTURE, mode, pidFile];
+  if (attackSize !== undefined) args.push(String(attackSize));
+  return { command: process.execPath, args };
 }
 
-async function waitUntil(predicate: () => boolean, timeoutMs = 2_000): Promise<void> {
+interface InspectableHandle {
+  process: ChildProcess;
+  pendingRequests: Map<number, unknown>;
+  timers: Set<NodeJS.Timeout>;
+  buffer: Buffer;
+}
+
+function currentHandle(subject: LSPLayer): InspectableHandle {
+  const handles = (subject as unknown as { handles: Map<string, InspectableHandle> }).handles;
+  const [handle] = [...handles.values()];
+  if (!handle) throw new Error('expected an active LSP handle');
+  return handle;
+}
+
+async function waitUntil(
+  predicate: () => boolean | Promise<boolean>,
+  timeoutMs = 2_000
+): Promise<void> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (predicate()) return;
+    if (await predicate()) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
   throw new Error('condition did not become true before timeout');
@@ -103,6 +123,65 @@ describe('LSPLayer process lifecycle', () => {
     await waitUntil(() => !processIsAlive(pid));
   });
 
+  it.each([
+    {
+      name: 'incomplete huge header',
+      mode: 'incomplete-huge-header',
+      attackSize: 4096,
+      overrides: { maxHeaderBytes: 1024, maxReceiveBufferBytes: 8192 },
+      reason: /header limit exceeded/,
+    },
+    {
+      name: 'incomplete huge body',
+      mode: 'incomplete-huge-body',
+      attackSize: 4096,
+      overrides: { maxBodyBytes: 8192, maxReceiveBufferBytes: 2048 },
+      reason: /receive buffer limit exceeded|frame exceeds receive buffer limit/,
+    },
+    {
+      name: 'abusive Content-Length',
+      mode: 'abusive-content-length',
+      attackSize: 4096,
+      overrides: { maxBodyBytes: 8192 },
+      reason: /Content-Length exceeds body limit/,
+    },
+    {
+      name: 'caller attempt to raise the absolute header maximum',
+      mode: 'incomplete-huge-header',
+      attackSize: 32 * 1024,
+      overrides: { maxHeaderBytes: Number.MAX_SAFE_INTEGER },
+      reason: /header limit exceeded/,
+    },
+  ])('terminates and opens the circuit for $name', async ({
+    mode,
+    attackSize,
+    overrides,
+    reason,
+  }) => {
+    const events: LSPLifecycleEvent[] = [];
+    const subject = createLayer(
+      { typescript: server(mode, pidFile, attackSize) },
+      { ...overrides, onLifecycleEvent: (event) => events.push(event) }
+    );
+
+    const initialization = subject.ensureServer('typescript', projectPath);
+    const handle = currentHandle(subject);
+    await expect(initialization).resolves.toBe(false);
+    const [pid] = await readPids(pidFile);
+    expect(pid).toBeDefined();
+    await waitUntil(() => !processIsAlive(pid));
+    expect(events).toEqual(expect.arrayContaining([
+      expect.objectContaining({ state: 'failed', reason: expect.stringMatching(reason) }),
+      expect.objectContaining({ state: 'stopped', pendingRequestCount: 0 }),
+    ]));
+    expect(handle.pendingRequests.size).toBe(0);
+    expect(handle.timers.size).toBe(0);
+    expect(handle.buffer).toHaveLength(0);
+
+    await expect(subject.ensureServer('typescript', projectPath)).resolves.toBe(false);
+    expect(await readPids(pidFile)).toEqual([pid]);
+  });
+
   it('deduplicates concurrent initialization for the same language and project', async () => {
     const subject = createLayer({ typescript: server('normal', pidFile) });
 
@@ -159,5 +238,40 @@ describe('LSPLayer process lifecycle', () => {
       ])
     );
     await expect(subject.shutdown()).resolves.toBeUndefined();
+  });
+
+  it('is safe when shutdown races with initialization', async () => {
+    const subject = createLayer({ typescript: server('timeout-initialize', pidFile) });
+
+    const initialization = subject.ensureServer('typescript', projectPath);
+    await waitUntil(async () => (await readPids(pidFile)).length === 1);
+    const [pid] = await readPids(pidFile);
+    const handle = currentHandle(subject);
+
+    await expect(Promise.all([initialization, subject.shutdown()])).resolves.toEqual([
+      false,
+      undefined,
+    ]);
+    expect(processIsAlive(pid)).toBe(false);
+    expect(handle.pendingRequests.size).toBe(0);
+    expect(handle.timers.size).toBe(0);
+  });
+
+  it('removes final listeners, timers, buffers, and process handles after shutdown', async () => {
+    const subject = createLayer({ typescript: server('normal', pidFile) });
+    await expect(subject.ensureServer('typescript', projectPath)).resolves.toBe(true);
+    const [pid] = await readPids(pidFile);
+    const handle = currentHandle(subject);
+
+    await subject.shutdown();
+
+    expect(processIsAlive(pid)).toBe(false);
+    expect(handle.pendingRequests.size).toBe(0);
+    expect(handle.timers.size).toBe(0);
+    expect(handle.buffer).toHaveLength(0);
+    expect(handle.process.eventNames()).toEqual([]);
+    expect(handle.process.stdin?.eventNames()).toEqual([]);
+    expect(handle.process.stdout?.eventNames()).toEqual([]);
+    expect(handle.process.stderr?.eventNames()).toEqual([]);
   });
 });

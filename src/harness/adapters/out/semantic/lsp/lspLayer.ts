@@ -57,6 +57,7 @@ interface ServerHandle {
   initialization: Promise<boolean>;
   stopping?: Promise<void>;
   pendingRequests: Map<number, PendingRequest>;
+  timers: Set<NodeJS.Timeout>;
   buffer: Buffer;
   startedAt: number;
   terminationReason?: string;
@@ -74,6 +75,9 @@ export interface LSPLayerOptions {
   requestTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   terminationGraceMs?: number;
+  maxHeaderBytes?: number;
+  maxBodyBytes?: number;
+  maxReceiveBufferBytes?: number;
   onLifecycleEvent?: (event: LSPLifecycleEvent) => void;
 }
 
@@ -98,6 +102,15 @@ const LSP_SERVER_CONFIGS: Record<string, LSPServerConfig> = {
 const DEFAULT_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 2_000;
 const DEFAULT_TERMINATION_GRACE_MS = 2_000;
+export const MAX_LSP_HEADER_BYTES = 16 * 1024;
+export const MAX_LSP_BODY_BYTES = 8 * 1024 * 1024;
+export const MAX_LSP_RECEIVE_BUFFER_BYTES =
+  MAX_LSP_HEADER_BYTES + 4 + MAX_LSP_BODY_BYTES;
+
+function boundedProtocolLimit(value: number | undefined, maximum: number): number {
+  if (value === undefined || !Number.isSafeInteger(value) || value <= 0) return maximum;
+  return Math.min(value, maximum);
+}
 
 export class LSPLayer {
   private readonly handles = new Map<string, ServerHandle>();
@@ -106,6 +119,9 @@ export class LSPLayer {
   private readonly requestTimeoutMs: number;
   private readonly shutdownTimeoutMs: number;
   private readonly terminationGraceMs: number;
+  private readonly maxHeaderBytes: number;
+  private readonly maxBodyBytes: number;
+  private readonly maxReceiveBufferBytes: number;
   private readonly onLifecycleEvent?: (event: LSPLifecycleEvent) => void;
   private messageId = 0;
   private shuttingDown?: Promise<void>;
@@ -115,6 +131,12 @@ export class LSPLayer {
     this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
     this.shutdownTimeoutMs = options.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
     this.terminationGraceMs = options.terminationGraceMs ?? DEFAULT_TERMINATION_GRACE_MS;
+    this.maxHeaderBytes = boundedProtocolLimit(options.maxHeaderBytes, MAX_LSP_HEADER_BYTES);
+    this.maxBodyBytes = boundedProtocolLimit(options.maxBodyBytes, MAX_LSP_BODY_BYTES);
+    this.maxReceiveBufferBytes = boundedProtocolLimit(
+      options.maxReceiveBufferBytes,
+      MAX_LSP_RECEIVE_BUFFER_BYTES
+    );
     this.onLifecycleEvent = options.onLifecycleEvent;
   }
 
@@ -161,6 +183,7 @@ export class LSPLayer {
       state: 'starting',
       initialization: Promise.resolve(false),
       pendingRequests: new Map(),
+      timers: new Set(),
       buffer: Buffer.alloc(0),
       startedAt: Date.now(),
       forcedKill: false,
@@ -243,6 +266,10 @@ export class LSPLayer {
       });
       return true;
     } catch (error) {
+      if (handle.state === 'stopping' || handle.state === 'stopped') {
+        await handle.stopping;
+        return false;
+      }
       this.failedCircuits.add(handle.key);
       const reason =
         error instanceof Error ? `initialize failed: ${error.message}` : 'initialize failed';
@@ -285,23 +312,61 @@ export class LSPLayer {
   }
 
   private handleServerData(handle: ServerHandle, data: Buffer): void {
+    if (handle.state === 'stopping' || handle.state === 'stopped') return;
+    if (data.length > this.maxReceiveBufferBytes - handle.buffer.length) {
+      this.failProtocol(handle, 'receive buffer limit exceeded');
+      return;
+    }
     handle.buffer = Buffer.concat([handle.buffer, data]);
 
     while (true) {
       const headerEnd = handle.buffer.indexOf('\r\n\r\n');
-      if (headerEnd < 0) return;
-      const header = handle.buffer.subarray(0, headerEnd).toString('ascii');
-      const match = /(?:^|\r\n)Content-Length:\s*(\d+)/i.exec(header);
-      if (!match) {
-        handle.buffer = Buffer.alloc(0);
+      if (headerEnd < 0) {
+        if (handle.buffer.length > this.maxHeaderBytes) {
+          this.failProtocol(handle, 'incomplete header limit exceeded');
+        }
         return;
       }
-      const contentLength = Number(match[1]);
+      if (headerEnd > this.maxHeaderBytes) {
+        this.failProtocol(handle, 'header limit exceeded');
+        return;
+      }
+      const header = handle.buffer.subarray(0, headerEnd).toString('ascii');
+      const contentLengthHeaders = header
+        .split('\r\n')
+        .filter((line) => /^Content-Length:/i.test(line));
+      if (contentLengthHeaders.length !== 1) {
+        this.failProtocol(handle, 'expected exactly one Content-Length header');
+        return;
+      }
+      const rawContentLength = contentLengthHeaders[0].slice(
+        contentLengthHeaders[0].indexOf(':') + 1
+      ).trim();
+      if (!/^[0-9]+$/.test(rawContentLength)) {
+        this.failProtocol(handle, 'invalid Content-Length');
+        return;
+      }
+      const contentLength = Number(rawContentLength);
+      if (
+        !Number.isSafeInteger(contentLength) ||
+        contentLength <= 0 ||
+        contentLength > this.maxBodyBytes
+      ) {
+        this.failProtocol(handle, 'Content-Length exceeds body limit');
+        return;
+      }
       const bodyStart = headerEnd + 4;
+      if (bodyStart + contentLength > this.maxReceiveBufferBytes) {
+        this.failProtocol(handle, 'frame exceeds receive buffer limit');
+        return;
+      }
       if (handle.buffer.length < bodyStart + contentLength) return;
 
       const body = handle.buffer.subarray(bodyStart, bodyStart + contentLength);
-      handle.buffer = handle.buffer.subarray(bodyStart + contentLength);
+      const remainingStart = bodyStart + contentLength;
+      handle.buffer = remainingStart === handle.buffer.length
+        ? Buffer.alloc(0)
+        : Buffer.from(handle.buffer.subarray(remainingStart));
       try {
         this.handleMessage(handle, JSON.parse(body.toString('utf8')) as LSPMessage);
       } catch {
@@ -310,13 +375,30 @@ export class LSPLayer {
     }
   }
 
+  private failProtocol(handle: ServerHandle, detail: string): void {
+    if (
+      handle.state === 'failed' ||
+      handle.state === 'stopping' ||
+      handle.state === 'stopped'
+    ) return;
+
+    const reason = `protocol overflow: ${detail}`;
+    handle.buffer = Buffer.alloc(0);
+    handle.terminationReason = reason;
+    handle.state = 'failed';
+    this.failedCircuits.add(handle.key);
+    this.emitHandleLifecycle(handle, 'failed', { reason });
+    this.rejectPending(handle, new Error(`LSP server ${handle.language} ${reason}`));
+    void this.terminateHandle(handle, reason);
+  }
+
   private handleMessage(handle: ServerHandle, message: LSPMessage): void {
     if (message.id === undefined) return;
     const pending = handle.pendingRequests.get(message.id);
     if (!pending) return;
 
     handle.pendingRequests.delete(message.id);
-    clearTimeout(pending.timeout);
+    this.clearHandleTimeout(handle, pending.timeout);
     if (message.error) pending.reject(new Error(message.error.message));
     else pending.resolve(message.result);
   }
@@ -329,14 +411,14 @@ export class LSPLayer {
   ): Promise<unknown> {
     return new Promise((resolve, reject) => {
       const id = ++this.messageId;
-      const timeout = setTimeout(() => {
+      const timeout = this.setHandleTimeout(handle, () => {
         handle.pendingRequests.delete(id);
         reject(new Error(`LSP request timeout: ${method}`));
       }, timeoutMs);
       handle.pendingRequests.set(id, { resolve, reject, timeout });
 
       if (!this.sendMessage(handle, { jsonrpc: '2.0', id, method, params })) {
-        clearTimeout(timeout);
+        this.clearHandleTimeout(handle, timeout);
         handle.pendingRequests.delete(id);
         reject(new Error(`LSP server ${handle.language} is not writable`));
       }
@@ -362,7 +444,7 @@ export class LSPLayer {
 
   private rejectPending(handle: ServerHandle, error: Error): void {
     for (const pending of handle.pendingRequests.values()) {
-      clearTimeout(pending.timeout);
+      this.clearHandleTimeout(handle, pending.timeout);
       pending.reject(error);
     }
     handle.pendingRequests.clear();
@@ -420,17 +502,37 @@ export class LSPLayer {
   private waitForClose(handle: ServerHandle, timeoutMs: number): Promise<boolean> {
     if (handle.closed) return Promise.resolve(true);
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => resolve(false), timeoutMs);
+      const timeout = this.setHandleTimeout(handle, () => resolve(false), timeoutMs);
       handle.closePromise.then(() => {
-        clearTimeout(timeout);
+        this.clearHandleTimeout(handle, timeout);
         resolve(true);
       });
     });
   }
 
+  private setHandleTimeout(
+    handle: ServerHandle,
+    callback: () => void,
+    timeoutMs: number
+  ): NodeJS.Timeout {
+    const timeout = setTimeout(() => {
+      handle.timers.delete(timeout);
+      callback();
+    }, timeoutMs);
+    handle.timers.add(timeout);
+    return timeout;
+  }
+
+  private clearHandleTimeout(handle: ServerHandle, timeout: NodeJS.Timeout): void {
+    clearTimeout(timeout);
+    handle.timers.delete(timeout);
+  }
+
   private releaseHandle(handle: ServerHandle): void {
     if (this.handles.get(handle.key) === handle) this.handles.delete(handle.key);
     this.rejectPending(handle, new Error(`LSP server ${handle.language} released`));
+    for (const timer of handle.timers) clearTimeout(timer);
+    handle.timers.clear();
     handle.buffer = Buffer.alloc(0);
     handle.process.stdin?.removeAllListeners();
     handle.process.stdout?.removeAllListeners();
