@@ -11,12 +11,14 @@
  * Thread safety: Node.js is single-threaded, so no mutex needed.
  */
 
-import * as fs from 'fs-extra';
 import * as path from 'path';
-import { createHash } from 'crypto';
-import { glob } from 'glob';
 import { BoundedLruCache, type BoundedLruCacheMetrics } from '../../../domain/retention/boundedLruCache';
 import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
+import {
+    discoverBoundedFiles,
+    isBoundedSnapshotFresh,
+    type BoundedFreshnessSnapshot,
+} from './discovery';
 
 /**
  * A cached context entry with metadata for invalidation.
@@ -24,8 +26,8 @@ import { loadRuntimeRetentionConfig } from '../../../application/retention/runti
 interface CacheEntry {
     /** The cached context string */
     content: string;
-    /** Modification time hash of source directories at cache time */
-    mtimeHash: string;
+    freshnessFingerprint?: string;
+    freshnessSnapshot?: BoundedFreshnessSnapshot;
 }
 
 export interface ContextCacheOptions {
@@ -39,12 +41,32 @@ export interface ContextCacheOptions {
     maxBytes?: number;
     /** Proactive expiration sweep interval */
     sweepIntervalMs?: number;
+    /** Maximum relevant files selected while establishing freshness (default: 128). */
+    freshnessMaxFiles?: number;
+    /** Maximum directories visited while establishing freshness (default: 256). */
+    freshnessMaxDirectories?: number;
+    /** Optional operation-provided source fingerprint that avoids local discovery. */
+    fingerprintProvider?: (repoPath: string) => Promise<string>;
 }
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const DEFAULT_WATCH_DIRS = ['src', '.context', 'lib', 'packages'];
 const DEFAULT_MAX_ENTRIES = 16;
 const DEFAULT_MAX_BYTES = 32 * 1024 * 1024;
+const CONTEXT_RELEVANT_EXTENSIONS = [
+    '.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.go', '.rs', '.java', '.kt', '.swift', '.cs',
+    '.php', '.rb', '.md', '.mdx', '.json', '.yaml', '.yml', '.toml', '.xml', '.graphql', '.gql', '.proto',
+    '.sql', '.sh', '.bash', '.zsh', '.css', '.scss', '.html', '.vue', '.svelte',
+];
+
+export interface ContextCacheFreshnessMetrics {
+    discoveries: number;
+    filesSelected: number;
+    directoriesVisited: number;
+    partialDiscoveries: number;
+    signalsChecked: number;
+    invalidations: number;
+}
 
 export class ContextCache {
     private readonly caches = new Map<string, {
@@ -54,6 +76,14 @@ export class ContextCache {
     }>();
     private readonly watchDirs: string[];
     private readonly options: ContextCacheOptions;
+    private readonly freshness: ContextCacheFreshnessMetrics = {
+        discoveries: 0,
+        filesSelected: 0,
+        directoriesVisited: 0,
+        partialDiscoveries: 0,
+        signalsChecked: 0,
+        invalidations: 0,
+    };
 
     constructor(options: ContextCacheOptions = {}) {
         this.options = options;
@@ -76,10 +106,10 @@ export class ContextCache {
             return null;
         }
 
-        // Check directory mtime invalidation
-        const currentMtimeHash = await this.computeMtimeHash(repoPath);
-        if (currentMtimeHash !== entry.mtimeHash) {
+        const fresh = await this.isFresh(repoPath, entry);
+        if (!fresh) {
             cache.delete(key);
+            this.freshness.invalidations += 1;
             return null;
         }
 
@@ -96,11 +126,11 @@ export class ContextCache {
     async set(repoPath: string, contextType: string, content: string, keyOptions?: unknown): Promise<void> {
         const cache = await this.cacheForRepo(repoPath);
         const key = this.buildKey(repoPath, contextType, keyOptions);
-        const mtimeHash = await this.computeMtimeHash(repoPath);
+        const freshness = await this.captureFreshness(repoPath);
 
         cache.set(key, {
             content,
-            mtimeHash,
+            ...freshness,
         });
         const loaded = await loadRuntimeRetentionConfig(repoPath);
         this.enforceGlobalLimits({
@@ -159,6 +189,10 @@ export class ContextCache {
         return [...(this.caches.get(this.normalizeRepoPath(repoPath))?.diagnostics ?? [])];
     }
 
+    freshnessMetrics(): ContextCacheFreshnessMetrics {
+        return { ...this.freshness };
+    }
+
     /**
      * Build a unique cache key from repo path and context type.
      */
@@ -201,7 +235,8 @@ export class ContextCache {
         const cache = new BoundedLruCache<string, CacheEntry>({
             ...limits,
             sweepIntervalMs: this.options.sweepIntervalMs,
-            estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(entry.content) + Buffer.byteLength(entry.mtimeHash),
+            estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(entry.content)
+                + Buffer.byteLength(JSON.stringify(entry.freshnessSnapshot ?? entry.freshnessFingerprint ?? '')),
         });
         this.caches.set(normalized, { cache, signature, diagnostics: loaded.diagnostics });
         return cache;
@@ -223,33 +258,37 @@ export class ContextCache {
         }
     }
 
-    /**
-     * Compute a lightweight hash based on directory modification times.
-     * Uses mtime of watched directories as a fast approximation
-     * of whether source files have changed.
-     */
-    private async computeMtimeHash(repoPath: string): Promise<string> {
-        const hash = createHash('sha256');
-
-        for (const dir of this.watchDirs) {
-            const dirPath = path.join(repoPath, dir);
-            try {
-                const files = await glob('**/*', {
-                    cwd: dirPath,
-                    absolute: true,
-                    nodir: true,
-                    dot: true,
-                    ignore: dir === '.context' ? ['runtime/**', 'cache/**'] : [],
-                });
-                for (const file of files.sort()) {
-                    const stat = await fs.stat(file);
-                    hash.update(`${dir}/${path.relative(dirPath, file)}:${stat.size}:${stat.mtimeMs}\n`);
-                }
-            } catch {
-                hash.update(`${dir}:missing\n`);
-            }
+    private async captureFreshness(repoPath: string): Promise<Pick<CacheEntry, 'freshnessFingerprint' | 'freshnessSnapshot'>> {
+        if (this.options.fingerprintProvider) {
+            return { freshnessFingerprint: await this.options.fingerprintProvider(repoPath) };
         }
+        const discovery = await discoverBoundedFiles(repoPath, {
+            roots: this.watchDirs,
+            maxFiles: this.options.freshnessMaxFiles ?? 128,
+            maxDirectories: this.options.freshnessMaxDirectories ?? 256,
+            extensions: CONTEXT_RELEVANT_EXTENSIONS,
+            excludeRelativePrefixes: ['.context/runtime', '.context/cache'],
+        });
+        this.freshness.discoveries += 1;
+        this.freshness.filesSelected += discovery.metrics.filesSelected;
+        this.freshness.directoriesVisited += discovery.metrics.directoriesVisited;
+        if (discovery.metrics.partial) this.freshness.partialDiscoveries += 1;
+        return { freshnessFingerprint: discovery.fingerprint, freshnessSnapshot: discovery.snapshot };
+    }
 
-        return hash.digest('hex');
+    private async isFresh(repoPath: string, entry: CacheEntry): Promise<boolean> {
+        if (entry.freshnessFingerprint !== undefined && this.options.fingerprintProvider) {
+            return await this.options.fingerprintProvider(repoPath) === entry.freshnessFingerprint;
+        }
+        if (!entry.freshnessSnapshot) return false;
+        const result = await isBoundedSnapshotFresh(entry.freshnessSnapshot);
+        this.freshness.signalsChecked += result.signalsChecked;
+        if (result.fresh) return true;
+        const refreshed = await this.captureFreshness(repoPath);
+        if (refreshed.freshnessFingerprint === entry.freshnessFingerprint && refreshed.freshnessSnapshot) {
+            entry.freshnessSnapshot = refreshed.freshnessSnapshot;
+            return true;
+        }
+        return false;
     }
 }

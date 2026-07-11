@@ -104,6 +104,26 @@ describe('ContextCache', () => {
 
             expect(await cache.get(tempDir, 'compact')).toBeNull();
         });
+
+        it('validates cache hits from bounded signals and ignores irrelevant runtime files', async () => {
+            await fs.writeFile(path.join(tempDir, 'src', 'index.ts'), 'export const value = 1;');
+            const cache = new ContextCache({ watchDirs: ['src', '.context'], freshnessMaxFiles: 4 });
+            await cache.set(tempDir, 'compact', 'content');
+            const afterSet = cache.freshnessMetrics();
+            expect(afterSet).toMatchObject({ discoveries: 1, filesSelected: 1, partialDiscoveries: 0 });
+
+            expect(await cache.get(tempDir, 'compact')).toBe('content');
+            expect(await cache.get(tempDir, 'compact')).toBe('content');
+            expect(cache.freshnessMetrics().discoveries).toBe(1);
+            expect(cache.freshnessMetrics().signalsChecked).toBeGreaterThan(0);
+
+            await fs.outputFile(path.join(tempDir, '.context', 'runtime', 'ignored.json'), '{"ignored":true}');
+            expect(await cache.get(tempDir, 'compact')).toBe('content');
+            await fs.writeFile(path.join(tempDir, 'src', 'index.ts'), 'export const value = 222;');
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            expect(cache.freshnessMetrics().invalidations).toBe(1);
+            cache.dispose();
+        });
     });
 
     describe('invalidation and clearing', () => {

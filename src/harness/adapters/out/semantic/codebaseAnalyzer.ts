@@ -5,7 +5,6 @@
  * for deeper semantic understanding.
  */
 
-import { glob } from 'glob';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
@@ -29,6 +28,7 @@ import {
   FlowEdge,
   ExecutionFlow,
 } from './types';
+import { discoverBoundedFiles, type BoundedDiscoveryMetrics } from './discovery';
 
 const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   useLSP: false,
@@ -47,6 +47,7 @@ export class CodebaseAnalyzer {
   private options: Required<AnalyzerOptions>;
   private readonly fileCacheEntriesExplicit: boolean;
   private readonly fileCacheBytesExplicit: boolean;
+  private lastDiscovery?: BoundedDiscoveryMetrics;
 
   constructor(options: AnalyzerOptions = {}) {
     this.fileCacheEntriesExplicit = options.fileAnalysisCacheMaxEntries !== undefined;
@@ -100,37 +101,15 @@ export class CodebaseAnalyzer {
   }
 
   private async findCodeFiles(projectPath: string): Promise<string[]> {
-    const extensions = Object.keys(LANGUAGE_EXTENSIONS);
-    const patterns = extensions.map((ext) => `**/*${ext}`);
-
-    const ignorePatterns = this.options.exclude.map((p) => `**/${p}/**`);
-
-    const allFiles: string[] = [];
-
-    for (const pattern of patterns) {
-      try {
-        const matches = await glob(pattern, {
-          cwd: projectPath,
-          ignore: ignorePatterns,
-          absolute: true,
-          nodir: true,
-        });
-        allFiles.push(...matches);
-      } catch {
-        // Ignore glob errors for individual patterns
-      }
-    }
-
-    // Apply include filter if specified
-    let filteredFiles = allFiles;
-    if (this.options.include.length > 0) {
-      filteredFiles = allFiles.filter((file) =>
-        this.options.include.some((pattern) => file.includes(pattern))
-      );
-    }
-
-    // Limit number of files
-    return filteredFiles.slice(0, this.options.maxFiles);
+    const discovery = await discoverBoundedFiles(projectPath, {
+      maxFiles: this.options.maxFiles,
+      maxDirectories: Math.min(10_000, this.options.maxFiles * 2 + 32),
+      extensions: Object.keys(LANGUAGE_EXTENSIONS),
+      include: this.options.include,
+      excludeDirectoryNames: this.options.exclude,
+    });
+    this.lastDiscovery = discovery.metrics;
+    return discovery.files;
   }
 
   private async analyzeFiles(files: string[]): Promise<Map<string, FileAnalysis>> {
@@ -614,6 +593,10 @@ export class CodebaseAnalyzer {
 
   fileAnalysisCacheMetrics() {
     return this.treeSitter.cacheMetrics();
+  }
+
+  discoveryMetrics(): BoundedDiscoveryMetrics | undefined {
+    return this.lastDiscovery ? { ...this.lastDiscovery } : undefined;
   }
 
   /**

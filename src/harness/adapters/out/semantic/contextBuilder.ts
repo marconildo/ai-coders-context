@@ -6,9 +6,6 @@
  */
 
 import * as path from 'path';
-import * as fs from 'fs/promises';
-import { createHash } from 'crypto';
-import { glob } from 'glob';
 import { CodebaseAnalyzer } from './codebaseAnalyzer';
 import type {
   SemanticContext,
@@ -20,6 +17,12 @@ import type {
 import { DEFAULT_EXCLUDE_PATTERNS } from './types';
 import { BoundedLruCache, type BoundedLruCacheMetrics } from '../../../domain/retention/boundedLruCache';
 import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
+import {
+  discoverBoundedFiles,
+  isBoundedSnapshotFresh,
+  type BoundedDiscoveryMetrics,
+  type BoundedFreshnessSnapshot,
+} from './discovery';
 
 export interface ContextBuilderOptions extends AnalyzerOptions {
   /** Maximum symbols to include per category */
@@ -35,6 +38,16 @@ export interface ContextBuilderOptions extends AnalyzerOptions {
 }
 
 export type ContextFormat = 'documentation' | 'playbook' | 'plan' | 'compact';
+
+export interface SemanticFreshnessMetrics {
+  discoveries: number;
+  filesSelected: number;
+  directoriesVisited: number;
+  entriesScanned: number;
+  partialDiscoveries: number;
+  signalsChecked: number;
+  invalidations: number;
+}
 
 const DEFAULT_OPTIONS: Required<ContextBuilderOptions> = {
   useLSP: false,
@@ -63,6 +76,8 @@ export class SemanticContextBuilder {
     diagnostics: string[];
     maxEntries: number;
     maxBytes: number;
+    snapshot?: BoundedFreshnessSnapshot;
+    freshness: SemanticFreshnessMetrics;
   }>();
 
   constructor(options: ContextBuilderOptions = {}) {
@@ -76,25 +91,45 @@ export class SemanticContextBuilder {
    */
   async analyze(projectPath: string): Promise<SemanticContext> {
     const normalizedProjectPath = path.resolve(projectPath);
-    const fingerprint = await this.computeProjectFingerprint(normalizedProjectPath);
     const owner = this.options.cacheEnabled
       ? await this.semanticCacheForRepo(normalizedProjectPath)
       : undefined;
-    if (owner?.fingerprint && owner.fingerprint !== fingerprint) {
-      owner.cache.clear();
-    }
-    const cached = owner?.cache.get(fingerprint);
-    if (cached) {
-      owner!.fingerprint = fingerprint;
-      return cached;
+    if (!owner) return this.analyzer.analyze(normalizedProjectPath);
+
+    let discovered: Awaited<ReturnType<SemanticContextBuilder['computeProjectFingerprint']>> | undefined;
+    if (owner.fingerprint && owner.snapshot) {
+      const freshness = await isBoundedSnapshotFresh(owner.snapshot);
+      owner.freshness.signalsChecked += freshness.signalsChecked;
+      if (freshness.fresh) {
+        const cached = owner.cache.get(owner.fingerprint);
+        if (cached) return cached;
+      } else {
+        discovered = await this.computeProjectFingerprint(normalizedProjectPath);
+        this.recordDiscoveryMetrics(owner.freshness, discovered.metrics);
+        if (discovered.fingerprint === owner.fingerprint) {
+          owner.snapshot = discovered.snapshot;
+          const cached = owner.cache.get(owner.fingerprint);
+          if (cached) return cached;
+        } else {
+          owner.cache.clear();
+          owner.freshness.invalidations += 1;
+        }
+      }
     }
 
-    const context = await this.analyzer.analyze(normalizedProjectPath);
-    if (owner) {
-      owner.cache.set(fingerprint, context);
-      owner.fingerprint = fingerprint;
-      this.enforceSemanticLimits(owner.maxEntries, owner.maxBytes);
+    if (!discovered) {
+      discovered = await this.computeProjectFingerprint(normalizedProjectPath);
+      this.recordDiscoveryMetrics(owner.freshness, discovered.metrics);
     }
+    const fingerprint = discovered.fingerprint;
+    if (owner.fingerprint && owner.fingerprint !== fingerprint) owner.cache.clear();
+    const cached = owner.cache.get(fingerprint);
+    if (cached) return cached;
+    const context = await this.analyzer.analyze(normalizedProjectPath);
+    owner.cache.set(fingerprint, context);
+    owner.fingerprint = fingerprint;
+    owner.snapshot = discovered.snapshot;
+    this.enforceSemanticLimits(owner.maxEntries, owner.maxBytes);
     return context;
   }
 
@@ -859,6 +894,11 @@ export class SemanticContextBuilder {
     return [...(this.semanticCaches.get(path.resolve(projectPath))?.diagnostics ?? [])];
   }
 
+  freshnessMetrics(projectPath: string): SemanticFreshnessMetrics | undefined {
+    const metrics = this.semanticCaches.get(path.resolve(projectPath))?.freshness;
+    return metrics ? { ...metrics } : undefined;
+  }
+
   private async semanticCacheForRepo(projectPath: string) {
     for (const [ownerPath, owner] of this.semanticCaches) {
       if (ownerPath !== projectPath && owner.cache.size === 0) {
@@ -885,7 +925,15 @@ export class SemanticContextBuilder {
       ttlMs: 24 * 60 * 60 * 1000,
       estimateBytes: context => this.estimateSemanticContextBytes(context),
     });
-    const owner = { cache, signature, diagnostics: loaded.diagnostics, ...limits, fingerprint: undefined as string | undefined };
+    const owner = {
+      cache,
+      signature,
+      diagnostics: loaded.diagnostics,
+      ...limits,
+      fingerprint: undefined as string | undefined,
+      snapshot: undefined as BoundedFreshnessSnapshot | undefined,
+      freshness: { discoveries: 0, filesSelected: 0, directoriesVisited: 0, entriesScanned: 0, partialDiscoveries: 0, signalsChecked: 0, invalidations: 0 },
+    };
     this.semanticCaches.set(projectPath, owner);
     return owner;
   }
@@ -906,24 +954,22 @@ export class SemanticContextBuilder {
     }
   }
 
-  private async computeProjectFingerprint(projectPath: string): Promise<string> {
-    const extensions = ['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'go'];
-    const files = await glob(`**/*.{${extensions.join(',')}}`, {
-      cwd: projectPath,
-      absolute: true,
-      nodir: true,
-      ignore: this.options.exclude.map((entry) => `**/${entry}/**`),
+  private async computeProjectFingerprint(projectPath: string) {
+    return discoverBoundedFiles(projectPath, {
+      maxFiles: this.options.maxFiles,
+      maxDirectories: Math.min(10_000, this.options.maxFiles * 2 + 32),
+      extensions: ['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs', '.py', '.pyw', '.pyi', '.go'],
+      include: this.options.include,
+      excludeDirectoryNames: this.options.exclude,
     });
-    const hash = createHash('sha256');
-    for (const file of files.sort().slice(0, this.options.maxFiles)) {
-      try {
-        const stat = await fs.stat(file);
-        hash.update(`${path.relative(projectPath, file)}:${stat.size}:${stat.mtimeMs}\n`);
-      } catch {
-        hash.update(`${path.relative(projectPath, file)}:missing\n`);
-      }
-    }
-    return hash.digest('hex');
+  }
+
+  private recordDiscoveryMetrics(target: SemanticFreshnessMetrics, metrics: BoundedDiscoveryMetrics): void {
+    target.discoveries += 1;
+    target.filesSelected += metrics.filesSelected;
+    target.directoriesVisited += metrics.directoriesVisited;
+    target.entriesScanned += metrics.entriesScanned;
+    if (metrics.partial) target.partialDiscoveries += 1;
   }
 
   private estimateSemanticContextBytes(context: SemanticContext): number {

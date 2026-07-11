@@ -82,4 +82,25 @@ describe('semantic cache retention', () => {
     await analyzer.shutdown();
     expect(analyzer.fileAnalysisCacheMetrics().entries).toBe(0);
   });
+
+  it('limits semantic fingerprint discovery before materialization and reuses bounded hit signals', async () => {
+    for (let index = 0; index < 40; index += 1) {
+      await fs.outputFile(path.join(repo, 'src', `${index}.ts`), `export const value${index} = ${index};`);
+    }
+    const builder = new SemanticContextBuilder({ maxFiles: 5 });
+    const analyze = jest.fn().mockResolvedValue(emptyContext);
+    (builder as any).analyzer.analyze = analyze;
+
+    await builder.analyze(repo);
+    await builder.analyze(repo);
+    expect(analyze).toHaveBeenCalledTimes(1);
+    expect(builder.freshnessMetrics(repo)).toMatchObject({
+      discoveries: 1,
+      filesSelected: 5,
+      partialDiscoveries: 1,
+    });
+    expect(builder.freshnessMetrics(repo)!.entriesScanned).toBeLessThan(40);
+    expect(builder.freshnessMetrics(repo)!.signalsChecked).toBeGreaterThan(0);
+    await builder.shutdown();
+  });
 });
