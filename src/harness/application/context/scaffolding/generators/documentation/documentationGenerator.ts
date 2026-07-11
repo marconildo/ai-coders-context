@@ -8,8 +8,13 @@ import {
   renderIndex,
 } from './templates';
 import { getGuidesByKeys, DOCUMENT_GUIDES } from './guideRegistry';
-import { CodebaseAnalyzer, SemanticContext, SemanticSnapshotService } from '../../../../../adapters/out/semantic';
-import { StackDetector } from '../../../intelligence/stack';
+import {
+  CodebaseAnalyzer,
+  SemanticContext,
+  SemanticSnapshotService,
+  type DetectedFunctionalPatterns,
+} from '../../../../../adapters/out/semantic';
+import { StackDetector, type StackInfo } from '../../../intelligence/stack';
 import {
   createDocFrontmatter,
   serializeFrontmatter,
@@ -57,6 +62,11 @@ interface DocumentationGenerationConfig {
   includeContentStubs?: boolean;
   /** Fill scaffolds with semantic data (no LLM required) */
   autoFill?: boolean;
+  /** Operation-scoped semantic data supplied by context init. */
+  semanticContext?: SemanticContext;
+  functionalPatterns?: DetectedFunctionalPatterns;
+  stackInfo?: StackInfo;
+  repoFingerprint?: string;
 }
 
 export class DocumentationGenerator {
@@ -72,12 +82,14 @@ export class DocumentationGenerator {
   ): Promise<number> {
     const docsDir = path.join(outputDir, 'docs');
     await GeneratorUtils.ensureDirectoryAndLog(docsDir, verbose, 'Generating documentation scaffold in');
-    const snapshotService = config.semantic ? new SemanticSnapshotService() : null;
+    const snapshotService = (config.semantic || config.semanticContext)
+      ? new SemanticSnapshotService()
+      : null;
 
     // Perform semantic analysis if enabled
-    let semantics: SemanticContext | undefined;
-    let snapshotFingerprint: string | undefined;
-    if (config.semantic) {
+    let semantics = config.semanticContext;
+    let snapshotFingerprint = config.repoFingerprint;
+    if (config.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis...', verbose);
       this.analyzer = new CodebaseAnalyzer();
       try {
@@ -93,8 +105,8 @@ export class DocumentationGenerator {
     }
 
     // Detect stack info for codebase map and autoFill
-    let stackInfo;
-    if (semantics || config.autoFill) {
+    let stackInfo = config.stackInfo;
+    if (!stackInfo && (semantics || config.autoFill)) {
       try {
         const stackDetector = new StackDetector();
         stackInfo = await stackDetector.detect(repoStructure.rootPath);
@@ -111,6 +123,7 @@ export class DocumentationGenerator {
           outputDir,
           semantics,
           stackInfo,
+          functionalPatterns: config.functionalPatterns,
           repoFingerprint: snapshotFingerprint,
         });
 

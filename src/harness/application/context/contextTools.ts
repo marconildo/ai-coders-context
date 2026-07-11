@@ -8,7 +8,11 @@ import { FileMapper } from '../../../utils/fileMapper';
 import { needsFill } from '../../../utils/frontMatter';
 import { getScaffoldStructure, serializeStructureForAI } from './scaffolding/generators/shared/structures';
 import { DocumentationGenerator } from './scaffolding/generators/documentation/documentationGenerator';
-import { SemanticSnapshotService } from '../../adapters/out/semantic';
+import {
+  CodebaseAnalyzer,
+  SemanticSnapshotService,
+  type SemanticAnalysisBundle,
+} from '../../adapters/out/semantic';
 import { AgentGenerator } from './scaffolding/generators/agents/agentGenerator';
 import { SkillGenerator } from './scaffolding/generators/skills/skillGenerator';
 import { PlanGenerator } from './scaffolding/generators/plans/planGenerator';
@@ -642,12 +646,34 @@ export const initializeContextTool = createInternalTool<
       const fileMapper = new FileMapper(exclude);
       const repoStructure = await fileMapper.mapRepository(resolvedRepoPath, include);
 
+      let semanticBundle: SemanticAnalysisBundle | undefined;
+      let semanticFingerprint: string | undefined;
+      if (semantic) {
+        const analyzer = new CodebaseAnalyzer({
+          exclude: [...new Set([...DEFAULT_EXCLUDE_PATTERNS, ...exclude])],
+        });
+        try {
+          const snapshotService = new SemanticSnapshotService();
+          semanticFingerprint = await snapshotService.captureRepoFingerprint(resolvedRepoPath);
+          semanticBundle = await analyzer.analyzeBundle(resolvedRepoPath);
+        } catch {
+          semanticBundle = undefined;
+          semanticFingerprint = undefined;
+        } finally {
+          await analyzer.shutdown();
+        }
+      }
+
       let classification: ProjectClassification | undefined;
       let projectType: ProjectType = 'unknown';
+      let detectedStackInfo: Awaited<ReturnType<StackDetector['detect']>> | undefined;
+
+      if (!disableFiltering || semantic) {
+        const stackDetector = new StackDetector();
+        detectedStackInfo = await stackDetector.detect(resolvedRepoPath);
+      }
 
       if (!disableFiltering) {
-        const stackDetector = new StackDetector();
-        const stackInfo = await stackDetector.detect(resolvedRepoPath);
         if (overrideProjectType) {
           projectType = overrideProjectType;
           classification = {
@@ -657,7 +683,7 @@ export const initializeContextTool = createInternalTool<
             reasoning: ['Project type manually specified'],
           };
         } else {
-          classification = classifyProject(stackInfo);
+          classification = classifyProject(detectedStackInfo!);
           projectType = classification.primaryType;
         }
       }
@@ -672,7 +698,14 @@ export const initializeContextTool = createInternalTool<
         docsGenerated = await docGenerator.generateDocumentation(
           repoStructure,
           outputDir,
-          { semantic, filteredDocs },
+          {
+            semantic,
+            filteredDocs,
+            semanticContext: semanticBundle?.context,
+            functionalPatterns: semanticBundle?.functionalPatterns,
+            stackInfo: detectedStackInfo,
+            repoFingerprint: semanticFingerprint,
+          },
           false
         );
       }
@@ -716,7 +749,13 @@ export const initializeContextTool = createInternalTool<
         agentsGenerated = await agentGenerator.generateAgentPrompts(
           repoStructure,
           outputDir,
-          { semantic, filteredAgents, availableSkills },
+          {
+            semantic,
+            filteredAgents,
+            availableSkills,
+            semanticContext: semanticBundle?.context,
+            stackInfo: detectedStackInfo,
+          },
           false
         );
       }

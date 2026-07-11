@@ -9,6 +9,7 @@ import {
   listFilesToFillTool,
 } from '../contextTools';
 import { toolExecutionContext } from '../../../../shared';
+import { CodebaseAnalyzer } from '../../../adapters/out/semantic';
 
 describe('contextTools sensors scaffolding', () => {
   let tempDir: string;
@@ -29,7 +30,25 @@ describe('contextTools sensors scaffolding', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await fs.remove(tempDir);
+  });
+
+  it('shares one semantic analysis bundle across docs, snapshot, and agents', async () => {
+    const analyzeBundle = jest.spyOn(CodebaseAnalyzer.prototype, 'analyzeBundle');
+
+    await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'both',
+        semantic: true,
+        generateQA: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    );
+
+    expect(analyzeBundle).toHaveBeenCalledTimes(1);
   });
 
   it('includes bootstrap sensors.json in pending writes and listToFill', async () => {

@@ -40,6 +40,9 @@ interface AgentGenerationConfig {
   autoFill?: boolean;
   /** Available skills that agents can reference */
   availableSkills?: AvailableSkill[];
+  /** Operation-scoped data supplied by context init. */
+  semanticContext?: SemanticContext;
+  stackInfo?: StackInfo;
 }
 
 /**
@@ -116,8 +119,8 @@ export class AgentGenerator {
     await GeneratorUtils.ensureDirectoryAndLog(agentsDir, verbose, 'Generating agent scaffold in');
 
     // Perform semantic analysis if enabled
-    let semantics: SemanticContext | undefined;
-    if (normalizedConfig.semantic) {
+    let semantics = normalizedConfig.semanticContext;
+    if (normalizedConfig.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis for agents...', verbose);
       this.analyzer = new CodebaseAnalyzer();
       try {
@@ -132,8 +135,8 @@ export class AgentGenerator {
     }
 
     // Detect stack info for autoFill
-    let stackInfo: StackInfo | undefined;
-    if (normalizedConfig.autoFill) {
+    let stackInfo = normalizedConfig.stackInfo;
+    if (!stackInfo && normalizedConfig.autoFill) {
       try {
         const stackDetector = new StackDetector();
         stackInfo = await stackDetector.detect(repoStructure.rootPath);

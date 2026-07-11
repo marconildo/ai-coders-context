@@ -121,6 +121,26 @@ describe('CodebaseAnalyzer', () => {
   });
 
   describe('analyze', () => {
+    it('builds semantic context and functional patterns from one file-analysis pass', async () => {
+      const analyzer = new CodebaseAnalyzer({ useLSP: false });
+      const internal = analyzer as unknown as {
+        findCodeFiles(projectPath: string): Promise<string[]>;
+        analyzeFiles(files: string[]): Promise<Map<string, FileAnalysis>>;
+      };
+      const findSpy = jest.spyOn(internal, 'findCodeFiles');
+      const analyzeSpy = jest.spyOn(internal, 'analyzeFiles');
+
+      const bundle = await analyzer.analyzeBundle(tempDir);
+
+      expect(findSpy).toHaveBeenCalledTimes(1);
+      expect(analyzeSpy).toHaveBeenCalledTimes(1);
+      expect(bundle.context.stats.totalFiles).toBeGreaterThan(0);
+      expect(bundle.functionalPatterns).toEqual(expect.objectContaining({
+        patterns: expect.any(Array),
+      }));
+      expect(bundle.files).toHaveLength(bundle.context.stats.totalFiles);
+    });
+
     it('should analyze files with Tree-sitter by default', async () => {
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
 

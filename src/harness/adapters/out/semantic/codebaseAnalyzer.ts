@@ -38,6 +38,12 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   cacheEnabled: true,
 };
 
+export interface SemanticAnalysisBundle {
+  context: SemanticContext;
+  functionalPatterns: DetectedFunctionalPatterns;
+  files: string[];
+}
+
 export class CodebaseAnalyzer {
   private treeSitter: TreeSitterLayer;
   private lspLayer?: LSPLayer;
@@ -54,6 +60,23 @@ export class CodebaseAnalyzer {
   }
 
   async analyze(projectPath: string): Promise<SemanticContext> {
+    return (await this.analyzeProject(projectPath)).context;
+  }
+
+  async analyzeBundle(projectPath: string): Promise<SemanticAnalysisBundle> {
+    const { context, files, fileAnalyses } = await this.analyzeProject(projectPath);
+    return {
+      context,
+      functionalPatterns: this.detectFunctionalPatternsFromAnalyses(files, fileAnalyses),
+      files,
+    };
+  }
+
+  private async analyzeProject(projectPath: string): Promise<{
+    context: SemanticContext;
+    files: string[];
+    fileAnalyses: Map<string, FileAnalysis>;
+  }> {
     const startTime = Date.now();
 
     // 1. Find all code files
@@ -76,7 +99,11 @@ export class CodebaseAnalyzer {
     // 6. Calculate stats
     context.stats.analysisTimeMs = Date.now() - startTime;
 
-    return context;
+    return {
+      context,
+      files,
+      fileAnalyses,
+    };
   }
 
   private async findCodeFiles(projectPath: string): Promise<string[]> {
@@ -102,9 +129,9 @@ export class CodebaseAnalyzer {
     }
 
     // Apply include filter if specified
-    let filteredFiles = allFiles;
+    let filteredFiles = [...new Set(allFiles)];
     if (this.options.include.length > 0) {
-      filteredFiles = allFiles.filter((file) =>
+      filteredFiles = filteredFiles.filter((file) =>
         this.options.include.some((pattern) => file.includes(pattern))
       );
     }
@@ -674,6 +701,13 @@ export class CodebaseAnalyzer {
     const files = await this.findCodeFiles(projectPath);
     const analyses = await this.analyzeFiles(files);
 
+    return this.detectFunctionalPatternsFromAnalyses(files, analyses);
+  }
+
+  private detectFunctionalPatternsFromAnalyses(
+    files: string[],
+    analyses: Map<string, FileAnalysis>
+  ): DetectedFunctionalPatterns {
     const patterns: FunctionalPattern[] = [];
     const allSymbols = [...analyses.values()].flatMap((a) => a.symbols);
     const allImports = [...analyses.values()].flatMap((a) =>
