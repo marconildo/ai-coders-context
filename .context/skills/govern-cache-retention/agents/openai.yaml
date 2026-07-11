@@ -1,0 +1,4 @@
+interface:
+  display_name: "Govern Cache Retention"
+  short_description: "Add cache limits, TTLs, and cleanup"
+  default_prompt: "Use $govern-cache-retention to design bounded caches and lifecycle-aware persistent indexes."

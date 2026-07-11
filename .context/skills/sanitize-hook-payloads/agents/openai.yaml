@@ -1,0 +1,4 @@
+interface:
+  display_name: "Sanitize Hook Payloads"
+  short_description: "Keep hook traces small and safe"
+  default_prompt: "Use $sanitize-hook-payloads to review hook input capture, redaction, and trace size limits."

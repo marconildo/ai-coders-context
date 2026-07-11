@@ -27,6 +27,18 @@ On-demand expertise for AI agents. Skills are task-specific procedures that get 
 | [Security Audit](./security-audit/SKILL.md) | Security review checklist for code and infrastructure | R, V | filled |
 | [Test Generation](./test-generation/SKILL.md) | Generate comprehensive test cases for code | E, V | filled |
 
+### Performance Safety Skills
+
+| Skill | Description | Related Spec |
+|-------|-------------|--------------|
+| [Bound Subprocess Output](./bound-subprocess-output/SKILL.md) | Prevent unbounded stdout and stderr retention | [F-01](../../specs/performance/f-01-bound-subprocess-output.md) |
+| [Sanitize Hook Payloads](./sanitize-hook-payloads/SKILL.md) | Keep hook inputs and traces bounded and redacted | [F-02](../../specs/performance/f-02-sanitize-hook-payloads.md) |
+| [Stream Runtime History](./stream-runtime-history/SKILL.md) | Paginate traces, replay, datasets, and retention | [F-03](../../specs/performance/f-03-stream-runtime-history.md) |
+| [Manage LSP Process Lifecycle](./manage-lsp-process-lifecycle/SKILL.md) | Prevent orphan language-server processes | [F-04](../../specs/performance/f-04-lsp-process-lifecycle.md) |
+| [Share Semantic Analysis](./share-semantic-analysis/SKILL.md) | Reuse repository scans and semantic analysis | [F-05](../../specs/performance/f-05-shared-semantic-analysis.md) |
+| [Bound MCP Payloads](./bound-mcp-payloads/SKILL.md) | Bound inputs, responses, serialization, and logging | [F-06](../../specs/performance/f-06-bound-mcp-payloads.md) |
+| [Govern Cache Retention](./govern-cache-retention/SKILL.md) | Add cache budgets, TTL, invalidation, and cleanup | [F-07](../../specs/performance/f-07-cache-retention.md) |
+
 ## Creating Custom Skills
 
 Create a new skill by adding a directory with a `SKILL.md` file:
@@ -43,20 +55,11 @@ Create a new skill by adding a directory with a `SKILL.md` file:
 
 ```yaml
 ---
-type: skill
 name: my-skill
-description: When to use this skill
-skillSlug: my-skill
-phases: [P, E, V]  # Optional: PREVC phases
-mode: false        # Optional: mode command?
-status: filled
-scaffoldVersion: "2.0.0"
+description: What the skill does and the concrete tasks that should trigger it
 ---
 
 # My Skill
-
-## When to Use
-[Description of when this skill applies]
 
 ## Instructions
 1. Step one
@@ -65,6 +68,11 @@ scaffoldVersion: "2.0.0"
 ## Examples
 [Usage examples]
 ```
+
+Keep only `name` and `description` in frontmatter. Put all trigger conditions in
+`description`, because discovery reads metadata before loading the skill body. The
+folder name is the stable skill slug. Add `agents/openai.yaml` when UI metadata is
+needed.
 
 ## PREVC Phase Mapping
 

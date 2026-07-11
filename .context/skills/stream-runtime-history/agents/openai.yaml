@@ -1,0 +1,4 @@
+interface:
+  display_name: "Stream Runtime History"
+  short_description: "Bound runtime history reads and replays"
+  default_prompt: "Use $stream-runtime-history to design paginated traces, replays, datasets, and retention."

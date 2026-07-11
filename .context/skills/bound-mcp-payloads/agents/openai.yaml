@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bound MCP Payloads"
+  short_description: "Keep MCP responses paginated and bounded"
+  default_prompt: "Use $bound-mcp-payloads to review MCP response size, pagination, serialization, and logging."

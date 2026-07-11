@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage LSP Process Lifecycle"
+  short_description: "Prevent orphan language-server processes"
+  default_prompt: "Use $manage-lsp-process-lifecycle to implement or review safe LSP startup, failure, and shutdown paths."
