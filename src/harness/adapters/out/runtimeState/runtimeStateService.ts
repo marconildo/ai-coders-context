@@ -25,6 +25,7 @@ const ROTATION_EVENT_RESERVE_BYTES = 2 * 1024;
 interface TraceLockIdentity {
   pid: number;
   token: string;
+  createdAt?: string;
 }
 
 interface TraceFileLock extends TraceLockIdentity {
@@ -51,11 +52,22 @@ interface TraceTakeoverDocument extends TraceLockIdentity {
   };
 }
 
-interface TraceTakeoverSnapshot extends TraceTakeoverDocument {
+interface CurrentTraceTakeoverSnapshot extends TraceTakeoverDocument {
+  format: 'current';
   actualInode: bigint | number;
   actualDevice: bigint | number;
   mtimeMs: number;
 }
+
+interface LegacyTraceTakeoverSnapshot extends TraceLockIdentity {
+  format: 'legacy';
+  createdAt: string;
+  actualInode: bigint | number;
+  actualDevice: bigint | number;
+  mtimeMs: number;
+}
+
+type TraceTakeoverSnapshot = CurrentTraceTakeoverSnapshot | LegacyTraceTakeoverSnapshot;
 
 function waitForLock(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -77,6 +89,7 @@ function parseTraceLockIdentity(value: string): TraceLockIdentity {
     return {
       pid: typeof parsed.pid === 'number' ? parsed.pid : Number.NaN,
       token: typeof parsed.token === 'string' ? parsed.token : '',
+      createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : undefined,
     };
   } catch {
     // Preserve takeover compatibility with locks written by the first F-02
@@ -87,7 +100,13 @@ function parseTraceLockIdentity(value: string): TraceLockIdentity {
 
 async function sameLockIdentity(
   file: string,
-  expected: { inode: bigint | number; device: bigint | number; token: string }
+  expected: {
+    inode: bigint | number;
+    device: bigint | number;
+    token: string;
+    pid?: number;
+    createdAt?: string;
+  }
 ): Promise<boolean> {
   try {
     const handle = await nodeFs.open(file, 'r');
@@ -97,7 +116,11 @@ async function sameLockIdentity(
         handle.readFile('utf8'),
       ]);
       const identity = parseTraceLockIdentity(contents);
-      return stat.ino === expected.inode && stat.dev === expected.device && identity.token === expected.token;
+      return stat.ino === expected.inode
+        && stat.dev === expected.device
+        && identity.token === expected.token
+        && (expected.pid === undefined || identity.pid === expected.pid)
+        && (expected.createdAt === undefined || identity.createdAt === expected.createdAt);
     } finally {
       await handle.close();
     }
@@ -157,9 +180,22 @@ async function readTraceTakeoverSnapshot(takeoverFile: string): Promise<TraceTak
         handle.readFile('utf8'),
       ]);
       const document = parseTraceTakeoverDocument(contents);
-      if (!document || document.inode !== String(stat.ino) || document.device !== String(stat.dev)) return undefined;
+      if (document) {
+        if (document.inode !== String(stat.ino) || document.device !== String(stat.dev)) return undefined;
+        return {
+          ...document,
+          format: 'current',
+          actualInode: stat.ino,
+          actualDevice: stat.dev,
+          mtimeMs: Number(stat.mtimeMs),
+        };
+      }
+      const legacy = parseTraceLockIdentity(contents);
+      if (!Number.isInteger(legacy.pid) || !legacy.token || !legacy.createdAt) return undefined;
       return {
-        ...document,
+        ...legacy,
+        format: 'legacy',
+        createdAt: legacy.createdAt,
         actualInode: stat.ino,
         actualDevice: stat.dev,
         mtimeMs: Number(stat.mtimeMs),
@@ -175,9 +211,12 @@ async function readTraceTakeoverSnapshot(takeoverFile: string): Promise<TraceTak
 async function sameTakeoverIdentity(file: string, expected: TraceTakeoverSnapshot): Promise<boolean> {
   const current = await readTraceTakeoverSnapshot(file);
   return current !== undefined
+    && current.format === expected.format
     && current.actualInode === expected.actualInode
     && current.actualDevice === expected.actualDevice
-    && current.token === expected.token;
+    && current.pid === expected.pid
+    && current.token === expected.token
+    && current.createdAt === expected.createdAt;
 }
 
 function takeoverCandidateFile(takeoverFile: string, pid: number, token: string): string {
@@ -187,7 +226,7 @@ function takeoverCandidateFile(takeoverFile: string, pid: number, token: string)
 async function publishTraceTakeover(
   takeoverFile: string,
   target: TraceLockSnapshot
-): Promise<TraceTakeoverSnapshot | undefined> {
+): Promise<CurrentTraceTakeoverSnapshot | undefined> {
   const token = randomUUID();
   const candidateFile = takeoverCandidateFile(takeoverFile, process.pid, token);
   let handle: FileHandle | undefined;
@@ -218,7 +257,8 @@ async function publishTraceTakeover(
       if (code === 'EEXIST' || code === 'ENOENT') return undefined;
       throw error;
     }
-    return readTraceTakeoverSnapshot(takeoverFile);
+    const published = await readTraceTakeoverSnapshot(takeoverFile);
+    return published?.format === 'current' ? published : undefined;
   } finally {
     await handle?.close().catch(() => undefined);
     await nodeFs.unlink(candidateFile).catch(() => undefined);
@@ -231,6 +271,26 @@ async function recoverOrphanedTraceTakeover(takeoverFile: string): Promise<boole
   const age = Date.now() - takeover.mtimeMs;
   if (age <= TRACE_LOCK_STALE_MS || isProcessAlive(takeover.pid)) return false;
   if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+
+  if (takeover.format === 'legacy') {
+    const lockFile = takeoverFile.slice(0, -'.takeover'.length);
+    const target = await readTraceLockSnapshot(lockFile);
+    if (
+      !target
+      || target.inode !== takeover.actualInode
+      || target.device !== takeover.actualDevice
+      || target.pid !== takeover.pid
+      || target.token !== takeover.token
+      || target.createdAt !== takeover.createdAt
+    ) return false;
+    // Legacy elections from the previous branch head were hard links to the
+    // target lock. Re-open both names immediately before unlinking only the
+    // election name, so a replacement identity survives the race.
+    if (!(await sameLockIdentity(lockFile, target))) return false;
+    if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+    await nodeFs.unlink(takeoverFile).catch(() => undefined);
+    return true;
+  }
 
   const candidateFile = takeoverCandidateFile(takeoverFile, takeover.pid, takeover.token);
   if (await sameTakeoverIdentity(candidateFile, takeover)) {

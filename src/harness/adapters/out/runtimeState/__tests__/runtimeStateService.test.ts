@@ -2,6 +2,7 @@ import * as fs from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
 import { spawn } from 'child_process';
+import { promises as nodeFs } from 'fs';
 import { pathToFileURL } from 'url';
 import {
   HarnessRuntimeStateService,
@@ -219,6 +220,101 @@ describe('HarnessRuntimeStateService', () => {
     expect(await fs.pathExists(lockFile)).toBe(false);
     expect(await fs.pathExists(`${lockFile}.takeover`)).toBe(false);
   }, 30_000);
+
+  it('recovers an aged legacy takeover hardlink owned by a dead process', async () => {
+    const session = await service.createSession({ name: 'legacy-takeover' });
+    const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+    const lockFile = path.join(sessionDir, 'trace.jsonl.lock');
+    const takeoverFile = `${lockFile}.takeover`;
+    await fs.writeJson(lockFile, {
+      pid: 999999,
+      token: 'legacy-dead-token',
+      createdAt: '2000-01-01T00:00:00.000Z',
+    });
+    await fs.link(lockFile, takeoverFile);
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lockFile, old, old);
+
+    await expect(service.appendTrace(session.id, {
+      level: 'info', event: 'legacy.recovered', message: 'continued safely',
+    })).resolves.toMatchObject({ event: 'legacy.recovered' });
+    expect(await fs.pathExists(lockFile)).toBe(false);
+    expect(await fs.pathExists(takeoverFile)).toBe(false);
+  });
+
+  it('does not steal an aged legacy takeover while its owner is alive', async () => {
+    const session = await service.createSession({ name: 'legacy-live-owner' });
+    const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+    const lockFile = path.join(sessionDir, 'trace.jsonl.lock');
+    const takeoverFile = `${lockFile}.takeover`;
+    const identity = {
+      pid: process.pid,
+      token: 'legacy-live-token',
+      createdAt: '2000-01-01T00:00:00.000Z',
+    };
+    await fs.writeJson(lockFile, identity);
+    await fs.link(lockFile, takeoverFile);
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lockFile, old, old);
+
+    const pending = service.appendTrace(session.id, {
+      level: 'info', event: 'after.live.legacy', message: 'waited for owner',
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(await fs.readJson(takeoverFile)).toEqual(identity);
+
+    await fs.unlink(takeoverFile);
+    await fs.unlink(lockFile);
+    await expect(pending).resolves.toMatchObject({ event: 'after.live.legacy' });
+  });
+
+  it('preserves a replacement takeover published during legacy recovery', async () => {
+    const session = await service.createSession({ name: 'legacy-replacement-race' });
+    const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+    const lockFile = path.join(sessionDir, 'trace.jsonl.lock');
+    const takeoverFile = `${lockFile}.takeover`;
+    await fs.writeJson(lockFile, {
+      pid: 999999,
+      token: 'legacy-replaced-token',
+      createdAt: '2000-01-01T00:00:00.000Z',
+    });
+    await fs.link(lockFile, takeoverFile);
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lockFile, old, old);
+
+    const replacement = {
+      pid: process.pid,
+      token: 'live-replacement-token',
+      createdAt: new Date().toISOString(),
+    };
+    let takeoverOpens = 0;
+    let publishReplacement!: () => void;
+    const replacementPublished = new Promise<void>((resolve) => { publishReplacement = resolve; });
+    const originalOpen = nodeFs.open.bind(nodeFs);
+    const openSpy = jest.spyOn(nodeFs, 'open').mockImplementation(async (...args: Parameters<typeof nodeFs.open>) => {
+      if (String(args[0]) === takeoverFile && ++takeoverOpens === 2) {
+        const replacementFile = `${takeoverFile}.replacement`;
+        await fs.writeJson(replacementFile, replacement);
+        await fs.rename(replacementFile, takeoverFile);
+        publishReplacement();
+      }
+      return originalOpen(...args);
+    });
+
+    const pending = service.appendTrace(session.id, {
+      level: 'info', event: 'after.replacement.race', message: 'replacement survived',
+    });
+    try {
+      await replacementPublished;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(await fs.readJson(takeoverFile)).toEqual(replacement);
+    } finally {
+      openSpy.mockRestore();
+      await fs.unlink(takeoverFile).catch(() => undefined);
+      await fs.unlink(lockFile).catch(() => undefined);
+    }
+    await expect(pending).resolves.toMatchObject({ event: 'after.replacement.race' });
+  });
 
   it('recovers when a takeover owner crashes after publishing its election identity', async () => {
     const session = await service.createSession({ name: 'orphaned-takeover-race' });
