@@ -34,6 +34,29 @@ interface TraceFileLock extends TraceLockIdentity {
   device: bigint | number;
 }
 
+interface TraceLockSnapshot extends TraceLockIdentity {
+  inode: bigint | number;
+  device: bigint | number;
+  mtimeMs: number;
+}
+
+interface TraceTakeoverDocument extends TraceLockIdentity {
+  createdAt: string;
+  inode: string;
+  device: string;
+  target: {
+    inode: string;
+    device: string;
+    token: string;
+  };
+}
+
+interface TraceTakeoverSnapshot extends TraceTakeoverDocument {
+  actualInode: bigint | number;
+  actualDevice: bigint | number;
+  mtimeMs: number;
+}
+
 function waitForLock(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
@@ -83,18 +106,49 @@ async function sameLockIdentity(
   }
 }
 
-async function tryTakeOverStaleTraceLock(lockFile: string): Promise<boolean> {
-  const takeoverFile = `${lockFile}.takeover`;
+async function readTraceLockSnapshot(lockFile: string): Promise<TraceLockSnapshot | undefined> {
   try {
-    // link(2) is the atomic election: exactly one waiter creates the fixed
-    // takeover name, and the hard link pins the inode it inspected.
-    await nodeFs.link(lockFile, takeoverFile);
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === 'EEXIST' || code === 'ENOENT') return false;
-    throw error;
+    const handle = await nodeFs.open(lockFile, 'r');
+    try {
+      const [stat, contents] = await Promise.all([
+        handle.stat({ bigint: true }),
+        handle.readFile('utf8'),
+      ]);
+      return {
+        ...parseTraceLockIdentity(contents),
+        inode: stat.ino,
+        device: stat.dev,
+        mtimeMs: Number(stat.mtimeMs),
+      };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
   }
+}
 
+function parseTraceTakeoverDocument(value: string): TraceTakeoverDocument | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<TraceTakeoverDocument>;
+    if (
+      typeof parsed.pid !== 'number'
+      || typeof parsed.token !== 'string'
+      || typeof parsed.createdAt !== 'string'
+      || typeof parsed.inode !== 'string'
+      || typeof parsed.device !== 'string'
+      || !parsed.target
+      || typeof parsed.target.inode !== 'string'
+      || typeof parsed.target.device !== 'string'
+      || typeof parsed.target.token !== 'string'
+    ) return undefined;
+    return parsed as TraceTakeoverDocument;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readTraceTakeoverSnapshot(takeoverFile: string): Promise<TraceTakeoverSnapshot | undefined> {
   try {
     const handle = await nodeFs.open(takeoverFile, 'r');
     try {
@@ -102,23 +156,113 @@ async function tryTakeOverStaleTraceLock(lockFile: string): Promise<boolean> {
         handle.stat({ bigint: true }),
         handle.readFile('utf8'),
       ]);
-      const identity = parseTraceLockIdentity(contents);
-      const age = Date.now() - Number(stat.mtimeMs);
-      const observed = { inode: stat.ino, device: stat.dev, token: identity.token };
-      if (age <= TRACE_LOCK_STALE_MS || isProcessAlive(identity.pid)) return false;
-      if (!(await sameLockIdentity(lockFile, observed))) return false;
-      // No second reaper can race this unlink while the fixed takeover link
-      // exists, and a dead owner cannot replace its own inode/token.
-      await nodeFs.unlink(lockFile);
-      return true;
+      const document = parseTraceTakeoverDocument(contents);
+      if (!document || document.inode !== String(stat.ino) || document.device !== String(stat.dev)) return undefined;
+      return {
+        ...document,
+        actualInode: stat.ino,
+        actualDevice: stat.dev,
+        mtimeMs: Number(stat.mtimeMs),
+      };
     } finally {
       await handle.close();
     }
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    return false;
+  } catch {
+    return undefined;
+  }
+}
+
+async function sameTakeoverIdentity(file: string, expected: TraceTakeoverSnapshot): Promise<boolean> {
+  const current = await readTraceTakeoverSnapshot(file);
+  return current !== undefined
+    && current.actualInode === expected.actualInode
+    && current.actualDevice === expected.actualDevice
+    && current.token === expected.token;
+}
+
+function takeoverCandidateFile(takeoverFile: string, pid: number, token: string): string {
+  return `${takeoverFile}.${pid}.${token}.candidate`;
+}
+
+async function publishTraceTakeover(
+  takeoverFile: string,
+  target: TraceLockSnapshot
+): Promise<TraceTakeoverSnapshot | undefined> {
+  const token = randomUUID();
+  const candidateFile = takeoverCandidateFile(takeoverFile, process.pid, token);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await nodeFs.open(candidateFile, 'wx');
+    const stat = await handle.stat({ bigint: true });
+    const document: TraceTakeoverDocument = {
+      pid: process.pid,
+      token,
+      createdAt: new Date().toISOString(),
+      inode: String(stat.ino),
+      device: String(stat.dev),
+      target: {
+        inode: String(target.inode),
+        device: String(target.device),
+        token: target.token,
+      },
+    };
+    await handle.writeFile(JSON.stringify(document), 'utf8');
+    await handle.sync();
+    try {
+      // Publish a fully-written identity atomically. The candidate and fixed
+      // election name refer to the same inode, so a crash cannot expose a
+      // partially initialized takeover owner.
+      await nodeFs.link(candidateFile, takeoverFile);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOENT') return undefined;
+      throw error;
+    }
+    return readTraceTakeoverSnapshot(takeoverFile);
   } finally {
-    await nodeFs.unlink(takeoverFile).catch(() => undefined);
+    await handle?.close().catch(() => undefined);
+    await nodeFs.unlink(candidateFile).catch(() => undefined);
+  }
+}
+
+async function recoverOrphanedTraceTakeover(takeoverFile: string): Promise<boolean> {
+  const takeover = await readTraceTakeoverSnapshot(takeoverFile);
+  if (!takeover) return false;
+  const age = Date.now() - takeover.mtimeMs;
+  if (age <= TRACE_LOCK_STALE_MS || isProcessAlive(takeover.pid)) return false;
+  if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+
+  const candidateFile = takeoverCandidateFile(takeoverFile, takeover.pid, takeover.token);
+  if (await sameTakeoverIdentity(candidateFile, takeover)) {
+    await nodeFs.unlink(candidateFile).catch(() => undefined);
+  }
+  // Revalidate immediately before removal: a waiter that inspected an old
+  // election must not unlink a replacement published under the fixed name.
+  if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+  await nodeFs.unlink(takeoverFile).catch(() => undefined);
+  return true;
+}
+
+async function tryTakeOverStaleTraceLock(lockFile: string): Promise<boolean> {
+  const takeoverFile = `${lockFile}.takeover`;
+  const target = await readTraceLockSnapshot(lockFile);
+  if (!target || Date.now() - target.mtimeMs <= TRACE_LOCK_STALE_MS || isProcessAlive(target.pid)) return false;
+  const takeover = await publishTraceTakeover(takeoverFile, target);
+  if (!takeover) return false;
+
+  try {
+    if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+    if (!(await sameLockIdentity(lockFile, {
+      inode: target.inode,
+      device: target.device,
+      token: target.token,
+    }))) return false;
+    await nodeFs.unlink(lockFile);
+    return true;
+  } finally {
+    if (await sameTakeoverIdentity(takeoverFile, takeover)) {
+      await nodeFs.unlink(takeoverFile).catch(() => undefined);
+    }
   }
 }
 
@@ -128,6 +272,7 @@ async function acquireTraceFileLock(traceFile: string): Promise<TraceFileLock> {
   const deadline = Date.now() + 10_000;
   while (true) {
     if (await nodeFs.stat(takeoverFile).then(() => true).catch(() => false)) {
+      if (await recoverOrphanedTraceTakeover(takeoverFile)) continue;
       if (Date.now() >= deadline) {
         throw new Error(`Timed out waiting for trace lock takeover: ${path.basename(traceFile)}`);
       }

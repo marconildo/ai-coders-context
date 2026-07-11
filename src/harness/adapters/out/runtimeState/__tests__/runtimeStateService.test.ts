@@ -220,6 +220,108 @@ describe('HarnessRuntimeStateService', () => {
     expect(await fs.pathExists(`${lockFile}.takeover`)).toBe(false);
   }, 30_000);
 
+  it('recovers when a takeover owner crashes after publishing its election identity', async () => {
+    const session = await service.createSession({ name: 'orphaned-takeover-race' });
+    const sessionDir = path.join(tempDir, '.context', 'runtime', 'sessions', session.id);
+    const lockFile = path.join(sessionDir, 'trace.jsonl.lock');
+    const takeoverFile = `${lockFile}.takeover`;
+    await fs.writeJson(lockFile, {
+      pid: 999999,
+      token: 'stale-target-token',
+      createdAt: '2000-01-01T00:00:00.000Z',
+    });
+    const old = new Date(Date.now() - 120_000);
+    await fs.utimes(lockFile, old, old);
+
+    const moduleUrl = pathToFileURL(path.resolve(__dirname, '../runtimeStateService.ts')).href;
+    const holderScript = `
+      const fs = require('fs');
+      const originalLink = fs.promises.link.bind(fs.promises);
+      fs.promises.link = async (source, destination) => {
+        await originalLink(source, destination);
+        if (destination.endsWith('.takeover')) {
+          process.stdout.write('TAKEOVER_READY\\n');
+          await new Promise(() => {});
+        }
+      };
+      (async () => {
+        const loaded = await import(${JSON.stringify(moduleUrl)});
+        const Runtime = loaded.HarnessRuntimeStateService ?? loaded.default?.HarnessRuntimeStateService;
+        await new Runtime({ repoPath: process.argv[1] }).appendTrace(process.argv[2], {
+          level: 'info', event: 'holder.event', message: 'must-not-complete'
+        });
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const holder = spawn(process.execPath, ['--import', 'tsx', '-e', holderScript, tempDir, session.id], {
+      cwd: path.resolve(__dirname, '../../../../../..'),
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    await new Promise<void>((resolve, reject) => {
+      let stdout = '';
+      let stderr = '';
+      holder.stdout.setEncoding('utf8');
+      holder.stderr.setEncoding('utf8');
+      holder.stdout.on('data', (chunk) => {
+        stdout += chunk;
+        if (stdout.includes('TAKEOVER_READY')) resolve();
+      });
+      holder.stderr.on('data', (chunk) => { stderr += chunk; });
+      holder.once('error', reject);
+      holder.once('exit', (code) => reject(new Error(`takeover holder exited early (${code}): ${stderr}`)));
+    });
+    const holderPid = holder.pid;
+    holder.kill('SIGKILL');
+    await new Promise<void>((resolve) => holder.once('exit', () => resolve()));
+
+    const orphaned = await fs.readJson(takeoverFile) as Record<string, unknown>;
+    expect(orphaned).toMatchObject({
+      pid: holderPid,
+      token: expect.any(String),
+      createdAt: expect.any(String),
+      inode: expect.any(String),
+      device: expect.any(String),
+      target: {
+        token: 'stale-target-token',
+        inode: expect.any(String),
+        device: expect.any(String),
+      },
+    });
+    await fs.utimes(takeoverFile, old, old);
+
+    const writerScript = `
+      (async () => {
+        const loaded = await import(${JSON.stringify(moduleUrl)});
+        const Runtime = loaded.HarnessRuntimeStateService ?? loaded.default?.HarnessRuntimeStateService;
+        await new Runtime({ repoPath: process.argv[1] }).appendTrace(process.argv[2], {
+          level: 'info', event: 'recovered.worker', message: 'worker-' + process.argv[3],
+          data: { worker: Number(process.argv[3]) }
+        });
+      })().catch((error) => { console.error(error); process.exitCode = 1; });
+    `;
+    const runWriter = (index: number): Promise<void> => new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['--import', 'tsx', '-e', writerScript, tempDir, session.id, String(index)], {
+        cwd: path.resolve(__dirname, '../../../../../..'),
+        stdio: ['ignore', 'ignore', 'pipe'],
+      });
+      let stderr = '';
+      child.stderr.setEncoding('utf8');
+      child.stderr.on('data', (chunk) => { stderr += chunk; });
+      child.once('error', reject);
+      child.once('exit', (code) => code === 0 ? resolve() : reject(new Error(`writer ${index} failed: ${stderr}`)));
+    });
+    await Promise.all(Array.from({ length: 8 }, (_, index) => runWriter(index)));
+
+    const traceText = await fs.readFile(path.join(sessionDir, 'trace.jsonl'), 'utf8');
+    expect(() => traceText.trim().split('\n').forEach((line) => JSON.parse(line))).not.toThrow();
+    const traces = await service.listTraces(session.id);
+    const recovered = traces.filter((trace) => trace.event === 'recovered.worker');
+    expect(recovered).toHaveLength(8);
+    expect(new Set(recovered.map((trace) => trace.data?.worker)).size).toBe(8);
+    expect(traces.some((trace) => trace.event === 'holder.event')).toBe(false);
+    expect((await fs.readdir(sessionDir)).filter((entry) => entry.includes('.takeover'))).toEqual([]);
+    expect(await fs.pathExists(lockFile)).toBe(false);
+  }, 30_000);
+
   it('uses monotonic segment sequences for same-millisecond rotation and pruning', async () => {
     await fs.outputJson(path.join(tempDir, '.context', 'config', 'hooks.json'), {
       trace: {
