@@ -134,7 +134,11 @@ export class PlanUpdateOrchestrator {
         this.indexProjector.invalidateCache();
         throw new AcceptanceFailedError(
           `Acceptance predicate failed for step ${stepIndex} in ${phaseId} of ${planSlug}` +
-            (run.timedOut ? ' (timed out)' : ` (exit ${run.exitCode ?? 'null'})`),
+            (run.outputLimitExceeded
+              ? ' (outputLimitExceeded)'
+              : run.timedOut
+                ? ' (timed out)'
+                : ` (exit ${run.exitCode ?? 'null'})`),
           run,
           { planSlug, phaseId, stepIndex }
         );

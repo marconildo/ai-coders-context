@@ -1,7 +1,12 @@
 import * as fs from 'fs-extra';
+import { promises as nativeFs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
-import { executeTestsPassing } from '../testsPassing';
+import {
+  executeTestsPassing,
+  readJestResultFile,
+  runShell,
+} from '../testsPassing';
 
 describe('tests-passing sensor', () => {
   let tempDir: string;
@@ -33,6 +38,30 @@ describe('tests-passing sensor', () => {
     const out = result.output as { numPassedTests: number; numFailedTests: number };
     expect(out.numPassedTests).toBe(5);
     expect(out.numFailedTests).toBe(0);
+  });
+
+  it('uses a temporary output file for the default Jest command', async () => {
+    await fs.writeJson(path.join(tempDir, 'package.json'), {
+      scripts: { test: 'node fake-jest.js' },
+    });
+    await fs.writeFile(
+      path.join(tempDir, 'fake-jest.js'),
+      [
+        "const fs = require('fs');",
+        "const outputFlag = process.argv.indexOf('--outputFile');",
+        "const resultPath = process.argv[outputFlag + 1];",
+        'fs.writeFileSync(resultPath, JSON.stringify({',
+        '  numPassedTests: 3, numFailedTests: 0, numTotalTestSuites: 1, testResults: []',
+        '}));',
+        "process.stdout.write('bounded console output');",
+      ].join('\n')
+    );
+
+    const result = await executeTestsPassing(tempDir, { sessionId: 's' });
+
+    expect(result.status).toBe('passed');
+    expect(result.output).toEqual(expect.objectContaining({ numPassedTests: 3 }));
+    expect(result.details).toEqual(expect.objectContaining({ command: 'npm' }));
   });
 
   it('fails when jest JSON reports failed tests and captures failure names', async () => {
@@ -86,5 +115,74 @@ describe('tests-passing sensor', () => {
     });
     expect(bad.status).toBe('failed');
     expect(bad.summary).toContain('exit 2');
+  });
+
+  it('bounds both console streams while retaining counters', async () => {
+    const result = await runShell(
+      nodeScript('process.stdout.write("a".repeat(1000)); process.stderr.write("b".repeat(800))'),
+      tempDir,
+      5_000,
+      { tailBytes: 32 }
+    );
+
+    expect(Buffer.byteLength(result.stdoutTail)).toBe(32);
+    expect(Buffer.byteLength(result.stderrTail)).toBe(32);
+    expect(result.stdoutBytes).toBe(1000);
+    expect(result.stderrBytes).toBe(800);
+    expect(result.outputTruncated).toBe(true);
+  });
+
+  it('fails with a stable reason when output exceeds the hard limit', async () => {
+    const result = await executeTestsPassing(tempDir, {
+      sessionId: 's',
+      context: {
+        kind: 'exit-code',
+        testCommand: nodeScript(
+          'const c="x".repeat(4096); for(let i=0;i<10000;i++) process.stdout.write(c)'
+        ),
+        tailBytes: 128,
+        hardOutputLimitBytes: 32 * 1024,
+      },
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.summary).toContain('outputLimitExceeded');
+    expect(result.details).toEqual(expect.objectContaining({
+      outputLimitExceeded: true,
+      terminationReason: 'outputLimit',
+      outputTruncated: true,
+    }));
+  });
+
+  it('reports timeout and spawn error termination paths', async () => {
+    const timedOut = await executeTestsPassing(tempDir, {
+      sessionId: 's',
+      context: {
+        kind: 'exit-code',
+        testCommand: nodeScript('setTimeout(() => {}, 5000)'),
+        timeoutMs: 50,
+      },
+    });
+    expect(timedOut.summary).toMatch(/timed out/);
+    expect(timedOut.details).toEqual(expect.objectContaining({ terminationReason: 'timeout' }));
+
+    const spawnError = await executeTestsPassing(tempDir, {
+      sessionId: 's',
+      context: { kind: 'exit-code', testCommand: ['definitely-not-a-real-command-dotcontext'] },
+    });
+    expect(spawnError.summary).toMatch(/spawn error/);
+    expect(spawnError.details).toEqual(expect.objectContaining({ terminationReason: 'spawnError' }));
+  });
+
+  it('rejects oversized and malformed Jest result files before parsing', async () => {
+    const oversized = path.join(tempDir, 'oversized.json');
+    const handle = await nativeFs.open(oversized, 'w');
+    await handle.truncate(32 * 1024 * 1024 + 1);
+    await handle.close();
+    await expect(readJestResultFile(oversized)).resolves.toEqual({ status: 'resultFileTooLarge' });
+
+    const malformed = path.join(tempDir, 'malformed.json');
+    await fs.writeFile(malformed, '{not-json');
+    await expect(readJestResultFile(malformed)).resolves.toEqual({ status: 'malformed' });
   });
 });
