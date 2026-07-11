@@ -83,6 +83,76 @@ describe('hook trace policy', () => {
     expect(unknown.capture.truncatedFieldCount).toBe(1);
   });
 
+  it('omits pathological unknown key names and enforces the hook quota before persistence', () => {
+    const secretInKey = `secret-key-material-${'private-key-fragment-'.repeat(20_000)}`;
+    const data = sanitizeHookTraceData('CustomTool', {
+      [secretInKey]: 'private-value-that-must-not-survive',
+      stable: true,
+    });
+    const serialized = JSON.stringify(data);
+
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(DEFAULT_HOOK_TRACE_POLICY.maxSerializedTraceBytes);
+    expect(serialized).not.toContain('private-key-fragment');
+    expect(serialized).not.toContain('private-value-that-must-not-survive');
+    expect(serialized).not.toContain('secret-key-material');
+    expect(data.tool_input).toMatchObject({ __redactedKey1: '[REDACTED]', stable: true });
+    expect(data.capture).toMatchObject({
+      persistedBytes: Buffer.byteLength(serialized, 'utf8'),
+      redactedFieldCount: 1,
+      quotaStatus: 'within_limit',
+    });
+  });
+
+  it('collapses deep and wide unknown payloads to stable quota metadata', () => {
+    const policy = {
+      ...DEFAULT_HOOK_TRACE_POLICY,
+      maxStringBytes: 4096,
+      maxArrayItems: 100,
+      maxObjectDepth: 8,
+      maxSerializedTraceBytes: 1024,
+    };
+    let deep: Record<string, unknown> = { leaf: 'do-not-persist-'.repeat(500) };
+    for (let depth = 0; depth < 20; depth += 1) deep = { nested: deep };
+    const wide = Object.fromEntries(Array.from(
+      { length: 200 },
+      (_, index) => [`field-${index}`, { deep, value: 'sensitive-body-'.repeat(500) }]
+    ));
+
+    const first = sanitizeHookTraceData('UnknownTool', wide, policy);
+    const second = sanitizeHookTraceData('UnknownTool', wide, policy);
+    const serialized = JSON.stringify(first);
+
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(policy.maxSerializedTraceBytes);
+    expect(serialized).not.toContain('do-not-persist');
+    expect(serialized).not.toContain('sensitive-body');
+    expect(first.tool_input).toEqual({
+      valuesOmitted: true,
+      inputKeyCount: 200,
+      quota: 'max_serialized_hook_trace_bytes',
+    });
+    expect(first.capture).toEqual(second.capture);
+    expect(first.capture.persistedBytes).toBe(Buffer.byteLength(serialized, 'utf8'));
+    expect(first.capture.quotaStatus).toBe('truncated');
+    expect(first.capture.truncatedFieldCount).toBeGreaterThan(0);
+  });
+
+  it.each(['Write', 'Edit', 'Bash'])('bounds allowlisted metadata for known %s tools', (toolName) => {
+    const marker = `must-not-survive-${'x'.repeat(100_000)}`;
+    const input = toolName === 'Write'
+      ? { file_path: marker, content: 'source body' }
+      : toolName === 'Edit'
+        ? { file_path: marker, old_string: 'old body', new_string: 'new body' }
+        : { command: marker };
+
+    const data = sanitizeHookTraceData(toolName, input);
+    const serialized = JSON.stringify(data);
+
+    expect(Buffer.byteLength(serialized, 'utf8')).toBeLessThanOrEqual(DEFAULT_HOOK_TRACE_POLICY.maxSerializedTraceBytes);
+    expect(serialized).not.toContain('x'.repeat(1000));
+    expect(data.capture.persistedBytes).toBe(Buffer.byteLength(serialized, 'utf8'));
+    expect(data.capture.truncatedFieldCount).toBeGreaterThan(0);
+  });
+
   it('falls back to defaults and clamps malformed or unsafe configuration', () => {
     expect(parseHookTracePolicy({ maxInputBytes: 'huge' }).maxInputBytes)
       .toBe(DEFAULT_HOOK_STDIN_MAX_BYTES);

@@ -104,15 +104,13 @@ export function buildHookTraceData(
   options: { policy?: HookTracePolicy; repoPath?: string } = {}
 ): Record<string, unknown> {
   const policy = options.policy ?? loadHookTracePolicy(options.repoPath);
-  const data: Record<string, unknown> = sanitizeHookTraceData(toolName, toolInput, policy);
-  if (toolName?.trim().toLowerCase() !== 'bash') {
-    return data;
-  }
-
-  const classification = classifyBashCommand(extractBashCommand(toolInput));
-  if (classification) {
-    data.classification = classification;
-  }
-
-  return data;
+  const classification = toolName?.trim().toLowerCase() === 'bash'
+    ? classifyBashCommand(extractBashCommand(toolInput))
+    : undefined;
+  return sanitizeHookTraceData(
+    toolName,
+    toolInput,
+    policy,
+    classification ? { classification } : {}
+  );
 }

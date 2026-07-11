@@ -231,6 +231,54 @@ interface SanitizeState {
   truncatedFieldCount: number;
 }
 
+interface SafeKeyName {
+  key: string;
+  keyBytes: number;
+  redacted: boolean;
+  truncated: boolean;
+}
+
+function safeKeyName(key: string, index: number, policy: HookTracePolicy): SafeKeyName {
+  const keyBytes = Buffer.byteLength(key, 'utf8');
+  if (SENSITIVE_KEY.test(key)) {
+    return { key: `__redactedKey${index + 1}`, keyBytes, redacted: true, truncated: false };
+  }
+  if (keyBytes > policy.maxStringBytes) {
+    return { key: `__omittedKey${index + 1}`, keyBytes, redacted: false, truncated: true };
+  }
+  return { key, keyBytes, redacted: false, truncated: false };
+}
+
+function uniqueSafeKey(result: Record<string, unknown>, preferred: string, index: number): string {
+  if (!(preferred in result)) return preferred;
+  let suffix = index + 1;
+  while (`__field${suffix}` in result) suffix += 1;
+  return `__field${suffix}`;
+}
+
+function summarizeKeyList(
+  value: Record<string, unknown>,
+  policy: HookTracePolicy,
+  state: SanitizeState,
+  recordMetrics = true
+): Array<string | { keyOmitted: true; keyBytes: number }> {
+  const keys = Object.keys(value);
+  const selected = keys.slice(0, policy.maxArrayItems);
+  if (selected.length < keys.length) state.truncatedFieldCount += 1;
+  return selected.map((key, index) => {
+    const safe = safeKeyName(key, index, policy);
+    if (safe.redacted) {
+      if (recordMetrics) state.redactedFieldCount += 1;
+      return '[REDACTED_KEY]';
+    }
+    if (safe.truncated) {
+      if (recordMetrics) state.truncatedFieldCount += 1;
+      return { keyOmitted: true, keyBytes: safe.keyBytes };
+    }
+    return safe.key;
+  });
+}
+
 function summarizeUnknown(
   value: unknown,
   policy: HookTracePolicy,
@@ -259,27 +307,44 @@ function summarizeUnknown(
   }
   if (depth >= policy.maxObjectDepth) {
     state.truncatedFieldCount += 1;
-    return { keys: Object.keys(value).slice(0, policy.maxArrayItems), valuesOmitted: true };
+    return { keys: summarizeKeyList(value, policy, state), valuesOmitted: true };
   }
 
   const result: Record<string, unknown> = {};
   const entries = Object.entries(value).slice(0, policy.maxArrayItems);
   if (entries.length < Object.keys(value).length) state.truncatedFieldCount += 1;
-  for (const [key, child] of entries) {
-    if (SENSITIVE_KEY.test(key)) {
-      result[key] = '[REDACTED]';
+  for (const [index, [key, child]] of entries.entries()) {
+    const safe = safeKeyName(key, index, policy);
+    const outputKey = uniqueSafeKey(result, safe.key, index);
+    if (safe.redacted) {
+      result[outputKey] = '[REDACTED]';
       state.redactedFieldCount += 1;
+    } else if (safe.truncated) {
+      result[outputKey] = {
+        keyOmitted: true,
+        keyBytes: safe.keyBytes,
+        value: summarizeUnknown(child, policy, state, depth + 1),
+      };
+      state.truncatedFieldCount += 1;
     } else {
-      result[key] = summarizeUnknown(child, policy, state, depth + 1);
+      result[outputKey] = summarizeUnknown(child, policy, state, depth + 1);
     }
   }
   return result;
 }
 
-function summarizeWrite(input: Record<string, unknown>): Record<string, unknown> {
+function boundedMetadataString(value: string | undefined, policy: HookTracePolicy, state: SanitizeState): string | undefined {
+  if (value === undefined) return undefined;
+  const bounded = truncateUtf8(value, policy.maxStringBytes);
+  if (bounded.truncated) state.truncatedFieldCount += 1;
+  return bounded.truncated ? `${bounded.value}…[truncated]` : bounded.value;
+}
+
+function summarizeWrite(input: Record<string, unknown>, policy: HookTracePolicy, state: SanitizeState): Record<string, unknown> {
   const content = typeof input.content === 'string' ? input.content : undefined;
+  const filePath = boundedMetadataString(firstString(input, PATH_KEYS), policy, state);
   return {
-    ...(firstString(input, PATH_KEYS) ? { filePath: firstString(input, PATH_KEYS) } : {}),
+    ...(filePath ? { filePath } : {}),
     ...(typeof input.byte_length === 'number' ? { declaredByteLength: input.byte_length } : {}),
     ...(content !== undefined ? {
       contentBytes: Buffer.byteLength(content, 'utf8'),
@@ -289,15 +354,16 @@ function summarizeWrite(input: Record<string, unknown>): Record<string, unknown>
   };
 }
 
-function summarizeEdit(input: Record<string, unknown>): Record<string, unknown> {
+function summarizeEdit(input: Record<string, unknown>, policy: HookTracePolicy, state: SanitizeState): Record<string, unknown> {
   const oldString = firstString(input, ['old_string', 'oldString']);
   const newString = firstString(input, ['new_string', 'newString']);
   const rangeKeys = ['start_line', 'end_line', 'startLine', 'endLine', 'line', 'column'];
   const range = Object.fromEntries(rangeKeys
     .filter((key) => typeof input[key] === 'number')
     .map((key) => [key, input[key]]));
+  const filePath = boundedMetadataString(firstString(input, PATH_KEYS), policy, state);
   return {
-    ...(firstString(input, PATH_KEYS) ? { filePath: firstString(input, PATH_KEYS) } : {}),
+    ...(filePath ? { filePath } : {}),
     ...(oldString !== undefined ? {
       oldStringBytes: Buffer.byteLength(oldString, 'utf8'),
       oldStringHash: hashText(oldString),
@@ -319,8 +385,9 @@ function summarizeBash(input: Record<string, unknown>, policy: HookTracePolicy, 
   state.redactedFieldCount += redactedCommand.redacted;
   const preview = truncateUtf8(redactedCommand.value, policy.maxStringBytes);
   if (preview.truncated) state.truncatedFieldCount += 1;
+  const basename = boundedMetadataString(commandBasename(command), policy, state);
   return {
-    commandBasename: commandBasename(command),
+    ...(basename ? { commandBasename: basename } : {}),
     commandBytes: Buffer.byteLength(command, 'utf8'),
     commandPreview: preview.truncated ? `${preview.value}…[truncated]` : preview.value,
   };
@@ -329,7 +396,8 @@ function summarizeBash(input: Record<string, unknown>, policy: HookTracePolicy, 
 export function sanitizeHookTraceData(
   toolName: string | undefined,
   toolInput: unknown,
-  policy: HookTracePolicy = DEFAULT_HOOK_TRACE_POLICY
+  policy: HookTracePolicy = DEFAULT_HOOK_TRACE_POLICY,
+  additionalData: Record<string, string | number | boolean> = {}
 ): SanitizedHookTraceData {
   const state: SanitizeState = { redactedFieldCount: 0, truncatedFieldCount: 0 };
   const normalizedTool = toolName?.trim().toLowerCase();
@@ -337,10 +405,10 @@ export function sanitizeHookTraceData(
   let summary: Record<string, unknown>;
   if (normalizedTool === 'write') {
     state.redactedFieldCount = countSensitiveFields(input, policy);
-    summary = summarizeWrite(input);
+    summary = summarizeWrite(input, policy, state);
   } else if (normalizedTool === 'edit') {
     state.redactedFieldCount = countSensitiveFields(input, policy);
-    summary = summarizeEdit(input);
+    summary = summarizeEdit(input, policy, state);
   } else if (normalizedTool === 'bash') {
     state.redactedFieldCount = countSensitiveFields(input, policy);
     summary = summarizeBash(input, policy, state);
@@ -349,6 +417,7 @@ export function sanitizeHookTraceData(
   }
 
   const result: SanitizedHookTraceData = {
+    ...additionalData,
     tool_input: summary,
     capture: {
       inputBytes: byteLength(toolInput),
@@ -358,7 +427,7 @@ export function sanitizeHookTraceData(
       quotaStatus: 'within_limit',
     },
   };
-  for (let iteration = 0; iteration < 4; iteration += 1) {
+  for (let iteration = 0; iteration < 8; iteration += 1) {
     const persistedBytes = byteLength(result);
     if (result.capture.persistedBytes === persistedBytes) break;
     result.capture.persistedBytes = persistedBytes;
@@ -366,12 +435,28 @@ export function sanitizeHookTraceData(
 
   if (byteLength(result) > policy.maxSerializedTraceBytes) {
     result.tool_input = {
-      keys: Object.keys(input).slice(0, policy.maxArrayItems),
+      keys: summarizeKeyList(input, policy, state, false),
       valuesOmitted: true,
+    };
+    result.capture.redactedFieldCount = state.redactedFieldCount;
+    result.capture.truncatedFieldCount = state.truncatedFieldCount + 1;
+    result.capture.quotaStatus = 'truncated';
+    for (let iteration = 0; iteration < 8; iteration += 1) {
+      const persistedBytes = byteLength(result);
+      if (result.capture.persistedBytes === persistedBytes) break;
+      result.capture.persistedBytes = persistedBytes;
+    }
+  }
+
+  if (byteLength(result) > policy.maxSerializedTraceBytes) {
+    result.tool_input = {
+      valuesOmitted: true,
+      inputKeyCount: Object.keys(input).length,
+      quota: 'max_serialized_hook_trace_bytes',
     };
     result.capture.truncatedFieldCount += 1;
     result.capture.quotaStatus = 'truncated';
-    for (let iteration = 0; iteration < 4; iteration += 1) {
+    for (let iteration = 0; iteration < 8; iteration += 1) {
       const persistedBytes = byteLength(result);
       if (result.capture.persistedBytes === persistedBytes) break;
       result.capture.persistedBytes = persistedBytes;
