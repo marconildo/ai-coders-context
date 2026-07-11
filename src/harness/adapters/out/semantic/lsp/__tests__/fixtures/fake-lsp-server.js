@@ -1,14 +1,22 @@
 'use strict';
 
 const fs = require('fs');
+const { spawn } = require('child_process');
+const { once } = require('events');
 
 const mode = process.argv[2] || 'normal';
 const pidFile = process.argv[3];
 const attackSize = Number(process.argv[4]) || 4096;
 if (pidFile) fs.appendFileSync(pidFile, `${process.pid}\n`);
 
-if (mode === 'ignore-shutdown') {
+if (mode.startsWith('ignore-shutdown') || mode === 'signal-ignoring-descendant') {
   process.on('SIGTERM', () => {});
+}
+
+if (mode === 'ignore-shutdown-with-descendant') {
+  spawn(process.execPath, [__filename, 'signal-ignoring-descendant', pidFile], {
+    stdio: ['ignore', 'inherit', 'inherit'],
+  });
 }
 
 let input = Buffer.alloc(0);
@@ -16,6 +24,21 @@ let input = Buffer.alloc(0);
 function send(message) {
   const content = JSON.stringify(message);
   process.stdout.write(`Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`);
+}
+
+async function sendFragmented(message, chunkSize = 1024) {
+  const content = JSON.stringify(message);
+  const frame = Buffer.from(
+    `Content-Length: ${Buffer.byteLength(content)}\r\n\r\n${content}`
+  );
+  for (let offset = 0; offset < frame.length; offset += chunkSize) {
+    const chunk = frame.subarray(offset, Math.min(offset + chunkSize, frame.length));
+    if (!process.stdout.write(chunk)) await once(process.stdout, 'drain');
+    // Keep writes observably fragmented instead of filling the pipe in one turn.
+    if (offset > 0 && offset % (chunkSize * 64) === 0) {
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+  }
 }
 
 function respond(message) {
@@ -32,6 +55,12 @@ function respond(message) {
       process.exit(19);
     } else if (mode === 'reject-initialize') {
       send({ jsonrpc: '2.0', id: message.id, error: { code: -32002, message: 'initialize rejected' } });
+    } else if (mode === 'fragmented-large-initialize') {
+      void sendFragmented({
+        jsonrpc: '2.0',
+        id: message.id,
+        result: { capabilities: {}, padding: 'x'.repeat(attackSize) },
+      });
     } else if (mode !== 'timeout-initialize') {
       send({ jsonrpc: '2.0', id: message.id, result: { capabilities: {} } });
     }
@@ -39,14 +68,14 @@ function respond(message) {
   }
 
   if (message.method === 'shutdown') {
-    if (mode !== 'ignore-shutdown') {
+    if (!mode.startsWith('ignore-shutdown')) {
       send({ jsonrpc: '2.0', id: message.id, result: null });
     }
     return;
   }
 
   if (message.method === 'exit') {
-    if (mode !== 'ignore-shutdown') process.exit(0);
+    if (!mode.startsWith('ignore-shutdown')) process.exit(0);
     return;
   }
 

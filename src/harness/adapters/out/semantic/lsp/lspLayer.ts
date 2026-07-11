@@ -5,7 +5,7 @@
  * initialization and shutdown state therefore cannot leak across servers.
  */
 
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import { createHash } from 'crypto';
 import * as path from 'path';
 import {
@@ -58,15 +58,138 @@ interface ServerHandle {
   stopping?: Promise<void>;
   pendingRequests: Map<number, PendingRequest>;
   timers: Set<NodeJS.Timeout>;
-  buffer: Buffer;
+  receiver: LSPFrameAccumulator;
   startedAt: number;
   terminationReason?: string;
   forcedKill: boolean;
+  exited: boolean;
   closed: boolean;
-  closePromise: Promise<void>;
-  resolveClose: () => void;
   exitCode?: number | null;
   exitSignal?: NodeJS.Signals | null;
+}
+
+/**
+ * Incrementally assembles one LSP frame without repeatedly copying all bytes
+ * received so far. Header segments are joined once after the delimiter and
+ * body bytes are copied directly into their final, bounded allocation.
+ */
+class LSPFrameAccumulator {
+  private readonly headerSegments: Buffer[] = [];
+  private headerLength = 0;
+  private headerDelimiterMatch = 0;
+  private body?: Buffer;
+  private bodyOffset = 0;
+
+  constructor(
+    private readonly maxHeaderBytes: number,
+    private readonly maxBodyBytes: number,
+    private readonly maxReceiveBufferBytes: number
+  ) {}
+
+  get bufferedByteLength(): number {
+    return this.headerLength + this.bodyOffset;
+  }
+
+  accept(data: Buffer, onFrame: (body: Buffer) => void): string | undefined {
+    let offset = 0;
+
+    while (offset < data.length) {
+      if (this.body) {
+        const copyLength = Math.min(data.length - offset, this.body.length - this.bodyOffset);
+        data.copy(this.body, this.bodyOffset, offset, offset + copyLength);
+        offset += copyLength;
+        this.bodyOffset += copyLength;
+
+        if (this.bodyOffset === this.body.length) {
+          const completedBody = this.body;
+          this.body = undefined;
+          this.bodyOffset = 0;
+          onFrame(completedBody);
+        }
+        continue;
+      }
+
+      const segmentStart = offset;
+      let foundHeader = false;
+      while (offset < data.length) {
+        const byte = data[offset++];
+        this.headerLength += 1;
+        this.headerDelimiterMatch = this.nextDelimiterMatch(
+          this.headerDelimiterMatch,
+          byte
+        );
+
+        if (this.headerDelimiterMatch === 4) {
+          this.headerSegments.push(data.subarray(segmentStart, offset));
+          foundHeader = true;
+          break;
+        }
+
+        // Bytes matching the start of CRLFCRLF may still be the delimiter and
+        // therefore are not counted as header content until the match fails.
+        if (this.headerLength - this.headerDelimiterMatch > this.maxHeaderBytes) {
+          return 'incomplete header limit exceeded';
+        }
+        if (this.headerLength > this.maxReceiveBufferBytes) {
+          return 'receive buffer limit exceeded';
+        }
+      }
+
+      if (!foundHeader) {
+        this.headerSegments.push(data.subarray(segmentStart, offset));
+        return undefined;
+      }
+
+      const headerEnd = this.headerLength - 4;
+      if (headerEnd > this.maxHeaderBytes) return 'header limit exceeded';
+      const headerBuffer = Buffer.concat(this.headerSegments, this.headerLength);
+      const header = headerBuffer.subarray(0, headerEnd).toString('ascii');
+      const contentLengthHeaders = header
+        .split('\r\n')
+        .filter((line) => /^Content-Length:/i.test(line));
+      if (contentLengthHeaders.length !== 1) {
+        return 'expected exactly one Content-Length header';
+      }
+      const rawContentLength = contentLengthHeaders[0]
+        .slice(contentLengthHeaders[0].indexOf(':') + 1)
+        .trim();
+      if (!/^[0-9]+$/.test(rawContentLength)) return 'invalid Content-Length';
+
+      const contentLength = Number(rawContentLength);
+      if (
+        !Number.isSafeInteger(contentLength) ||
+        contentLength <= 0 ||
+        contentLength > this.maxBodyBytes
+      ) {
+        return 'Content-Length exceeds body limit';
+      }
+      if (this.headerLength + contentLength > this.maxReceiveBufferBytes) {
+        return 'frame exceeds receive buffer limit';
+      }
+
+      this.headerSegments.length = 0;
+      this.headerLength = 0;
+      this.headerDelimiterMatch = 0;
+      this.body = Buffer.allocUnsafe(contentLength);
+      this.bodyOffset = 0;
+    }
+
+    return undefined;
+  }
+
+  reset(): void {
+    this.headerSegments.length = 0;
+    this.headerLength = 0;
+    this.headerDelimiterMatch = 0;
+    this.body = undefined;
+    this.bodyOffset = 0;
+  }
+
+  private nextDelimiterMatch(current: number, byte: number): number {
+    const delimiter = [13, 10, 13, 10];
+    if (byte === delimiter[current]) return current + 1;
+    return byte === delimiter[0] ? 1 : 0;
+  }
 }
 
 export interface LSPLayerOptions {
@@ -165,14 +288,14 @@ export class LSPLayer {
     const config = this.serverConfigs[language];
     if (!config) return false;
 
-    let resolveClose!: () => void;
-    const closePromise = new Promise<void>((resolve) => {
-      resolveClose = resolve;
-    });
     const child = spawn(config.command, config.args, {
       cwd: projectPath,
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
+      // A dedicated POSIX process group lets the owner terminate launchers and
+      // every descendant they create. Windows uses taskkill /T below.
+      detached: process.platform !== 'win32',
+      windowsHide: true,
     });
 
     const handle: ServerHandle = {
@@ -184,12 +307,15 @@ export class LSPLayer {
       initialization: Promise.resolve(false),
       pendingRequests: new Map(),
       timers: new Set(),
-      buffer: Buffer.alloc(0),
+      receiver: new LSPFrameAccumulator(
+        this.maxHeaderBytes,
+        this.maxBodyBytes,
+        this.maxReceiveBufferBytes
+      ),
       startedAt: Date.now(),
       forcedKill: false,
+      exited: false,
       closed: false,
-      closePromise,
-      resolveClose,
     };
 
     // Publish the owner before any asynchronous event can act on the process.
@@ -231,15 +357,21 @@ export class LSPLayer {
           exitSignal: signal,
         });
         this.rejectPending(handle, new Error(`LSP server ${handle.language} disconnected`));
-        this.releaseHandle(handle);
+        // The direct launcher may have left descendants in its process group.
+        // Termination remains authoritative even after the launcher closes.
+        void this.terminateHandle(handle, handle.terminationReason);
       }
+    });
+    handle.process.once('exit', (code, signal) => {
+      handle.exited = true;
+      handle.exitCode = code;
+      handle.exitSignal = signal;
     });
   }
 
   private markClosed(handle: ServerHandle): void {
     if (handle.closed) return;
     handle.closed = true;
-    handle.resolveClose();
   }
 
   private async initializeHandle(handle: ServerHandle): Promise<boolean> {
@@ -313,66 +445,14 @@ export class LSPLayer {
 
   private handleServerData(handle: ServerHandle, data: Buffer): void {
     if (handle.state === 'stopping' || handle.state === 'stopped') return;
-    if (data.length > this.maxReceiveBufferBytes - handle.buffer.length) {
-      this.failProtocol(handle, 'receive buffer limit exceeded');
-      return;
-    }
-    handle.buffer = Buffer.concat([handle.buffer, data]);
-
-    while (true) {
-      const headerEnd = handle.buffer.indexOf('\r\n\r\n');
-      if (headerEnd < 0) {
-        if (handle.buffer.length > this.maxHeaderBytes) {
-          this.failProtocol(handle, 'incomplete header limit exceeded');
-        }
-        return;
-      }
-      if (headerEnd > this.maxHeaderBytes) {
-        this.failProtocol(handle, 'header limit exceeded');
-        return;
-      }
-      const header = handle.buffer.subarray(0, headerEnd).toString('ascii');
-      const contentLengthHeaders = header
-        .split('\r\n')
-        .filter((line) => /^Content-Length:/i.test(line));
-      if (contentLengthHeaders.length !== 1) {
-        this.failProtocol(handle, 'expected exactly one Content-Length header');
-        return;
-      }
-      const rawContentLength = contentLengthHeaders[0].slice(
-        contentLengthHeaders[0].indexOf(':') + 1
-      ).trim();
-      if (!/^[0-9]+$/.test(rawContentLength)) {
-        this.failProtocol(handle, 'invalid Content-Length');
-        return;
-      }
-      const contentLength = Number(rawContentLength);
-      if (
-        !Number.isSafeInteger(contentLength) ||
-        contentLength <= 0 ||
-        contentLength > this.maxBodyBytes
-      ) {
-        this.failProtocol(handle, 'Content-Length exceeds body limit');
-        return;
-      }
-      const bodyStart = headerEnd + 4;
-      if (bodyStart + contentLength > this.maxReceiveBufferBytes) {
-        this.failProtocol(handle, 'frame exceeds receive buffer limit');
-        return;
-      }
-      if (handle.buffer.length < bodyStart + contentLength) return;
-
-      const body = handle.buffer.subarray(bodyStart, bodyStart + contentLength);
-      const remainingStart = bodyStart + contentLength;
-      handle.buffer = remainingStart === handle.buffer.length
-        ? Buffer.alloc(0)
-        : Buffer.from(handle.buffer.subarray(remainingStart));
+    const error = handle.receiver.accept(data, (body) => {
       try {
         this.handleMessage(handle, JSON.parse(body.toString('utf8')) as LSPMessage);
       } catch {
         // Malformed server messages are ignored without affecting another handle.
       }
-    }
+    });
+    if (error) this.failProtocol(handle, error);
   }
 
   private failProtocol(handle: ServerHandle, detail: string): void {
@@ -383,7 +463,7 @@ export class LSPLayer {
     ) return;
 
     const reason = `protocol overflow: ${detail}`;
-    handle.buffer = Buffer.alloc(0);
+    handle.receiver.reset();
     handle.terminationReason = reason;
     handle.state = 'failed';
     this.failedCircuits.add(handle.key);
@@ -465,15 +545,18 @@ export class LSPLayer {
       this.rejectPending(handle, new Error(`LSP server ${handle.language} terminated: ${reason}`));
       handle.process.stdin?.end();
 
-      if (!handle.closed) {
+      if (this.processTreeIsAlive(handle)) {
         const exitedNaturally =
-          waitForNaturalExit && (await this.waitForClose(handle, this.terminationGraceMs));
+          waitForNaturalExit &&
+          (await this.waitForProcessTreeExit(handle, this.terminationGraceMs));
         if (!exitedNaturally) {
-          this.signal(handle, 'SIGTERM');
-          if (!(await this.waitForClose(handle, this.terminationGraceMs))) {
+          await this.signalProcessTree(handle, 'SIGTERM');
+          if (!(await this.waitForProcessTreeExit(handle, this.terminationGraceMs))) {
             handle.forcedKill = true;
-            this.signal(handle, 'SIGKILL');
-            await handle.closePromise;
+            await this.signalProcessTree(handle, 'SIGKILL');
+            // Some descendants inherit the server's stdio and can prevent the
+            // ChildProcess `close` event. Never await it without a deadline.
+            await this.waitForProcessTreeExit(handle, this.terminationGraceMs);
           }
         }
       }
@@ -490,8 +573,27 @@ export class LSPLayer {
     return handle.stopping;
   }
 
-  private signal(handle: ServerHandle, signal: NodeJS.Signals): void {
-    if (handle.closed || !handle.process.pid) return;
+  private async signalProcessTree(
+    handle: ServerHandle,
+    signal: 'SIGTERM' | 'SIGKILL'
+  ): Promise<void> {
+    const pid = handle.process.pid;
+    if (!pid) return;
+
+    if (process.platform === 'win32') {
+      await this.taskkill(pid, signal === 'SIGKILL');
+      return;
+    }
+
+    try {
+      // Negative PID targets the dedicated group created with detached=true.
+      process.kill(-pid, signal);
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return;
+    }
+
+    // Fall back to the direct child if group signalling is unavailable.
     try {
       handle.process.kill(signal);
     } catch {
@@ -499,15 +601,44 @@ export class LSPLayer {
     }
   }
 
-  private waitForClose(handle: ServerHandle, timeoutMs: number): Promise<boolean> {
-    if (handle.closed) return Promise.resolve(true);
+  private taskkill(pid: number, force: boolean): Promise<void> {
     return new Promise((resolve) => {
-      const timeout = this.setHandleTimeout(handle, () => resolve(false), timeoutMs);
-      handle.closePromise.then(() => {
-        this.clearHandleTimeout(handle, timeout);
-        resolve(true);
-      });
+      const args = ['/PID', String(pid), '/T'];
+      if (force) args.push('/F');
+      execFile(
+        'taskkill',
+        args,
+        { windowsHide: true, timeout: Math.max(100, this.terminationGraceMs) },
+        () => resolve()
+      );
     });
+  }
+
+  private processTreeIsAlive(handle: ServerHandle): boolean {
+    const pid = handle.process.pid;
+    if (!pid) return false;
+    if (process.platform === 'win32') return !handle.exited;
+    try {
+      process.kill(-pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  }
+
+  private async waitForProcessTreeExit(
+    handle: ServerHandle,
+    timeoutMs: number
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (this.processTreeIsAlive(handle)) {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) return false;
+      await new Promise<void>((resolve) => {
+        this.setHandleTimeout(handle, resolve, Math.min(25, remaining));
+      });
+    }
+    return true;
   }
 
   private setHandleTimeout(
@@ -533,7 +664,7 @@ export class LSPLayer {
     this.rejectPending(handle, new Error(`LSP server ${handle.language} released`));
     for (const timer of handle.timers) clearTimeout(timer);
     handle.timers.clear();
-    handle.buffer = Buffer.alloc(0);
+    handle.receiver.reset();
     handle.process.stdin?.removeAllListeners();
     handle.process.stdout?.removeAllListeners();
     handle.process.stderr?.removeAllListeners();

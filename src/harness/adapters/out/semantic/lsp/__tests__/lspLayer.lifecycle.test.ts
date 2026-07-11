@@ -2,7 +2,12 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import type { ChildProcess } from 'child_process';
-import { LSPLayer, LSPLayerOptions, LSPLifecycleEvent } from '../lspLayer';
+import {
+  LSPLayer,
+  LSPLayerOptions,
+  LSPLifecycleEvent,
+  MAX_LSP_BODY_BYTES,
+} from '../lspLayer';
 import type { LSPServerConfig } from '../../types';
 
 const FIXTURE = path.join(__dirname, 'fixtures', 'fake-lsp-server.js');
@@ -18,7 +23,7 @@ interface InspectableHandle {
   process: ChildProcess;
   pendingRequests: Map<number, unknown>;
   timers: Set<NodeJS.Timeout>;
-  buffer: Buffer;
+  receiver: { bufferedByteLength: number };
 }
 
 function currentHandle(subject: LSPLayer): InspectableHandle {
@@ -176,7 +181,7 @@ describe('LSPLayer process lifecycle', () => {
     ]));
     expect(handle.pendingRequests.size).toBe(0);
     expect(handle.timers.size).toBe(0);
-    expect(handle.buffer).toHaveLength(0);
+    expect(handle.receiver.bufferedByteLength).toBe(0);
 
     await expect(subject.ensureServer('typescript', projectPath)).resolves.toBe(false);
     expect(await readPids(pidFile)).toEqual([pid]);
@@ -240,6 +245,46 @@ describe('LSPLayer process lifecycle', () => {
     await expect(subject.shutdown()).resolves.toBeUndefined();
   });
 
+  it('kills a signal-ignoring descendant in the owned process group', async () => {
+    const events: LSPLifecycleEvent[] = [];
+    const subject = createLayer(
+      { typescript: server('ignore-shutdown-with-descendant', pidFile) },
+      { onLifecycleEvent: (event) => events.push(event) }
+    );
+    await expect(subject.ensureServer('typescript', projectPath)).resolves.toBe(true);
+    await waitUntil(async () => (await readPids(pidFile)).length === 2);
+    const pids = await readPids(pidFile);
+    expect(pids).toHaveLength(2);
+    expect(pids.every(processIsAlive)).toBe(true);
+
+    const startedAt = Date.now();
+    await subject.shutdown();
+
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    await Promise.all(pids.map((pid) => waitUntil(() => !processIsAlive(pid))));
+    expect(events).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ state: 'stopped', forcedKill: true }),
+      ])
+    );
+  });
+
+  it('accepts a near-8MiB response fragmented into 1KiB writes', async () => {
+    const subject = createLayer(
+      {
+        typescript: server(
+          'fragmented-large-initialize',
+          pidFile,
+          MAX_LSP_BODY_BYTES - 1024
+        ),
+      },
+      { requestTimeoutMs: 15_000 }
+    );
+
+    await expect(subject.ensureServer('typescript', projectPath)).resolves.toBe(true);
+    expect(currentHandle(subject).receiver.bufferedByteLength).toBe(0);
+  }, 20_000);
+
   it('is safe when shutdown races with initialization', async () => {
     const subject = createLayer({ typescript: server('timeout-initialize', pidFile) });
 
@@ -268,7 +313,7 @@ describe('LSPLayer process lifecycle', () => {
     expect(processIsAlive(pid)).toBe(false);
     expect(handle.pendingRequests.size).toBe(0);
     expect(handle.timers.size).toBe(0);
-    expect(handle.buffer).toHaveLength(0);
+    expect(handle.receiver.bufferedByteLength).toBe(0);
     expect(handle.process.eventNames()).toEqual([]);
     expect(handle.process.stdin?.eventNames()).toEqual([]);
     expect(handle.process.stdout?.eventNames()).toEqual([]);
