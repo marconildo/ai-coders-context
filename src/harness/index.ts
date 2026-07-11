@@ -181,6 +181,7 @@ export {
   type HarnessDatasetSummary,
   HarnessRuntimeRetentionService,
   RuntimeHistoryCursorError,
+  RUNTIME_HISTORY_LIMITS,
   type RuntimeHistoryDirection,
   type RuntimeHistoryQuery,
   type RuntimeHistoryPage,

@@ -218,6 +218,14 @@ Explicit harness runtime operations — sessions, traces, artifacts, checkpoints
 | `summary` / `evidence` | string / array | Sensor result summary |
 | `from` / `to` / `artifacts` | — | Handoff fields |
 | `scope` / `effect` / `target` / `pattern` | — | Policy fields |
+| `limit` | integer, 1–1,000 | Maximum records requested from a list action |
+| `cursor` | string | Opaque continuation cursor from `page.nextCursor` |
+| `direction` | `oldest` \| `newest` | Page traversal direction where supported |
+| `maxEvents` | integer, 1–1,000 | Replay event budget; defaults to 100 |
+
+`listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays`, and `listDatasets` are bounded. Continue a partial result by sending the returned `page.nextCursor` unchanged in the next call. Cursors are bound to their query and become invalid when their underlying trace segments rotate.
+
+MCP JSON text is compact-serialized once and has a 1 MiB default budget (4 MiB absolute maximum). A page that does not fit returns the typed `MCP_PAGE_TOO_LARGE` error with `suggestedLimit`; JSON is never cut at an arbitrary byte. Tool results also include a content-free `_meta.dotcontext` audit envelope with response size and page metrics. Clients may ignore `_meta` and continue reading `content`.
 
 **Returns:** session timelines, artifact inventories, task evaluations, sensor telemetry, replay records, failure clusters, or policy enforcement results.
 

@@ -193,4 +193,32 @@ describe('handleHarness', () => {
     expect(datasetPayload.dataset.failureCount).toBeGreaterThan(0);
     expect(datasetPayload.dataset.clusterCount).toBeGreaterThan(0);
   });
+
+  it('bounds listTraces to the harness default and exposes nextCursor', async () => {
+    const created = await handleHarness(
+      { action: 'createSession', name: 'bounded-traces' },
+      { repoPath: tempDir }
+    );
+    const session = JSON.parse(created.content[0].text).session;
+    for (let index = 0; index < 105; index += 1) {
+      await handleHarness({
+        action: 'appendTrace',
+        sessionId: session.id,
+        level: 'info',
+        event: 'bounded.trace',
+        message: `trace ${index}`,
+      }, { repoPath: tempDir });
+    }
+
+    const first = await handleHarness(
+      { action: 'listTraces', sessionId: session.id },
+      { repoPath: tempDir }
+    );
+    const payload = JSON.parse(first.content[0].text);
+
+    expect(payload.traces).toHaveLength(100);
+    expect(payload.page).toMatchObject({ recordsReturned: 100, hasMore: true, partial: true });
+    expect(payload.page.nextCursor).toEqual(expect.any(String));
+    expect(first._meta?.dotcontext).toMatchObject({ itemCount: 100, partial: true, appliedLimit: 100 });
+  });
 });

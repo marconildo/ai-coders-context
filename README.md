@@ -522,6 +522,8 @@ The MCP adapter currently exposes 12 tools: 7 action-based gateways plus 5 dedic
 
 For AI-agent use, provide `repoPath` on the first context-heavy MCP call so dotcontext can cache the working repository.
 
+MCP JSON responses are compact and bounded to 1 MiB by default (4 MiB absolute). Growing `harness` lists return `page.nextCursor`; pass it back with a bounded `limit` to continue. If a selected page cannot fit, the tool returns `MCP_PAGE_TOO_LARGE` and a `suggestedLimit` instead of truncating JSON. The optional `_meta.dotcontext` envelope contains only bounded audit metrics, so existing clients can continue reading `content` unchanged.
+
 ## CLI Reference
 
 ### Requirements

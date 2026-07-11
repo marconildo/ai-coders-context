@@ -1,7 +1,7 @@
 import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs-extra';
-import { AIContextMCPServer } from '../mcpServer';
+import { AIContextMCPServer, MCP_LIST_LIMIT_SCHEMA, MCP_MAX_EVENTS_SCHEMA } from '../mcpServer';
 
 // We can't fully test the MCP server without a transport,
 // but we can test instantiation and configuration
@@ -43,6 +43,45 @@ describe('AIContextMCPServer', () => {
       const server = new AIContextMCPServer({ verbose: false });
       expect(server).toBeInstanceOf(AIContextMCPServer);
     });
+  });
+
+  describe('bounded numeric schemas', () => {
+    it.each([
+      [999, true],
+      [1000, true],
+      [1001, false],
+    ])('validates list limit boundary %s', (value, success) => {
+      expect(MCP_LIST_LIMIT_SCHEMA.safeParse(value).success).toBe(success);
+    });
+
+    it.each([
+      [999, true],
+      [1000, true],
+      [1001, false],
+    ])('validates maxEvents boundary %s', (value, success) => {
+      expect(MCP_MAX_EVENTS_SCHEMA.safeParse(value).success).toBe(success);
+    });
+  });
+
+  it('logs response metadata without parsing response content', async () => {
+    const server = new AIContextMCPServer({ repoPath: tempDir });
+    const parse = jest.spyOn(JSON, 'parse');
+
+    await (server as any).logToolResponse(tempDir, 'harness', 'listSessions', {}, {
+      content: [{ type: 'text', text: '{not-json' }],
+      _meta: {
+        dotcontext: {
+          success: true,
+          responseBytes: 9,
+          serializationMs: 0,
+          itemCount: 0,
+          partial: false,
+        },
+      },
+    });
+
+    expect(parse).not.toHaveBeenCalled();
+    parse.mockRestore();
   });
 
   describe('resource registration', () => {

@@ -19,6 +19,7 @@ import {
 } from '../../../application/hooks/hookTracePolicy';
 import {
   boundedLimit,
+  RUNTIME_HISTORY_LIMITS,
   decodeHistoryCursor,
   encodeHistoryCursor,
   queryBinding,
@@ -536,7 +537,7 @@ export class HarnessRuntimeStateService {
 
   async listSessionPage(query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessSessionRecord>> {
     const started = Date.now();
-    const limit = boundedLimit(query.limit, 50, 200, 'sessions');
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.sessions.default, RUNTIME_HISTORY_LIMITS.sessions.maximum, 'sessions');
     const direction = query.direction ?? 'newest';
     const binding = queryBinding({ direction });
     const boundary = decodeHistoryCursor<{ updatedAt: string; id: string }>(query.cursor, 'sessions', binding);
@@ -648,7 +649,7 @@ export class HarnessRuntimeStateService {
 
   async listArtifactPage(sessionId: string, query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessArtifactRecord>> {
     const started = Date.now();
-    const limit = boundedLimit(query.limit, 50, 200, 'artifacts');
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.artifacts.default, RUNTIME_HISTORY_LIMITS.artifacts.maximum, 'artifacts');
     const direction = query.direction ?? 'newest';
     const binding = queryBinding({ sessionId, direction });
     const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'artifacts', binding);
@@ -708,7 +709,7 @@ export class HarnessRuntimeStateService {
 
   async listTracePage(sessionId: string, query: HarnessTracePageQuery = {}): Promise<RuntimeHistoryPage<HarnessTraceRecord>> {
     const started = Date.now();
-    const limit = boundedLimit(query.limit, 100, 1000, 'traces');
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.traces.default, RUNTIME_HISTORY_LIMITS.traces.maximum, 'traces');
     const direction: RuntimeHistoryDirection = query.direction ?? 'newest';
     const filters = { sessionId, direction, event: query.event, level: query.level, createdAfter: query.createdAfter, createdBefore: query.createdBefore };
     const binding = queryBinding(filters);

@@ -22,6 +22,7 @@ import {
   decodeHistoryCursor,
   encodeHistoryCursor,
   queryBinding,
+  RUNTIME_HISTORY_LIMITS,
   type RuntimeHistoryPage,
   type RuntimeHistoryQuery,
 } from '../history/runtimeHistory';
@@ -154,7 +155,7 @@ export class HarnessReplayService {
     sessionId: string,
     options: ReplaySessionOptions = {}
   ): Promise<HarnessReplayRecord> {
-    const maxEvents = boundedLimit(options.maxEvents, 100, 1000, 'replay events');
+    const maxEvents = boundedLimit(options.maxEvents, RUNTIME_HISTORY_LIMITS.replayEvents.default, RUNTIME_HISTORY_LIMITS.replayEvents.maximum, 'replay events');
     const session = await this.stateService.getSession(sessionId);
     const [tracePage, artifactPage, sensorRuns, tasks, handoffs] = await Promise.all([
       this.stateService.listTracePage(sessionId, { limit: maxEvents, direction: 'oldest' }),
@@ -335,7 +336,7 @@ export class HarnessReplayService {
 
   async listReplayPage(query: RuntimeHistoryQuery & { sessionId?: string } = {}): Promise<RuntimeHistoryPage<HarnessReplaySummary>> {
     const started = Date.now();
-    const limit = boundedLimit(query.limit, 25, 100, 'replay summaries');
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.replays.default, RUNTIME_HISTORY_LIMITS.replays.maximum, 'replay summaries');
     const binding = queryBinding({ sessionId: query.sessionId });
     const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'replays', binding);
     await this.ensureLayout();

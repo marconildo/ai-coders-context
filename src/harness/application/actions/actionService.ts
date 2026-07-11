@@ -328,9 +328,12 @@ export class HarnessActionService {
           }),
         };
       case 'listTasks':
+        const taskPage = await this.executionService.listTaskContractPage({ limit: params.limit, cursor: params.cursor, direction: params.direction });
+        const { items: tasks, ...taskPagination } = taskPage;
         return {
           success: true,
-          tasks: await this.executionService.listTaskContracts(),
+          tasks,
+          page: taskPagination,
         };
       case 'evaluateTask':
         return {
@@ -354,9 +357,12 @@ export class HarnessActionService {
           }),
         };
       case 'listHandoffs':
+        const handoffPage = await this.executionService.listHandoffContractPage({ limit: params.limit, cursor: params.cursor, direction: params.direction });
+        const { items: handoffs, ...handoffPagination } = handoffPage;
         return {
           success: true,
-          handoffs: await this.executionService.listHandoffContracts(),
+          handoffs,
+          page: handoffPagination,
         };
       case 'replaySession':
         return {

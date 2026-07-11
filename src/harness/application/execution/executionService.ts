@@ -206,6 +206,10 @@ export class HarnessExecutionService {
     return this.contracts.listTaskContracts();
   }
 
+  listTaskContractPage(query: Parameters<HarnessTaskContractsService['listTaskContractPage']>[0] = {}) {
+    return this.contracts.listTaskContractPage(query);
+  }
+
   evaluateTaskCompletion(taskId: string, sessionId?: string): Promise<HarnessTaskCompletionResult> {
     return this.contracts.evaluateTaskCompletion(taskId, sessionId);
   }
@@ -222,6 +226,10 @@ export class HarnessExecutionService {
 
   listHandoffContracts() {
     return this.contracts.listHandoffContracts();
+  }
+
+  listHandoffContractPage(query: Parameters<HarnessTaskContractsService['listHandoffContractPage']>[0] = {}) {
+    return this.contracts.listHandoffContractPage(query);
   }
 
   listPolicies(): Promise<HarnessPolicyRule[]> {

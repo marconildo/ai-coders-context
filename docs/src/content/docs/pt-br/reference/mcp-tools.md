@@ -218,6 +218,14 @@ Operações explícitas do runtime do harness — sessions, traces, artefatos, c
 | `summary` / `evidence` | string / array | Resumo do resultado do sensor |
 | `from` / `to` / `artifacts` | — | Campos de handoff |
 | `scope` / `effect` / `target` / `pattern` | — | Campos de policy |
+| `limit` | inteiro, 1–1.000 | Máximo de registros solicitado em uma action de listagem |
+| `cursor` | string | Cursor opaco de continuação retornado em `page.nextCursor` |
+| `direction` | `oldest` \| `newest` | Direção da paginação quando suportada |
+| `maxEvents` | inteiro, 1–1.000 | Orçamento de eventos do replay; padrão 100 |
+
+`listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays` e `listDatasets` são limitadas. Para continuar um resultado parcial, envie o `page.nextCursor` retornado, sem alterá-lo, na próxima chamada. Os cursors são vinculados à query e ficam inválidos quando os segmentos de trace subjacentes rotacionam.
+
+O texto JSON MCP é serializado uma vez em formato compacto e tem orçamento padrão de 1 MiB (máximo absoluto de 4 MiB). Uma página que não cabe retorna o erro tipado `MCP_PAGE_TOO_LARGE` com `suggestedLimit`; o JSON nunca é cortado em um byte arbitrário. Os resultados também incluem um envelope de auditoria `_meta.dotcontext`, sem conteúdo do usuário, com tamanho da resposta e métricas de paginação. Clientes podem ignorar `_meta` e continuar lendo `content`.
 
 **Retorna:** linhas do tempo de session, inventários de artefatos, avaliações de tasks, telemetria de sensors, registros de replay, clusters de falhas ou resultados de aplicação de policy.
 

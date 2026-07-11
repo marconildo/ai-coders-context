@@ -26,6 +26,13 @@ The MCP tools follow a simple, explicit pattern:
 | `plan` | Plan management and execution tracking |
 | `agent` | Agent orchestration and discovery |
 | `skill` | Skill management for on-demand expertise |
+| `harness` | Bounded runtime operations for sessions, traces, artifacts, contracts, replay, datasets, sensors, and policies |
+
+## Bounded responses
+
+Machine JSON is compact-serialized once and limited to 1 MiB by default (4 MiB absolute maximum). Every tool response includes a content-free `_meta.dotcontext` audit summary with response bytes, serialization time, item count, and partial-page state. Clients that ignore `_meta` continue to read the same JSON text from `content`.
+
+The growing harness lists (`listSessions`, `listTraces`, `listArtifacts`, `listTasks`, `listHandoffs`, `listReplays`, and `listDatasets`) return bounded pages. Pass `limit` and the opaque `cursor` returned as `page.nextCursor` to continue; do not inspect or modify cursors. `replaySession.maxEvents` defaults to 100 and cannot exceed 1,000. An oversized page returns `MCP_PAGE_TOO_LARGE` with `suggestedLimit`, never truncated JSON.
 
 ### Dedicated Workflow Tools (5)
 
