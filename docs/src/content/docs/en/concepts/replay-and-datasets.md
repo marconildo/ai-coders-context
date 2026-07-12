@@ -23,7 +23,7 @@ Replay answers the first two by collapsing a session into one ordered event log.
 
 ## Replay: a durable, ordered event log
 
-A **replay** reconstructs a session's complete timeline from everything the harness recorded: the session record itself, its traces, artifacts, checkpoints, sensor runs, tasks, and handoffs. The result is a single document with a flat, time-ordered list of events that you can play back in sequence.
+A **replay** reconstructs a bounded page of a session timeline from its session summary, traces, artifacts, checkpoints, sensor runs, tasks, and handoffs. The result is a time-ordered event page that can be continued with an opaque cursor without first materializing the complete history.
 
 ### What a replay contains
 
@@ -37,9 +37,11 @@ Each replay is a self-contained snapshot. Beyond the collected data, it carries 
 | `createdAt` / `replayedAt` | When the replay was built |
 | `fidelity` | `complete` or `partial` (whether all source data was available) |
 | `eventCount` | Number of events in the ordered timeline |
+| `sourceCounts` / `omittedCounts` | Available and omitted records by source |
+| `nextCursor` | Opaque continuation cursor when the replay is partial |
 | `summary` | Human-readable description of the run |
 
-The collected source data (`session`, `artifacts`, `checkpoints`, `traces`, `sensorRuns`, `tasks`, `handoffs`) is included in full, and the `events` array merges all of it into one timeline:
+The merged `events` array is constrained by one shared `maxEvents` and byte budget (100 events by default, 1,000 maximum). Source records, when requested, live only under their event's `record` field; replay files no longer duplicate them in separate source arrays. A partial replay can continue every source through the same opaque cursor:
 
 ```json
 {
@@ -87,6 +89,9 @@ Replay is an action on the `harness` MCP tool:
 // Re-run a session into a durable replay
 { "action": "replaySession", "sessionId": "session-..." }
 
+// Bound the response and persisted replay to ten events
+{ "action": "replaySession", "sessionId": "session-...", "maxEvents": 10 }
+
 // List existing replays
 { "action": "listReplays" }
 
@@ -100,7 +105,7 @@ Build a replay right after a session finishes — whether it completed or failed
 
 ## Failure datasets: clustering what keeps breaking
 
-A single replay tells you about one run. A **failure dataset** scans across replays to build a failure corpus, then groups related failures into clusters so you can see which problems recur.
+A single replay tells you about one run. A **failure dataset** processes sessions with one worker by default (configurable up to four), retains at most 10,000 failures by default, and also applies per-failure, aggregate, and persisted-file byte budgets. It reports `partial` plus `omittedFailureCount` when any limit is reached.
 
 ### How failures are collected
 

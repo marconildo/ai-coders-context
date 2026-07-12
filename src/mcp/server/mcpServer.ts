@@ -623,11 +623,11 @@ Actions:
 - evaluateTask: Evaluate task completion (params: taskId, sessionId?)
 - createHandoff: Create handoff contract (params: from, to, sessionId?, taskId?, artifacts?, evidence?)
 - listHandoffs: List handoff contracts
-- replaySession: Replay a durable session timeline (params: sessionId, includePayloads?, maxEvents?)
-- listReplays: List generated replays (params: sessionId?)
+- replaySession: Replay a durable session timeline (params: sessionId, includePayloads?, maxEvents?, maxBytes?, cursor?)
+- listReplays: List generated replay summaries (params: sessionId?, limit?, maxBytes?, cursor?)
 - getReplay: Get replay by id (params: replayId)
-- buildDataset: Build a failure dataset from sessions (params: sessionIds?, includeSuccessfulSessions?)
-- listDatasets: List failure datasets
+- buildDataset: Build a failure dataset from sessions (params: sessionIds?, includeSuccessfulSessions?, concurrency?, maxFailures?, maxFailureBytes?, maxBytes?)
+- listDatasets: List failure dataset summaries (params: limit?, maxBytes?, cursor?)
 - getDataset: Get failure dataset by id (params: datasetId)
 - getFailureClusters: Get clusters for a dataset (params: datasetId)
 - registerPolicy: Register policy rule (params: scope, effect, target?, pattern?, pathPattern?, risk?, description?)
@@ -710,9 +710,18 @@ Actions:
         replayId: z.string().optional(),
         includePayloads: z.boolean().optional(),
         maxEvents: z.number().optional(),
+        maxBytes: z.number().optional(),
+        cursor: z.string().optional(),
+        limit: z.number().optional(),
+        direction: z.enum(['oldest', 'newest']).optional(),
+        createdAfter: z.string().optional(),
+        createdBefore: z.string().optional(),
         datasetId: z.string().optional(),
         sessionIds: z.array(z.string()).optional(),
         includeSuccessfulSessions: z.boolean().optional(),
+        concurrency: z.number().optional(),
+        maxFailures: z.number().optional(),
+        maxFailureBytes: z.number().optional(),
         scope: z.enum(['sensor', 'artifact', 'handoff', 'workflow', 'task', 'risk']).optional(),
         effect: z.enum(['allow', 'deny', 'require_approval']).optional(),
         target: z.enum(['tool', 'action', 'path', 'risk']).optional(),
