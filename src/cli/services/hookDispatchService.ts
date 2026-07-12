@@ -5,8 +5,11 @@
  * and writes host-specific JSON to stdout.
  */
 
+import * as path from 'path';
+
 import {
   createHarnessHookAdapter,
+  loadHookTracePolicy,
   recordHookTraceFailure,
   type HarnessHookResponse,
   WorkflowService,
@@ -36,6 +39,8 @@ export interface HookDispatchOptions {
   repoPath?: string;
   stdin?: NodeJS.ReadableStream;
   stdout?: NodeJS.WritableStream;
+  /** Test/embedding override. Values remain clamped by the hook policy ceiling. */
+  maxInputBytes?: number;
 }
 
 export interface HookDispatchResult {
@@ -277,11 +282,32 @@ async function recordTraceAppendFailure(options: {
   }
 }
 
-async function readStdin(stdin: NodeJS.ReadableStream = process.stdin): Promise<string> {
+class HookInputTooLargeError extends Error {
+  constructor(
+    readonly inputBytes: number,
+    readonly maxInputBytes: number
+  ) {
+    super(`Hook dispatch input exceeded the ${maxInputBytes} byte limit`);
+    this.name = 'HookInputTooLargeError';
+  }
+}
+
+async function readStdin(
+  stdin: NodeJS.ReadableStream = process.stdin,
+  maxInputBytes: number
+): Promise<string> {
   const chunks: Buffer[] = [];
+  let inputBytes = 0;
 
   for await (const chunk of stdin) {
-    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+    inputBytes += buffer.byteLength;
+    if (inputBytes > maxInputBytes) {
+      // Do not retain or concatenate rejected input. Hook failures must not block the host.
+      chunks.length = 0;
+      throw new HookInputTooLargeError(inputBytes, maxInputBytes);
+    }
+    chunks.push(buffer);
   }
 
   return Buffer.concat(chunks).toString('utf-8').trim();
@@ -499,7 +525,32 @@ export async function runHookDispatch(
 ): Promise<HookDispatchResult> {
   const stdin = options.stdin ?? process.stdin;
   const stdout = options.stdout ?? process.stdout;
-  const rawInput = await readStdin(stdin);
+  const configuredPolicy = loadHookTracePolicy(options.repoPath ?? process.cwd());
+  const maxInputBytes = Math.min(
+    configuredPolicy.maxInputBytes,
+    typeof options.maxInputBytes === 'number' && Number.isFinite(options.maxInputBytes)
+      ? Math.max(1024, Math.floor(options.maxInputBytes))
+      : configuredPolicy.maxInputBytes
+  );
+  let rawInput: string;
+  try {
+    rawInput = await readStdin(stdin, maxInputBytes);
+  } catch (error) {
+    if (!(error instanceof HookInputTooLargeError)) {
+      throw error;
+    }
+
+    const repoPath = path.resolve(options.repoPath ?? process.cwd());
+    await recordTraceAppendFailure({
+      repoPath,
+      source: options.source,
+      reason: 'hook_stdin_too_large',
+      message: `Rejected ${error.inputBytes} bytes (limit ${error.maxInputBytes})`,
+    });
+    const output = finalizeHostHookOutput(options.source, { continue: true });
+    stdout.write(`${JSON.stringify(output)}\n`);
+    return { exitCode: 0, output };
+  }
 
   if (!rawInput) {
     throw new Error('Hook dispatch requires JSON input on stdin');

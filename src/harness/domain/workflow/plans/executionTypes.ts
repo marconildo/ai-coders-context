@@ -36,6 +36,15 @@ export interface StepAcceptanceRun {
   tailStderr: string;
   durationMs: number;
   timedOut: boolean;
+  /** Optional for compatibility with acceptance runs persisted before F-01. */
+  stdoutBytes?: number;
+  stderrBytes?: number;
+  stdoutDroppedBytes?: number;
+  stderrDroppedBytes?: number;
+  outputTruncated?: boolean;
+  outputLimitExceeded?: boolean;
+  terminationReason?: 'timeout' | 'outputLimit' | 'spawnError';
+  commandBasename?: string;
 }
 
 /** Individual step execution tracking */

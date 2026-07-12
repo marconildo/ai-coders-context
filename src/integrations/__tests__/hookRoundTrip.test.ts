@@ -38,9 +38,10 @@ describe('hook mapper unit tests', () => {
     });
 
     it('maps PostToolUse to harness appendTrace when harness session is bound', () => {
-      expect(mapClaudeCodeEvent(postToolUseWriteFixture, {
+      const mapped = mapClaudeCodeEvent(postToolUseWriteFixture, {
         harnessSessionId: 'harness-session-1',
-      })).toEqual({
+      });
+      expect(mapped).toMatchObject({
         tool: 'harness',
         params: {
           action: 'appendTrace',
@@ -48,9 +49,17 @@ describe('hook mapper unit tests', () => {
           level: 'info',
           event: 'tool.use',
           message: 'Write',
-          data: { tool_input: postToolUseWriteFixture.tool_input },
+          data: {
+            tool_input: {
+              filePath: postToolUseWriteFixture.tool_input.file_path,
+              contentBytes: Buffer.byteLength(postToolUseWriteFixture.tool_input.content),
+              contentOmitted: true,
+            },
+            capture: { redactedFieldCount: 1 },
+          },
         },
       });
+      expect(JSON.stringify(mapped)).not.toContain(postToolUseWriteFixture.tool_input.content);
     });
 
     it('returns null for PostToolUse without harness session binding', () => {
@@ -82,9 +91,10 @@ describe('hook mapper unit tests', () => {
     });
 
     it('maps PostToolUse to harness appendTrace when harness session is bound', () => {
-      expect(mapCodexEvent(codexPostToolUseFixture, {
+      const mapped = mapCodexEvent(codexPostToolUseFixture, {
         harnessSessionId: 'harness-session-2',
-      })).toEqual({
+      });
+      expect(mapped).toMatchObject({
         tool: 'harness',
         params: {
           action: 'appendTrace',
@@ -92,9 +102,13 @@ describe('hook mapper unit tests', () => {
           level: 'info',
           event: 'tool.use',
           message: 'Edit',
-          data: { tool_input: codexPostToolUseFixture.tool_input },
+          data: {
+            tool_input: { filePath: codexPostToolUseFixture.tool_input.file_path },
+            capture: { redactedFieldCount: 1 },
+          },
         },
       });
+      expect(JSON.stringify(mapped)).not.toContain(codexPostToolUseFixture.tool_input.content);
     });
 
     it('maps Stop to workflow-guide', () => {
@@ -382,6 +396,31 @@ describe('hook mapper unit tests', () => {
           repoPath: '/tmp/repo',
         },
       });
+    });
+
+    it('sanitizes Pi Write payloads before mapping them to appendTrace', () => {
+      const source = 'pi-secret-source-body';
+      const mapped = mapPiEvent({
+        type: 'tool_execution_end',
+        toolName: 'Write',
+        toolInput: { file_path: 'src/pi.ts', content: source, password: 'hidden' },
+        sessionId: 'pi-harness-1',
+        cwd: '/tmp/repo',
+      });
+
+      expect(mapped).toMatchObject({
+        tool: 'harness',
+        params: {
+          action: 'appendTrace',
+          data: {
+            host: 'pi-dev',
+            tool_input: { filePath: 'src/pi.ts', contentOmitted: true },
+            capture: { redactedFieldCount: 2 },
+          },
+        },
+      });
+      expect(JSON.stringify(mapped)).not.toContain(source);
+      expect(JSON.stringify(mapped)).not.toContain('hidden');
     });
   });
 

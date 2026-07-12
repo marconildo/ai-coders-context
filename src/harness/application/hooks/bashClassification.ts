@@ -6,6 +6,12 @@ export type HookBashClassification =
   | 'migration'
   | 'destructive';
 
+import {
+  loadHookTracePolicy,
+  sanitizeHookTraceData,
+  type HookTracePolicy,
+} from './hookTracePolicy';
+
 function normalizeCommand(command: string): string {
   return command.trim().replace(/\s+/g, ' ').toLowerCase();
 }
@@ -92,8 +98,13 @@ export function classifyBashCommand(command: string | undefined): HookBashClassi
   return undefined;
 }
 
-export function buildHookTraceData(toolName: string | undefined, toolInput: unknown): Record<string, unknown> {
-  const data: Record<string, unknown> = { tool_input: toolInput };
+export function buildHookTraceData(
+  toolName: string | undefined,
+  toolInput: unknown,
+  options: { policy?: HookTracePolicy; repoPath?: string } = {}
+): Record<string, unknown> {
+  const policy = options.policy ?? loadHookTracePolicy(options.repoPath);
+  const data: Record<string, unknown> = sanitizeHookTraceData(toolName, toolInput, policy);
   if (toolName?.trim().toLowerCase() !== 'bash') {
     return data;
   }

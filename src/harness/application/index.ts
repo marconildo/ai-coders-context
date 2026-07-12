@@ -11,6 +11,7 @@ export * from './execution';
 export * from './policies';
 export * from './replay';
 export * from './datasets';
+export * from './history';
 export * from '../adapters/out/runtimeState';
 export * from '../adapters/out/workflowState';
 export * from '../adapters/out/sensors';

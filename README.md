@@ -417,7 +417,7 @@ Hook install writes project-level configuration by default. Use `--global` only 
 
 `SessionStart` resolves the project root first (`--repo-path`, then the nearest parent with `.context/`, then `cwd`) and checks readiness. If the repository is not initialized yet, the hook returns a short JSON-safe hint and does not create `.context/runtime`. Partial context lists up to three missing areas. Ready context gets compact navigation, a daily no-workflow reminder, or active PREVC preflight when a workflow is running.
 
-`PostToolUse` appends durable `tool.use` traces for `Write`, `Edit`, and `Bash`. Bash traces include best-effort classification such as `test`, `build`, `lint`, or `inspection` without running extra commands. Repeated trace append failures are counted under `.context/runtime/hooks/trace-failures.json` and stay non-blocking.
+`PostToolUse` appends durable `tool.use` traces for `Write`, `Edit`, and `Bash` without retaining source bodies. Write/Edit traces keep paths, byte counts, and content hashes; Bash keeps a bounded preview and best-effort classification such as `test`, `build`, `lint`, or `inspection`. Hook stdin is capped at 8 MiB and oversized input remains non-blocking. Trace events are size-bounded, `trace.jsonl` rotates at 8 MiB, and up to four closed segments are retained by default. Repeated trace append or input failures are counted under `.context/runtime/hooks/trace-failures.json`.
 
 `Stop` and session-end hooks stay quiet unless there is an active PREVC workflow. Missing, inactive, malformed, or reentrant workflow state returns a successful no-op so end-of-turn feedback does not become noise.
 

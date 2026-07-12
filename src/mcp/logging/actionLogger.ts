@@ -184,13 +184,17 @@ async function resolveMcpActivitySessionId(
     }
   }
 
-  // listSessions() is newest-first. A terminal audit session is immutable for
-  // future activity: only an active/paused session may be reused.
-  const existing = (await state.listSessions()).find((session) =>
-    session.name === MCP_ACTIVITY_NAME &&
-    session.metadata?.transport === 'mcp' &&
-    (session.status === 'active' || session.status === 'paused')
-  );
+  let existing;
+  let cursor: string | undefined;
+  do {
+    const page = await state.listSessionPage({ limit: 50, cursor });
+    existing = page.items.find((session) =>
+      session.name === MCP_ACTIVITY_NAME &&
+      session.metadata?.transport === 'mcp' &&
+      (session.status === 'active' || session.status === 'paused')
+    );
+    cursor = existing ? undefined : page.nextCursor;
+  } while (!existing && cursor);
 
   if (existing) {
     sessionCache.set(cacheKey, existing.id);

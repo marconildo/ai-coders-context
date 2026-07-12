@@ -185,6 +185,6 @@ describe('hook readiness runtime helpers', () => {
     expect(buildHookTraceData('Bash', { command: 'git diff -- src' }))
       .toMatchObject({ classification: 'inspection' });
     expect(buildHookTraceData('Write', { file_path: 'README.md' }))
-      .toEqual({ tool_input: { file_path: 'README.md' } });
+      .toMatchObject({ tool_input: { filePath: 'README.md' } });
   });
 });

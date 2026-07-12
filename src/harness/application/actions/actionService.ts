@@ -84,9 +84,18 @@ export interface HarnessActionInput {
   replayId?: string;
   includePayloads?: boolean;
   maxEvents?: number;
+  maxBytes?: number;
   datasetId?: string;
   sessionIds?: string[];
   includeSuccessfulSessions?: boolean;
+  limit?: number;
+  cursor?: string;
+  direction?: 'oldest' | 'newest';
+  createdAfter?: string;
+  createdBefore?: string;
+  concurrency?: number;
+  maxFailures?: number;
+  maxFailureBytes?: number;
   scope?: 'sensor' | 'artifact' | 'handoff' | 'workflow' | 'task' | 'risk';
   effect?: 'allow' | 'deny' | 'require_approval';
   target?: 'tool' | 'action' | 'path' | 'risk';
@@ -195,9 +204,12 @@ export class HarnessActionService {
           }),
         };
       case 'listSessions':
+        const sessionPage = await this.executionService.listSessionPage({ limit: params.limit, cursor: params.cursor, direction: params.direction, maxBytes: params.maxBytes });
+        const { items: sessions, ...sessionPagination } = sessionPage;
         return {
           success: true,
-          sessions: await this.executionService.listSessions(),
+          sessions,
+          page: sessionPagination,
         };
       case 'getSession':
         return {
@@ -215,9 +227,12 @@ export class HarnessActionService {
           }),
         };
       case 'listTraces':
+        const tracePage = await this.executionService.listTracePage(params.sessionId!, { limit: params.limit, cursor: params.cursor, direction: params.direction, event: params.event, level: params.level, createdAfter: params.createdAfter, createdBefore: params.createdBefore, maxBytes: params.maxBytes });
+        const { items: traces, ...tracePagination } = tracePage;
         return {
           success: true,
-          traces: await this.executionService.listTraces(params.sessionId!),
+          traces,
+          page: tracePagination,
         };
       case 'addArtifact':
         return {
@@ -231,9 +246,12 @@ export class HarnessActionService {
           }),
         };
       case 'listArtifacts':
+        const artifactPage = await this.executionService.listArtifactPage(params.sessionId!, { limit: params.limit, cursor: params.cursor, direction: params.direction, maxBytes: params.maxBytes });
+        const { items: artifacts, ...artifactPagination } = artifactPage;
         return {
           success: true,
-          artifacts: await this.executionService.listArtifacts(params.sessionId!),
+          artifacts,
+          page: artifactPagination,
         };
       case 'checkpoint':
         return {
@@ -348,12 +366,17 @@ export class HarnessActionService {
           replay: await this.executionService.replaySession(params.sessionId!, {
             includePayloads: params.includePayloads,
             maxEvents: params.maxEvents,
+            maxBytes: params.maxBytes,
+            cursor: params.cursor,
           }),
         };
       case 'listReplays':
+        const replayPage = await this.executionService.listReplayPage({ limit: params.limit, cursor: params.cursor, sessionId: params.sessionId, maxBytes: params.maxBytes });
+        const { items: replays, ...replayPagination } = replayPage;
         return {
           success: true,
-          replays: await this.executionService.listReplays(params.sessionId),
+          replays,
+          page: replayPagination,
         };
       case 'getReplay':
         return {
@@ -366,12 +389,19 @@ export class HarnessActionService {
           dataset: await this.executionService.buildFailureDataset({
             sessionIds: params.sessionIds,
             includeSuccessfulSessions: params.includeSuccessfulSessions,
+            concurrency: params.concurrency,
+            maxFailures: params.maxFailures,
+            maxFailureBytes: params.maxFailureBytes,
+            maxBytes: params.maxBytes,
           }),
         };
       case 'listDatasets':
+        const datasetPage = await this.executionService.listDatasetPage({ limit: params.limit, cursor: params.cursor, maxBytes: params.maxBytes });
+        const { items: datasets, ...datasetPagination } = datasetPage;
         return {
           success: true,
-          datasets: await this.executionService.listDatasets(),
+          datasets,
+          page: datasetPagination,
         };
       case 'getDataset':
         return {
