@@ -19,6 +19,7 @@ import {
     isBoundedSnapshotFresh,
     type BoundedFreshnessSnapshot,
 } from './discovery';
+import { SemanticSnapshotService } from './semanticSnapshotService';
 
 /**
  * A cached context entry with metadata for invalidation.
@@ -28,6 +29,8 @@ interface CacheEntry {
     content: string;
     freshnessFingerprint?: string;
     freshnessSnapshot?: BoundedFreshnessSnapshot;
+    /** Content-aware identity that catches same-size writes with restored mtimes. */
+    contentFingerprint?: string;
 }
 
 export interface ContextCacheOptions {
@@ -81,6 +84,7 @@ export class ContextCache {
     }>();
     private readonly watchDirs: string[];
     private readonly options: ContextCacheOptions;
+    private readonly fingerprintService = new SemanticSnapshotService(true);
     private readonly freshness: ContextCacheFreshnessMetrics = {
         discoveries: 0,
         filesSelected: 0,
@@ -146,6 +150,9 @@ export class ContextCache {
         cache.set(key, {
             content,
             ...freshness,
+            contentFingerprint: this.options.fingerprintProvider
+                ? undefined
+                : await this.fingerprintService.captureRepoFingerprint(repoPath),
         });
         const loaded = await loadRuntimeRetentionConfig(repoPath);
         this.enforceGlobalLimits({
@@ -254,7 +261,8 @@ export class ContextCache {
             ttlMs: limits.ttlMs,
             sweepIntervalMs: this.options.sweepIntervalMs,
             estimateBytes: (entry, key) => Buffer.byteLength(key) + Buffer.byteLength(entry.content)
-                + Buffer.byteLength(JSON.stringify(entry.freshnessSnapshot ?? entry.freshnessFingerprint ?? '')),
+                + Buffer.byteLength(JSON.stringify(entry.freshnessSnapshot ?? entry.freshnessFingerprint ?? ''))
+                + Buffer.byteLength(entry.contentFingerprint ?? ''),
         });
         this.caches.set(normalized, {
             cache,
@@ -310,7 +318,10 @@ export class ContextCache {
         if (entry.freshnessSnapshot.partial) return false;
         const result = await isBoundedSnapshotFresh(entry.freshnessSnapshot);
         this.freshness.signalsChecked += result.signalsChecked;
-        if (result.fresh) return true;
+        if (result.fresh) {
+            return entry.contentFingerprint === undefined
+                || await this.fingerprintService.captureRepoFingerprint(repoPath) === entry.contentFingerprint;
+        }
         const refreshed = await this.captureFreshness(repoPath);
         if (refreshed.freshnessSnapshot?.partial) return false;
         if (refreshed.freshnessFingerprint === entry.freshnessFingerprint && refreshed.freshnessSnapshot) {

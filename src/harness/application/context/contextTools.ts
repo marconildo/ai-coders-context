@@ -8,7 +8,12 @@ import { FileMapper } from '../../../utils/fileMapper';
 import { needsFill } from '../../../utils/frontMatter';
 import { getScaffoldStructure, serializeStructureForAI } from './scaffolding/generators/shared/structures';
 import { DocumentationGenerator } from './scaffolding/generators/documentation/documentationGenerator';
-import { SemanticSnapshotService } from '../../adapters/out/semantic';
+import {
+  CodebaseAnalyzer,
+  SemanticFingerprintCache,
+  SemanticSnapshotService,
+  type SemanticAnalysisBundle,
+} from '../../adapters/out/semantic';
 import { AgentGenerator } from './scaffolding/generators/agents/agentGenerator';
 import { SkillGenerator } from './scaffolding/generators/skills/skillGenerator';
 import { PlanGenerator } from './scaffolding/generators/plans/planGenerator';
@@ -28,6 +33,7 @@ import { getUntrackedContextLayoutEntries } from '../../../shared';
 import { resolveRuntimeLayout } from '../../../shared/fs/pathHelpers';
 import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
+import type { AnalysisBundle } from './analysisBundle';
 import {
   boundedLimit,
   RUNTIME_HISTORY_LIMITS,
@@ -38,6 +44,14 @@ import {
   searchBoundedCode,
   type BoundedExploreListResult,
 } from './boundedExplore';
+
+// Context tools are long-lived while each operation remains short-lived. Only
+// bounded fingerprint metadata/content hashes cross operation boundaries.
+const contextFingerprintCache = new SemanticFingerprintCache();
+
+function createContextSnapshotService(cacheEnabled = true): SemanticSnapshotService {
+  return new SemanticSnapshotService(cacheEnabled, contextFingerprintCache);
+}
 
 type ToolContext = unknown;
 
@@ -449,7 +463,12 @@ export const getFileStructureTool = createInternalTool<
     const { rootPath, maxDepth = 3, includePatterns } = input;
     try {
       const mapper = new FileMapper([]);
-      const structure = await mapper.mapRepository(rootPath, includePatterns || undefined);
+      // This explicit structure-inspection surface requests all paths, while
+      // context initialization uses the bounded relevant defaults.
+      const structure = await mapper.mapRepository(
+        rootPath,
+        includePatterns?.length ? includePatterns : ['**/*']
+      );
 
       const filterByDepth = (relativePath: string): boolean => relativePath.split('/').length <= maxDepth;
 
@@ -573,6 +592,7 @@ export const initializeContextTool = createInternalTool<
     skipContentGeneration?: boolean;
     generateQA?: boolean;
     generateSkills?: boolean;
+    cacheEnabled?: boolean;
   },
   Record<string, unknown>
 >(
@@ -591,6 +611,7 @@ export const initializeContextTool = createInternalTool<
       skipContentGeneration = true,
       generateQA = false,
       generateSkills = true,
+      cacheEnabled = true,
     } = input;
 
     const resolvedRepoPath = path.resolve(repoPath);
@@ -634,12 +655,72 @@ export const initializeContextTool = createInternalTool<
       const fileMapper = new FileMapper(exclude);
       const repoStructure = await fileMapper.mapRepository(resolvedRepoPath, include);
 
+      let semanticBundle: SemanticAnalysisBundle | undefined;
+      let analysisBundle: AnalysisBundle | undefined;
+      let semanticFingerprint: string | undefined;
+      let fingerprintMetrics: Awaited<ReturnType<SemanticSnapshotService['captureRepoFingerprintWithMetrics']>> | undefined;
+      const snapshotService = semantic
+        ? createContextSnapshotService(cacheEnabled)
+        : undefined;
+      if (semantic) {
+        const analyzer = new CodebaseAnalyzer({
+          exclude: [...new Set([...DEFAULT_EXCLUDE_PATTERNS, ...exclude])],
+          cacheEnabled,
+        });
+        try {
+          fingerprintMetrics = await snapshotService!.captureRepoFingerprintWithMetrics(
+            resolvedRepoPath,
+            repoStructure
+          );
+          semanticFingerprint = fingerprintMetrics.fingerprint;
+          semanticBundle = await analyzer.analyzeBundle(
+            resolvedRepoPath,
+            repoStructure
+          );
+        } catch {
+          semanticBundle = undefined;
+          semanticFingerprint = undefined;
+        } finally {
+          await analyzer.shutdown();
+        }
+      }
+
       let classification: ProjectClassification | undefined;
       let projectType: ProjectType = 'unknown';
+      let detectedStackInfo: Awaited<ReturnType<StackDetector['detect']>> | undefined;
+
+      if (!disableFiltering || semantic) {
+        const stackDetector = new StackDetector();
+        detectedStackInfo = await stackDetector.detect(resolvedRepoPath);
+      }
+
+      if (semanticBundle && semanticFingerprint && fingerprintMetrics) {
+        analysisBundle = {
+          repoPath: resolvedRepoPath,
+          discoveredFiles: semanticBundle.files,
+          repoStructure,
+          semanticContext: semanticBundle.context,
+          functionalPatterns: semanticBundle.functionalPatterns,
+          stackInfo: detectedStackInfo,
+          repoFingerprint: semanticFingerprint,
+          limits: semanticBundle.limits,
+          partial: semanticBundle.partial,
+          skipped: semanticBundle.skipped,
+          metrics: {
+            ...semanticBundle.metrics,
+            fingerprint: {
+              files: fingerprintMetrics.files,
+              bytesRead: fingerprintMetrics.bytesRead,
+              contentReads: fingerprintMetrics.contentReads,
+              cacheHits: fingerprintMetrics.cacheHits,
+              discoveries: fingerprintMetrics.discoveries,
+              durationMs: fingerprintMetrics.durationMs,
+            },
+          },
+        };
+      }
 
       if (!disableFiltering) {
-        const stackDetector = new StackDetector();
-        const stackInfo = await stackDetector.detect(resolvedRepoPath);
         if (overrideProjectType) {
           projectType = overrideProjectType;
           classification = {
@@ -649,7 +730,7 @@ export const initializeContextTool = createInternalTool<
             reasoning: ['Project type manually specified'],
           };
         } else {
-          classification = classifyProject(stackInfo);
+          classification = classifyProject(detectedStackInfo!);
           projectType = classification.primaryType;
         }
       }
@@ -664,7 +745,23 @@ export const initializeContextTool = createInternalTool<
         docsGenerated = await docGenerator.generateDocumentation(
           repoStructure,
           outputDir,
-          { semantic, filteredDocs },
+          {
+            semantic,
+            filteredDocs,
+            semanticContext: semanticBundle?.context,
+            functionalPatterns: semanticBundle?.functionalPatterns,
+            stackInfo: detectedStackInfo,
+            repoFingerprint: semanticFingerprint,
+            cacheEnabled,
+            analysisBundle,
+            snapshotService,
+            onSnapshotMetrics: (metrics) => {
+              if (analysisBundle) {
+                analysisBundle.metrics.durationsMs.generation = metrics.generationMs;
+                analysisBundle.metrics.durationsMs.publication = metrics.publicationMs;
+              }
+            },
+          },
           false
         );
       }
@@ -708,7 +805,15 @@ export const initializeContextTool = createInternalTool<
         agentsGenerated = await agentGenerator.generateAgentPrompts(
           repoStructure,
           outputDir,
-          { semantic, filteredAgents, availableSkills },
+          {
+            semantic,
+            filteredAgents,
+            availableSkills,
+            semanticContext: semanticBundle?.context,
+            stackInfo: detectedStackInfo,
+            cacheEnabled,
+            analysisBundle,
+          },
           false
         );
       }
@@ -851,6 +956,14 @@ export const initializeContextTool = createInternalTool<
                 projectType: classification.primaryType,
                 confidence: classification.confidence,
                 reasoning: classification.reasoning,
+              }
+            : undefined,
+          analysis: analysisBundle
+            ? {
+                limits: analysisBundle.limits,
+                partial: analysisBundle.partial,
+                skipped: analysisBundle.skipped,
+                metrics: analysisBundle.metrics,
               }
             : undefined,
         },
@@ -1150,7 +1263,7 @@ export const getCodebaseMapTool = createInternalTool<
 
     const section = input.section || 'all';
     try {
-      const snapshotService = new SemanticSnapshotService();
+      const snapshotService = createContextSnapshotService();
       const result = await snapshotService.ensureFreshSection(input.repoPath, section as any);
       return {
         success: true,

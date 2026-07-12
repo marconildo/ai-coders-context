@@ -190,6 +190,14 @@ export interface AnalyzerOptions {
   exclude?: string[];
   include?: string[];
   maxFiles?: number;
+  /** Maximum aggregate bytes selected for semantic parsing. */
+  maxTotalBytes?: number;
+  /** Maximum size of one source file selected for semantic parsing. */
+  maxFileBytes?: number;
+  /** Maximum number of file analyses running concurrently. */
+  concurrency?: number;
+  /** Maximum directories opened while discovering repository files. */
+  maxDirectoriesScanned?: number;
   /** Maximum raw directory entries inspected before returning a partial analysis. */
   maxEntriesScanned?: number;
   cacheEnabled?: boolean;

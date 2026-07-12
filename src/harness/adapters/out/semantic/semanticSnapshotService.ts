@@ -1,15 +1,19 @@
 import { createHash } from 'crypto';
+import { promises as nativeFs } from 'fs';
 import * as fs from 'fs-extra';
-import { glob } from 'glob';
 import * as path from 'path';
 
-import { RepoStructure } from '../../../../types';
+import { RepoStructure, type RepoDiscoverySkip } from '../../../../types';
 import { CodebaseMapGenerator } from '../../../application/context/scaffolding/generators/documentation/codebaseMapGenerator';
 import type {
   CodebaseMap,
   SemanticSnapshotMetadata,
 } from '../../../application/context/scaffolding/generators/documentation/codebaseMapGenerator';
-import { FileMapper } from '../../../../utils/fileMapper';
+import {
+  DEFAULT_FILE_MAPPING_LIMITS,
+  FileMapper,
+  type FileMappingLimits,
+} from '../../../../utils/fileMapper';
 import { CodebaseAnalyzer } from './codebaseAnalyzer';
 import type { AnalyzerOptions, DetectedFunctionalPatterns, SemanticContext } from './types';
 import { StackDetector } from '../../../application/context/intelligence/stack/stackDetector';
@@ -48,6 +52,11 @@ export interface SemanticSnapshotWriteResult {
   manifest: SemanticSnapshotManifest;
   snapshotDir: string;
   publishedSummaryPath: string;
+  metrics: {
+    generationMs: number;
+    publicationMs: number;
+    stabilizationAttempts: number;
+  };
 }
 
 export interface SemanticSnapshotReadOptions {
@@ -91,8 +100,10 @@ const SNAPSHOT_DIRNAME = path.join('cache', 'semantic');
 const MANIFEST_FILENAME = 'manifest.json';
 const SUMMARY_FILENAME = 'summary.json';
 const VERSIONS_DIRNAME = 'versions';
-const MAX_REFRESH_ATTEMPTS = 3;
+const MAX_REFRESH_ATTEMPTS = 2;
 const MAX_VERSION_HISTORY = 3;
+const MAX_FINGERPRINT_CACHE_ENTRIES = 10_000;
+const DEFAULT_FINGERPRINT_CACHE_TTL_MS = 5 * 60_000;
 
 const SECTION_FILENAMES: Record<SnapshotFileSection, string> = {
   stack: 'stack.json',
@@ -107,62 +118,161 @@ const SECTION_FILENAMES: Record<SnapshotFileSection, string> = {
 
 const LEGACY_CODEBASE_MAP_PATH = path.join('docs', 'codebase-map.json');
 
-const FINGERPRINT_IGNORE_PATTERNS = [
-  'node_modules/**',
-  '.git/**',
-  'dist/**',
-  'build/**',
-  'coverage/**',
-  '.context/**',
-  'vendor/**',
-  '__pycache__/**',
-];
+interface FingerprintCacheEntry {
+  metadata: string;
+  contentHash: string;
+  lastUsedAt: number;
+}
 
-const FINGERPRINT_ROOT_FILES = new Set([
-  'package.json',
-  'package-lock.json',
-  'pnpm-lock.yaml',
-  'yarn.lock',
-  'bun.lockb',
-  'tsconfig.json',
-  'tsconfig.build.json',
-  'jest.config.js',
-  'jest.config.ts',
-  'vitest.config.ts',
-  'vite.config.ts',
-  'webpack.config.js',
-  'next.config.js',
-  'next.config.ts',
-  'nest-cli.json',
-  '.eslintrc',
-  '.eslintrc.js',
-  '.eslintrc.json',
-  '.prettierrc',
-  '.prettierrc.json',
-  '.nvmrc',
-  '.node-version',
-]);
+/**
+ * Bounded metadata/content-hash cache that may be injected into short-lived
+ * snapshot services. It never stores file contents or semantic analyses.
+ */
+export class SemanticFingerprintCache {
+  private readonly entries = new Map<string, FingerprintCacheEntry>();
 
-const FINGERPRINT_CODE_EXTENSIONS = new Set([
-  '.ts',
-  '.tsx',
-  '.js',
-  '.jsx',
-  '.mjs',
-  '.cjs',
-  '.py',
-  '.go',
-  '.json',
-  '.yaml',
-  '.yml',
-  '.toml',
-]);
+  constructor(
+    private readonly maxEntries = MAX_FINGERPRINT_CACHE_ENTRIES,
+    private readonly ttlMs = DEFAULT_FINGERPRINT_CACHE_TTL_MS
+  ) {}
+
+  get(cacheKey: string, metadata: string): string | undefined {
+    const entry = this.entries.get(cacheKey);
+    if (!entry) return undefined;
+    const now = Date.now();
+    if (now - entry.lastUsedAt > this.ttlMs) {
+      this.entries.delete(cacheKey);
+      return undefined;
+    }
+    if (entry.metadata !== metadata) return undefined;
+    entry.lastUsedAt = now;
+    return entry.contentHash;
+  }
+
+  set(cacheKey: string, metadata: string, contentHash: string): void {
+    this.entries.set(cacheKey, { metadata, contentHash, lastUsedAt: Date.now() });
+    this.prune();
+  }
+
+  reconcileRepo(repoPrefix: string, liveCacheKeys: Set<string>): void {
+    for (const key of this.entries.keys()) {
+      if (key.startsWith(repoPrefix) && !liveCacheKeys.has(key)) this.entries.delete(key);
+    }
+    this.prune();
+  }
+
+  dispose(repoPath?: string): void {
+    if (!repoPath) {
+      this.entries.clear();
+      return;
+    }
+    const prefix = `${path.resolve(repoPath).toLowerCase()}\0`;
+    for (const key of this.entries.keys()) {
+      if (key.startsWith(prefix)) this.entries.delete(key);
+    }
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
+
+  private prune(): void {
+    const now = Date.now();
+    for (const [key, entry] of this.entries) {
+      if (now - entry.lastUsedAt > this.ttlMs) this.entries.delete(key);
+    }
+    if (this.entries.size <= this.maxEntries) return;
+    const stale = [...this.entries.entries()]
+      .sort((left, right) => left[1].lastUsedAt - right[1].lastUsedAt)
+      .slice(0, this.entries.size - this.maxEntries);
+    for (const [key] of stale) this.entries.delete(key);
+  }
+}
+
+export interface RepoFingerprintResult {
+  fingerprint: string;
+  files: number;
+  bytesRead: number;
+  contentReads: number;
+  cacheHits: number;
+  discoveries: number;
+  partial: boolean;
+  skipped: RepoDiscoverySkip[];
+  durationMs: number;
+}
+
+export class RepositoryChangingError extends Error {
+  readonly code = 'repositoryChanging';
+
+  constructor(readonly repoPath: string, readonly attempts: number) {
+    super(
+      `Semantic snapshot refresh could not stabilize for ${repoPath}; ` +
+      `repository changed during ${attempts} refresh attempts.`
+    );
+    this.name = 'RepositoryChangingError';
+  }
+}
 
 export class SemanticSnapshotService {
   private static readonly inFlightRefreshes = new Map<string, Promise<SemanticSnapshotWriteResult>>();
 
-  async captureRepoFingerprint(repoPath: string): Promise<string> {
-    return this.computeRepoFingerprint(repoPath);
+  constructor(
+    private readonly cacheEnabled = true,
+    private readonly fingerprintCache = new SemanticFingerprintCache(),
+    fingerprintLimits: Partial<FileMappingLimits> = {}
+  ) {
+    this.fingerprintLimits = {
+      maxFiles: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxFiles,
+        Math.max(0, Math.floor(fingerprintLimits.maxFiles ?? DEFAULT_FILE_MAPPING_LIMITS.maxFiles))
+      ),
+      maxTotalBytes: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxTotalBytes,
+        Math.max(
+          0,
+          Math.floor(fingerprintLimits.maxTotalBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxTotalBytes)
+        )
+      ),
+      maxFileBytes: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxFileBytes,
+        Math.max(
+          0,
+          Math.floor(fingerprintLimits.maxFileBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxFileBytes)
+        )
+      ),
+      maxDirectoriesScanned: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxDirectoriesScanned,
+        Math.max(
+          0,
+          Math.floor(
+            fingerprintLimits.maxDirectoriesScanned ??
+            DEFAULT_FILE_MAPPING_LIMITS.maxDirectoriesScanned
+          )
+        )
+      ),
+      maxEntriesScanned: Math.min(
+        DEFAULT_FILE_MAPPING_LIMITS.maxEntriesScanned,
+        Math.max(
+          0,
+          Math.floor(
+            fingerprintLimits.maxEntriesScanned ?? DEFAULT_FILE_MAPPING_LIMITS.maxEntriesScanned
+          )
+        )
+      ),
+    };
+  }
+
+  private readonly fingerprintLimits: FileMappingLimits;
+
+  async captureRepoFingerprint(repoPath: string, discovery?: RepoStructure): Promise<string> {
+    return (await this.computeRepoFingerprint(repoPath, discovery)).fingerprint;
+  }
+
+  async captureRepoFingerprintWithMetrics(
+    repoPath: string,
+    discovery?: RepoStructure
+  ): Promise<RepoFingerprintResult> {
+    return this.computeRepoFingerprint(repoPath, discovery);
   }
 
   async writeSnapshot(
@@ -172,27 +282,54 @@ export class SemanticSnapshotService {
     const outputDir = this.resolveOutputDir(repoStructure.rootPath, options.outputDir);
     const snapshotDir = this.getSnapshotDir(outputDir);
     const publishedSummaryPath = path.join(snapshotDir, SUMMARY_FILENAME);
+    const fileMapper = new FileMapper([], this.fingerprintLimits);
+    let attemptStructure = repoStructure;
+    let attemptFingerprint = options.repoFingerprint;
+    let generationMs = 0;
 
-    const repoFingerprint =
-      options.repoFingerprint ?? await this.computeRepoFingerprint(repoStructure.rootPath);
+    for (let attempt = 1; attempt <= MAX_REFRESH_ATTEMPTS; attempt += 1) {
+      const repoFingerprint = attemptFingerprint ?? (
+        await this.computeRepoFingerprint(repoStructure.rootPath, attemptStructure)
+      ).fingerprint;
+      const attemptOptions: SemanticSnapshotWriteOptions = attempt === 1
+        ? { ...options, repoFingerprint }
+        : {
+          outputDir: options.outputDir,
+          analyzerOptions: options.analyzerOptions,
+          repoFingerprint,
+        };
+      const generationStartedAt = Date.now();
+      const artifacts = await this.buildSnapshotArtifacts(attemptStructure, attemptOptions);
+      generationMs += Date.now() - generationStartedAt;
 
-    const artifacts = await this.buildSnapshotArtifacts(repoStructure, {
-      ...options,
-      repoFingerprint,
-    });
-    const manifest = await this.publishSnapshotArtifacts({
-      outputDir,
-      snapshotDir,
-      publishedSummaryPath,
-      artifacts,
-    });
+      const verificationStructure = await fileMapper.mapRepository(repoStructure.rootPath);
+      const verificationFingerprint = (
+        await this.computeRepoFingerprint(repoStructure.rootPath, verificationStructure)
+      ).fingerprint;
+      if (verificationFingerprint !== repoFingerprint) {
+        attemptStructure = verificationStructure;
+        attemptFingerprint = verificationFingerprint;
+        continue;
+      }
 
-    return {
-      summary: artifacts.summary,
-      manifest,
-      snapshotDir,
-      publishedSummaryPath,
-    };
+      const publicationStartedAt = Date.now();
+      const manifest = await this.publishSnapshotArtifacts({
+        outputDir,
+        snapshotDir,
+        publishedSummaryPath,
+        artifacts,
+      });
+      const publicationMs = Date.now() - publicationStartedAt;
+      return {
+        summary: artifacts.summary,
+        manifest,
+        snapshotDir,
+        publishedSummaryPath,
+        metrics: { generationMs, publicationMs, stabilizationAttempts: attempt },
+      };
+    }
+
+    throw new RepositoryChangingError(repoStructure.rootPath, MAX_REFRESH_ATTEMPTS);
   }
 
   async ensureFreshSummary(
@@ -301,45 +438,8 @@ export class SemanticSnapshotService {
 
     const refreshPromise = (async () => {
       const fileMapper = new FileMapper();
-      const snapshotDir = this.getSnapshotDir(outputDir);
-      const publishedSummaryPath = path.join(snapshotDir, SUMMARY_FILENAME);
-
-      for (let attempt = 1; attempt <= MAX_REFRESH_ATTEMPTS; attempt += 1) {
-        const repoFingerprint = await this.computeRepoFingerprint(repoPath);
-        const repoStructure = await fileMapper.mapRepository(repoPath);
-        const artifacts = await this.buildSnapshotArtifacts(repoStructure, {
-          outputDir,
-          repoFingerprint,
-        });
-        const currentFingerprint = await this.computeRepoFingerprint(repoPath);
-
-        if (currentFingerprint !== repoFingerprint) {
-          continue;
-        }
-
-        const manifest = await this.publishSnapshotArtifacts({
-          outputDir,
-          snapshotDir,
-          publishedSummaryPath,
-          artifacts,
-        });
-        const publishedFingerprint = await this.computeRepoFingerprint(repoPath);
-
-        if (publishedFingerprint !== repoFingerprint) {
-          continue;
-        }
-
-        return {
-          summary: artifacts.summary,
-          manifest,
-          snapshotDir,
-          publishedSummaryPath,
-        };
-      }
-
-      throw new Error(
-        `Semantic snapshot refresh could not stabilize for ${repoPath}; repository changed during refresh.`
-      );
+      const repoStructure = await fileMapper.mapRepository(repoPath);
+      return this.writeSnapshot(repoStructure, { outputDir });
     })();
 
     SemanticSnapshotService.inFlightRefreshes.set(refreshKey, refreshPromise);
@@ -424,14 +524,12 @@ export class SemanticSnapshotService {
     try {
       if (!semantics || !functionalPatterns) {
         analyzer = new CodebaseAnalyzer(options.analyzerOptions);
-      }
-
-      if (!semantics) {
-        semantics = await analyzer!.analyze(repoStructure.rootPath);
-      }
-
-      if (!functionalPatterns) {
-        functionalPatterns = await analyzer!.detectFunctionalPatterns(repoStructure.rootPath);
+        const bundle = await analyzer.analyzeBundle(
+          repoStructure.rootPath,
+          repoStructure
+        );
+        semantics ??= bundle.context;
+        functionalPatterns ??= bundle.functionalPatterns;
       }
 
       if (!stackInfo) {
@@ -448,7 +546,7 @@ export class SemanticSnapshotService {
       schemaVersion: SNAPSHOT_SCHEMA_VERSION,
       generatedAt: new Date().toISOString(),
       repoFingerprint:
-        options.repoFingerprint ?? await this.computeRepoFingerprint(repoStructure.rootPath),
+        options.repoFingerprint ?? (await this.computeRepoFingerprint(repoStructure.rootPath)).fingerprint,
       analyzer: {
         useLSP: !!options.analyzerOptions?.useLSP,
         includesSymbolPayload: false,
@@ -726,46 +824,174 @@ export class SemanticSnapshotService {
   }
 
   private async isFresh(repoPath: string, expectedFingerprint: string): Promise<boolean> {
-    return expectedFingerprint === await this.computeRepoFingerprint(repoPath);
+    return expectedFingerprint === (await this.computeRepoFingerprint(repoPath)).fingerprint;
   }
 
-  private async computeRepoFingerprint(repoPath: string): Promise<string> {
-    const files = await glob('**/*', {
-      cwd: repoPath,
-      nodir: true,
-      dot: true,
-      ignore: FINGERPRINT_IGNORE_PATTERNS,
-    });
-
-    const relevantFiles = files
-      .filter((filePath) => this.isFingerprintRelevant(filePath))
-      .sort();
-
-    const hash = createHash('sha1');
-    for (const relativePath of relevantFiles) {
-      const absolutePath = path.join(repoPath, relativePath);
+  private async computeRepoFingerprint(
+    repoPath: string,
+    discovery?: RepoStructure
+  ): Promise<RepoFingerprintResult> {
+    const startedAt = Date.now();
+    const boundedDiscovery = discovery ?? await new FileMapper([], this.fingerprintLimits)
+      .mapRepository(repoPath);
+    const discoveries = discovery ? 0 : 1;
+    const relevantFiles = [...boundedDiscovery.files]
+      .sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    const skipped = [...(boundedDiscovery.skipped ?? [])];
+    let partial = !!boundedDiscovery.partial;
+    const hash = createHash('sha256');
+    let bytesRead = 0;
+    let contentReads = 0;
+    let cacheHits = 0;
+    let filesHashed = 0;
+    let selectedBytes = 0;
+    const liveCacheKeys = new Set<string>();
+    const repoPrefix = `${path.resolve(repoPath).toLowerCase()}\0`;
+    for (const discoveredFile of relevantFiles) {
+      const relativePath = discoveredFile.relativePath.split(path.sep).join('/');
+      if (filesHashed >= this.fingerprintLimits.maxFiles) {
+        partial = true;
+        this.recordFingerprintSkip(skipped, {
+          file: discoveredFile.path,
+          reason: 'file-limit',
+          size: discoveredFile.size,
+        });
+        break;
+      }
+      const absolutePath = discoveredFile.path;
+      const cacheKey = `${repoPrefix}${relativePath}`;
       try {
-        hash.update(`${relativePath}\0`);
-        hash.update(await fs.readFile(absolutePath));
-        hash.update('\0');
+        const stats = await nativeFs.stat(absolutePath, { bigint: true });
+        const size = Number(stats.size);
+        if (stats.size > BigInt(this.fingerprintLimits.maxFileBytes)) {
+          partial = true;
+          this.recordFingerprintSkip(skipped, {
+            file: absolutePath,
+            reason: 'file-too-large',
+            size,
+            mtimeMs: Number(stats.mtimeNs) / 1_000_000,
+            ctimeMs: Number(stats.ctimeNs) / 1_000_000,
+          });
+          hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0skipped:file-too-large\n`);
+          continue;
+        }
+        if (selectedBytes + size > this.fingerprintLimits.maxTotalBytes) {
+          partial = true;
+          this.recordFingerprintSkip(skipped, {
+            file: absolutePath,
+            reason: 'total-byte-limit',
+            size,
+          });
+          hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0skipped:total-byte-limit\n`);
+          break;
+        }
+
+        liveCacheKeys.add(cacheKey);
+        const metadata = `${stats.size}:${stats.mtimeNs}:${stats.ctimeNs}`;
+        let contentHash: string;
+        const cachedHash = this.cacheEnabled
+          ? this.fingerprintCache.get(cacheKey, metadata)
+          : undefined;
+        if (cachedHash) {
+          contentHash = cachedHash;
+          cacheHits += 1;
+        } else {
+          const boundedHash = await this.hashFileContentBounded(
+            absolutePath,
+            Math.min(
+              this.fingerprintLimits.maxFileBytes,
+              this.fingerprintLimits.maxTotalBytes - selectedBytes
+            )
+          );
+          bytesRead += boundedHash.bytesRead;
+          contentReads += 1;
+          if (boundedHash.exceeded) {
+            partial = true;
+            const reason = selectedBytes + boundedHash.bytesRead > this.fingerprintLimits.maxTotalBytes
+              ? 'total-byte-limit'
+              : 'file-too-large';
+            this.recordFingerprintSkip(skipped, { file: absolutePath, reason, size });
+            hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0skipped:${reason}\n`);
+            continue;
+          }
+          contentHash = boundedHash.contentHash!;
+          if (this.cacheEnabled) {
+            this.fingerprintCache.set(cacheKey, metadata, contentHash);
+          }
+        }
+        hash.update(`${relativePath}\0${stats.size}\0${stats.mtimeNs}\0${contentHash}\n`);
+        filesHashed += 1;
+        selectedBytes += size;
       } catch {
         hash.update(`${relativePath}:missing\n`);
+        partial = true;
+        this.recordFingerprintSkip(skipped, { file: absolutePath, reason: 'stat-failed' });
       }
     }
 
-    return hash.digest('hex');
-  }
-
-  private isFingerprintRelevant(relativePath: string): boolean {
-    if (FINGERPRINT_ROOT_FILES.has(relativePath)) {
-      return true;
+    for (const skip of skipped) {
+      const relativePath = path.relative(repoPath, skip.file).split(path.sep).join('/');
+      hash.update(`discovery-skip:${relativePath}:${skip.reason}:${skip.size ?? 'unknown'}\n`);
     }
 
-    const topLevel = relativePath.split('/')[0];
-    if (['src', 'lib', 'bin', 'app', 'packages', 'scripts'].includes(topLevel)) {
-      return true;
+    // Git index identity is an additional signal only; dirty files are still
+    // represented by their independently hashed metadata/content above.
+    try {
+      const gitIndex = await fs.stat(path.join(repoPath, '.git', 'index'));
+      hash.update(`git-index:${gitIndex.size}:${gitIndex.mtimeMs}\n`);
+    } catch {
+      // Non-git repositories are fully supported.
     }
 
-    return FINGERPRINT_CODE_EXTENSIONS.has(path.extname(relativePath).toLowerCase());
+    if (this.cacheEnabled) {
+      this.fingerprintCache.reconcileRepo(repoPrefix, liveCacheKeys);
+    }
+
+    return {
+      fingerprint: hash.digest('hex'),
+      files: filesHashed,
+      bytesRead,
+      contentReads,
+      cacheHits,
+      discoveries,
+      partial,
+      skipped,
+      durationMs: Date.now() - startedAt,
+    };
   }
+
+  private recordFingerprintSkip(
+    skipped: RepoDiscoverySkip[],
+    skip: RepoDiscoverySkip
+  ): void {
+    if (skipped.length < 1_000) skipped.push(skip);
+  }
+
+  private async hashFileContentBounded(
+    filePath: string,
+    maxBytes: number
+  ): Promise<{ contentHash?: string; bytesRead: number; exceeded: boolean }> {
+    const handle = await nativeFs.open(filePath, 'r');
+    const contentHash = createHash('sha256');
+    const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, Math.max(1, maxBytes)));
+    let bytesRead = 0;
+    try {
+      while (bytesRead < maxBytes) {
+        const length = Math.min(chunk.length, maxBytes - bytesRead);
+        const read = await handle.read(chunk, 0, length, null);
+        if (read.bytesRead === 0) {
+          return { contentHash: contentHash.digest('hex'), bytesRead, exceeded: false };
+        }
+        contentHash.update(chunk.subarray(0, read.bytesRead));
+        bytesRead += read.bytesRead;
+      }
+      const probe = Buffer.allocUnsafe(1);
+      const extra = await handle.read(probe, 0, 1, null);
+      if (extra.bytesRead > 0) return { bytesRead: bytesRead + 1, exceeded: true };
+      return { contentHash: contentHash.digest('hex'), bytesRead, exceeded: false };
+    } finally {
+      await handle.close();
+    }
+  }
+
 }

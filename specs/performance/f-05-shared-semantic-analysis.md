@@ -58,7 +58,9 @@ Defaults:
 | code files parsed | 5,000 |
 | total source bytes parsed | 256 MiB |
 | single source file | 2 MiB |
-| file analysis concurrency | 16 |
+| directories scanned | 10,000 (absolute maximum 50,000) |
+| raw directory entries scanned | 100,000 (absolute maximum 500,000) |
+| file analysis concurrency | 16 (absolute maximum 64) |
 | fingerprint attempts | 2 |
 
 Skip oversized files with a reason and mark partial=true.
@@ -118,4 +120,3 @@ Introduce AnalysisBundle behind the existing context service while legacy direct
 ## Observability
 
 Record discovery, parsing, fingerprint, generation and publication durations; file and byte counts; cache hits; skipped file reasons; partial status; and stabilization attempts.
-

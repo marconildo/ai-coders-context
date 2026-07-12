@@ -7,6 +7,11 @@
 
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import type { FileInfo, RepoDiscoveryMetrics, RepoStructure } from '../../../../types';
+import {
+  ABSOLUTE_FILE_MAPPING_SCAN_LIMITS,
+  FileMapper,
+} from '../../../../utils/fileMapper';
 import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
 import { TreeSitterLayer } from './treeSitter/treeSitterLayer';
 import { LSPLayer } from './lsp/lspLayer';
@@ -28,7 +33,6 @@ import {
   FlowEdge,
   ExecutionFlow,
 } from './types';
-import { discoverBoundedFiles, type BoundedDiscoveryMetrics } from './discovery';
 
 const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   useLSP: false,
@@ -36,11 +40,74 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   exclude: DEFAULT_EXCLUDE_PATTERNS,
   include: [],
   maxFiles: 5000,
+  maxTotalBytes: 256 * 1024 * 1024,
+  maxFileBytes: 2 * 1024 * 1024,
+  maxDirectoriesScanned: 10_000,
   maxEntriesScanned: 100_000,
+  concurrency: 16,
   cacheEnabled: true,
   fileAnalysisCacheMaxEntries: 5_000,
   fileAnalysisCacheMaxBytes: 128 * 1024 * 1024,
 };
+
+/** Absolute ceiling for direct API callers to avoid allocating excessive workers. */
+export const MAX_FILE_ANALYSIS_CONCURRENCY = 64;
+
+export interface AnalysisLimits {
+  maxFiles: number;
+  maxTotalBytes: number;
+  maxFileBytes: number;
+  maxDirectoriesScanned: number;
+  maxEntriesScanned: number;
+  concurrency: number;
+}
+
+export type AnalysisSkipReason =
+  | 'file-limit'
+  | 'total-byte-limit'
+  | 'file-too-large'
+  | 'directory-limit'
+  | 'entry-limit'
+  | 'stat-failed';
+
+export interface SkippedAnalysisFile {
+  file: string;
+  reason: AnalysisSkipReason;
+  size?: number;
+}
+
+export interface AnalysisMetrics {
+  directoriesScanned: number;
+  entriesScanned: number;
+  filesDiscovered: number;
+  filesParsed: number;
+  fileReads: number;
+  bytesRead: number;
+  maxInFlight: number;
+  cacheHits: number;
+  durationsMs: {
+    discovery: number;
+    parsing: number;
+    architecture: number;
+    functionalPatterns: number;
+    generation: number;
+    publication: number;
+    total: number;
+  };
+}
+
+export interface SemanticAnalysisBundle {
+  context: SemanticContext;
+  functionalPatterns: DetectedFunctionalPatterns;
+  files: string[];
+  limits: AnalysisLimits;
+  partial: boolean;
+  skipped: SkippedAnalysisFile[];
+  metrics: AnalysisMetrics;
+}
+
+type DiscoveredAnalysisFile = string | Pick<FileInfo, 'path' | 'size'>;
+type SemanticDiscoveryInput = DiscoveredAnalysisFile[] | RepoStructure;
 
 export class CodebaseAnalyzer {
   private treeSitter: TreeSitterLayer;
@@ -49,13 +116,31 @@ export class CodebaseAnalyzer {
   private readonly fileCacheEntriesExplicit: boolean;
   private readonly fileCacheBytesExplicit: boolean;
   private readonly maxEntriesScannedExplicit: boolean;
-  private lastDiscovery?: BoundedDiscoveryMetrics;
+  private lastDiscovery?: import('./discovery').BoundedDiscoveryMetrics;
 
   constructor(options: AnalyzerOptions = {}) {
     this.fileCacheEntriesExplicit = options.fileAnalysisCacheMaxEntries !== undefined;
     this.fileCacheBytesExplicit = options.fileAnalysisCacheMaxBytes !== undefined;
     this.maxEntriesScannedExplicit = options.maxEntriesScanned !== undefined;
     this.options = { ...DEFAULT_OPTIONS, ...options };
+    this.options.maxFiles = Math.max(0, this.options.maxFiles);
+    this.options.maxTotalBytes = Math.max(0, this.options.maxTotalBytes);
+    this.options.maxFileBytes = Math.max(0, this.options.maxFileBytes);
+    this.options.maxDirectoriesScanned = Math.min(
+      ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxDirectoriesScanned,
+      Math.max(0, Math.floor(this.options.maxDirectoriesScanned))
+    );
+    this.options.maxEntriesScanned = Math.min(
+      ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxEntriesScanned,
+      Math.max(0, Math.floor(this.options.maxEntriesScanned))
+    );
+    const configuredConcurrency = Number.isFinite(this.options.concurrency)
+      ? Math.floor(this.options.concurrency)
+      : DEFAULT_OPTIONS.concurrency;
+    this.options.concurrency = Math.min(
+      MAX_FILE_ANALYSIS_CONCURRENCY,
+      Math.max(1, configuredConcurrency)
+    );
     this.treeSitter = new TreeSitterLayer({
       cacheEnabled: this.options.cacheEnabled,
       maxEntries: this.options.fileAnalysisCacheMaxEntries,
@@ -69,27 +154,103 @@ export class CodebaseAnalyzer {
   }
 
   async analyze(projectPath: string): Promise<SemanticContext> {
+    return (await this.analyzeProject(projectPath)).context;
+  }
+
+  async analyzeBundle(
+    projectPath: string,
+    discoveryInput?: SemanticDiscoveryInput
+  ): Promise<SemanticAnalysisBundle> {
+    const result = await this.analyzeProject(projectPath, discoveryInput);
+    const functionalStartedAt = Date.now();
+    const functionalPatterns = this.detectFunctionalPatternsFromAnalyses(
+      result.files,
+      result.fileAnalyses
+    );
+    result.metrics.durationsMs.functionalPatterns = Date.now() - functionalStartedAt;
+    result.metrics.durationsMs.total = Date.now() - result.startedAt;
+    return {
+      context: result.context,
+      functionalPatterns,
+      files: result.files,
+      limits: this.analysisLimits(),
+      partial: result.skipped.length > 0,
+      skipped: result.skipped,
+      metrics: result.metrics,
+    };
+  }
+
+  private async analyzeProject(projectPath: string, discoveryInput?: SemanticDiscoveryInput): Promise<{
+    context: SemanticContext;
+    files: string[];
+    fileAnalyses: Map<string, FileAnalysis>;
+    skipped: SkippedAnalysisFile[];
+    metrics: AnalysisMetrics;
+    startedAt: number;
+  }> {
     const startTime = Date.now();
     const { config } = await loadRuntimeRetentionConfig(projectPath);
     if (this.options.cacheEnabled) {
       this.treeSitter.configureCache?.({
-        maxEntries: this.fileCacheEntriesExplicit ? this.options.fileAnalysisCacheMaxEntries : config.caches.fileAnalysis.maxEntries,
-        maxBytes: this.fileCacheBytesExplicit ? this.options.fileAnalysisCacheMaxBytes : config.caches.fileAnalysis.maxBytes,
+        maxEntries: this.fileCacheEntriesExplicit
+          ? this.options.fileAnalysisCacheMaxEntries
+          : config.caches.fileAnalysis.maxEntries,
+        maxBytes: this.fileCacheBytesExplicit
+          ? this.options.fileAnalysisCacheMaxBytes
+          : config.caches.fileAnalysis.maxBytes,
         scope: path.resolve(projectPath),
       });
     }
+    const metrics: AnalysisMetrics = {
+      directoriesScanned: 0,
+      entriesScanned: 0,
+      filesDiscovered: 0,
+      filesParsed: 0,
+      fileReads: 0,
+      bytesRead: 0,
+      maxInFlight: 0,
+      cacheHits: 0,
+      durationsMs: {
+        discovery: 0,
+        parsing: 0,
+        architecture: 0,
+        functionalPatterns: 0,
+        generation: 0,
+        publication: 0,
+        total: 0,
+      },
+    };
 
-    // 1. Find all code files
-    const files = await this.findCodeFiles(
-      projectPath,
-      this.maxEntriesScannedExplicit
-        ? this.options.maxEntriesScanned
-        : config.caches.semantic.maxEntriesScanned,
-    );
+    // 1. Select source files once, applying byte and count budgets before parsing.
+    const discoveryStartedAt = Date.now();
+    const discovery = discoveryInput
+      ? this.discoveryFromInput(projectPath, discoveryInput)
+      : await this.findCodeFiles(
+          projectPath,
+          this.maxEntriesScannedExplicit
+            ? this.options.maxEntriesScanned
+            : Math.min(this.options.maxEntriesScanned, config.caches.semantic.maxEntriesScanned)
+        );
+    const candidates = discovery.files;
+    metrics.directoriesScanned = discovery.metrics?.directoriesScanned ?? 0;
+    metrics.entriesScanned = discovery.metrics?.entriesScanned ?? 0;
+    metrics.filesDiscovered = candidates.length;
+    const selected = await this.selectFilesWithinLimits(candidates);
+    const files = selected.files;
+    const skipped = [...discovery.skipped, ...selected.skipped];
+    const bytes = selected.bytes;
+    metrics.bytesRead = bytes;
+    metrics.durationsMs.discovery = Date.now() - discoveryStartedAt;
 
     // 2. Analyze with Tree-sitter
-    const fileAnalyses = await this.analyzeFiles(files);
+    if (!this.options.cacheEnabled) {
+      this.treeSitter.clearCache();
+    }
+    const parsingStartedAt = Date.now();
+    const fileAnalyses = await this.analyzeFiles(files, metrics);
     this.treeSitter.retainOnly?.(files);
+    metrics.filesParsed = fileAnalyses.size;
+    metrics.durationsMs.parsing = Date.now() - parsingStartedAt;
 
     // 3. Build base context
     const context = this.buildBaseContext(fileAnalyses, projectPath);
@@ -100,41 +261,211 @@ export class CodebaseAnalyzer {
     }
 
     // 5. Detect architecture and patterns
+    const architectureStartedAt = Date.now();
     context.architecture = this.detectArchitecture(fileAnalyses, projectPath);
+    metrics.durationsMs.architecture = Date.now() - architectureStartedAt;
 
     // 6. Calculate stats
     context.stats.analysisTimeMs = Date.now() - startTime;
+    metrics.durationsMs.total = context.stats.analysisTimeMs;
 
-    return context;
-  }
-
-  private async findCodeFiles(projectPath: string, maxEntriesScanned: number): Promise<string[]> {
-    const discovery = await discoverBoundedFiles(projectPath, {
-      maxFiles: this.options.maxFiles,
-      maxDirectories: Math.min(10_000, this.options.maxFiles * 2 + 32),
-      maxEntriesScanned,
-      extensions: Object.keys(LANGUAGE_EXTENSIONS),
-      include: this.options.include,
-      excludeDirectoryNames: this.options.exclude,
-    });
-    this.lastDiscovery = discovery.metrics;
-    return discovery.files;
-  }
-
-  private async analyzeFiles(files: string[]): Promise<Map<string, FileAnalysis>> {
-    const analyses = new Map<string, FileAnalysis>();
-    const batchSize = 50;
-
-    for (let i = 0; i < files.length; i += batchSize) {
-      const batch = files.slice(i, i + batchSize);
-      const results = await Promise.all(
-        batch.map((file) => this.treeSitter.analyzeFile(file))
-      );
-
-      for (const analysis of results) {
-        analyses.set(analysis.filePath, analysis);
-      }
+    if (!this.options.cacheEnabled) {
+      this.treeSitter.clearCache();
     }
+
+    return {
+      context,
+      files,
+      fileAnalyses,
+      skipped,
+      metrics,
+      startedAt: startTime,
+    };
+  }
+
+  private analysisLimits(): AnalysisLimits {
+    return {
+      maxFiles: this.options.maxFiles,
+      maxTotalBytes: this.options.maxTotalBytes,
+      maxFileBytes: this.options.maxFileBytes,
+      maxDirectoriesScanned: this.options.maxDirectoriesScanned,
+      maxEntriesScanned: this.options.maxEntriesScanned,
+      concurrency: this.options.concurrency,
+    };
+  }
+
+  private async findCodeFiles(
+    projectPath: string,
+    maxEntriesScanned = this.options.maxEntriesScanned
+  ): Promise<{
+    files: Array<{ path: string; size?: number }>;
+    skipped: SkippedAnalysisFile[];
+    metrics?: RepoDiscoveryMetrics;
+  }> {
+    const startedAt = Date.now();
+    try {
+      const structure = await new FileMapper(this.options.exclude, {
+        maxFiles: this.options.maxFiles,
+        maxTotalBytes: this.options.maxTotalBytes,
+        maxFileBytes: this.options.maxFileBytes,
+        maxDirectoriesScanned: this.options.maxDirectoriesScanned,
+        maxEntriesScanned,
+      }).mapRepository(projectPath);
+      const discoveryMetrics = structure.discoveryMetrics;
+      const limitSkip = structure.skipped?.find((item) =>
+        item.reason === 'file-limit' || item.reason === 'directory-limit' || item.reason === 'entry-limit'
+      );
+      if (discoveryMetrics) {
+        this.lastDiscovery = {
+          filesSelected: structure.files.length,
+          directoriesVisited: discoveryMetrics.directoriesScanned,
+          entriesScanned: discoveryMetrics.entriesScanned,
+          statsAttempted: discoveryMetrics.statCalls,
+          partial: Boolean(structure.partial || discoveryMetrics.stoppedEarly),
+          stopReason: limitSkip?.reason === 'file-limit'
+            ? 'maxFiles'
+            : limitSkip?.reason === 'directory-limit'
+              ? 'maxDirectories'
+              : limitSkip?.reason === 'entry-limit'
+                ? 'maxEntriesScanned'
+                : undefined,
+          durationMs: Date.now() - startedAt,
+        };
+      }
+      return {
+        files: this.filterCodeFiles(projectPath, structure.files),
+        skipped: (structure.skipped ?? []).map((skip) => ({
+          file: skip.file,
+          reason: skip.reason,
+          size: skip.size,
+        })),
+        metrics: structure.discoveryMetrics,
+      };
+    } catch {
+      return { files: [], skipped: [] };
+    }
+  }
+
+  private discoveryFromInput(
+    projectPath: string,
+    input: SemanticDiscoveryInput
+  ): {
+    files: Array<{ path: string; size?: number }>;
+    skipped: SkippedAnalysisFile[];
+    metrics?: RepoDiscoveryMetrics;
+  } {
+    if (Array.isArray(input)) {
+      return { files: this.filterCodeFiles(projectPath, input), skipped: [] };
+    }
+    return {
+      files: this.filterCodeFiles(projectPath, input.files),
+      skipped: (input.skipped ?? []).map((skip) => ({
+        file: skip.file,
+        reason: skip.reason,
+        size: skip.size,
+      })),
+      metrics: input.discoveryMetrics,
+    };
+  }
+
+  private filterCodeFiles(
+    projectPath: string,
+    discoveredFiles: DiscoveredAnalysisFile[]
+  ): Array<{ path: string; size?: number }> {
+    const supported = new Set(Object.keys(LANGUAGE_EXTENSIONS));
+    const unique = new Map<string, { path: string; size?: number }>();
+    for (const discovered of discoveredFiles) {
+      const file = typeof discovered === 'string' ? discovered : discovered.path;
+      const absolutePath = path.isAbsolute(file) ? file : path.resolve(projectPath, file);
+      unique.set(absolutePath, {
+        path: absolutePath,
+        size: typeof discovered === 'string' ? undefined : discovered.size,
+      });
+    }
+    return [...unique.values()]
+      .filter((file) => {
+        const extension = path.extname(file.path).toLowerCase();
+        return supported.has(extension) &&
+          this.options.languages.includes(LANGUAGE_EXTENSIONS[extension]);
+      })
+      .filter((file) => this.options.include.length === 0 ||
+        this.options.include.some((pattern) => file.path.includes(pattern)))
+      .sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  private async selectFilesWithinLimits(
+    candidates: Array<{ path: string; size?: number }>
+  ): Promise<{
+    files: string[];
+    skipped: SkippedAnalysisFile[];
+    bytes: number;
+  }> {
+    const selected: string[] = [];
+    const skipped: SkippedAnalysisFile[] = [];
+    let bytes = 0;
+
+    for (const candidate of candidates) {
+      const file = candidate.path;
+      let size = candidate.size;
+      if (size === undefined) {
+        try {
+          size = (await fs.stat(file)).size;
+        } catch {
+          skipped.push({ file, reason: 'stat-failed' });
+          continue;
+        }
+      }
+
+      if (size > this.options.maxFileBytes) {
+        skipped.push({ file, reason: 'file-too-large', size });
+        continue;
+      }
+      if (selected.length >= this.options.maxFiles) {
+        skipped.push({ file, reason: 'file-limit', size });
+        continue;
+      }
+      if (bytes + size > this.options.maxTotalBytes) {
+        skipped.push({ file, reason: 'total-byte-limit', size });
+        continue;
+      }
+
+      selected.push(file);
+      bytes += size;
+    }
+
+    return { files: selected, skipped, bytes };
+  }
+
+  private async analyzeFiles(
+    files: string[],
+    metrics?: AnalysisMetrics
+  ): Promise<Map<string, FileAnalysis>> {
+    const analyses = new Map<string, FileAnalysis>();
+    let cursor = 0;
+    let inFlight = 0;
+    const workerCount = Math.min(this.options.concurrency, files.length);
+
+    const worker = async (): Promise<void> => {
+      while (cursor < files.length) {
+        const index = cursor;
+        cursor += 1;
+        inFlight += 1;
+        if (metrics) {
+          metrics.maxInFlight = Math.max(metrics.maxInFlight, inFlight);
+        }
+        try {
+          if (metrics) {
+            metrics.fileReads += 1;
+          }
+          const analysis = await this.treeSitter.analyzeFile(files[index]);
+          analyses.set(analysis.filePath, analysis);
+        } finally {
+          inFlight -= 1;
+        }
+      }
+    };
+
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
 
     return analyses;
   }
@@ -604,7 +935,7 @@ export class CodebaseAnalyzer {
     return this.treeSitter.cacheMetrics();
   }
 
-  discoveryMetrics(): BoundedDiscoveryMetrics | undefined {
+  discoveryMetrics(): import('./discovery').BoundedDiscoveryMetrics | undefined {
     return this.lastDiscovery ? { ...this.lastDiscovery } : undefined;
   }
 
@@ -612,7 +943,11 @@ export class CodebaseAnalyzer {
    * Shutdown LSP servers gracefully
    */
   async shutdown(): Promise<void> {
-    this.treeSitter.dispose?.();
+    if (this.options.cacheEnabled) {
+      this.treeSitter.dispose?.();
+    } else {
+      this.treeSitter.clearCache();
+    }
     if (this.lspLayer) {
       await this.lspLayer.shutdown();
     }
@@ -688,15 +1023,13 @@ export class CodebaseAnalyzer {
    * These patterns indicate functional capabilities like auth, database, API, etc.
    */
   async detectFunctionalPatterns(projectPath: string): Promise<DetectedFunctionalPatterns> {
-    const { config } = await loadRuntimeRetentionConfig(projectPath);
-    const files = await this.findCodeFiles(
-      projectPath,
-      this.maxEntriesScannedExplicit
-        ? this.options.maxEntriesScanned
-        : config.caches.semantic.maxEntriesScanned,
-    );
-    const analyses = await this.analyzeFiles(files);
+    return (await this.analyzeBundle(projectPath)).functionalPatterns;
+  }
 
+  private detectFunctionalPatternsFromAnalyses(
+    files: string[],
+    analyses: Map<string, FileAnalysis>
+  ): DetectedFunctionalPatterns {
     const patterns: FunctionalPattern[] = [];
     const allSymbols = [...analyses.values()].flatMap((a) => a.symbols);
     const allImports = [...analyses.values()].flatMap((a) =>

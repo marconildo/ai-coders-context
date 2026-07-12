@@ -1,4 +1,5 @@
 import * as fs from 'fs-extra';
+import { promises as nativeFs } from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
@@ -9,6 +10,11 @@ import {
   listFilesToFillTool,
 } from '../contextTools';
 import { toolExecutionContext } from '../../../../shared';
+import { CodebaseAnalyzer } from '../../../adapters/out/semantic';
+import { DocumentationGenerator } from '../scaffolding/generators/documentation/documentationGenerator';
+import { AgentGenerator } from '../scaffolding/generators/agents/agentGenerator';
+import { SemanticSnapshotService } from '../../../adapters/out/semantic';
+import { FileMapper } from '../../../../utils/fileMapper';
 
 describe('contextTools sensors scaffolding', () => {
   let tempDir: string;
@@ -29,7 +35,109 @@ describe('contextTools sensors scaffolding', () => {
   });
 
   afterEach(async () => {
+    jest.restoreAllMocks();
     await fs.remove(tempDir);
+  });
+
+  it('shares one semantic analysis bundle across docs, snapshot, and agents', async () => {
+    const analyzeBundle = jest.spyOn(CodebaseAnalyzer.prototype, 'analyzeBundle');
+    const docs = jest.spyOn(DocumentationGenerator.prototype, 'generateDocumentation');
+    const agents = jest.spyOn(AgentGenerator.prototype, 'generateAgentPrompts');
+    const snapshot = jest.spyOn(SemanticSnapshotService.prototype, 'writeSnapshot');
+
+    await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'both',
+        semantic: true,
+        generateQA: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    );
+
+    expect(analyzeBundle).toHaveBeenCalledTimes(1);
+    const analyzed = await analyzeBundle.mock.results[0].value;
+    const docsConfig = docs.mock.calls[0][2]!;
+    const agentsConfig = agents.mock.calls[0][2]!;
+    expect(docsConfig).toEqual(expect.objectContaining({
+      semanticContext: analyzed.context,
+      functionalPatterns: analyzed.functionalPatterns,
+    }));
+    expect(docsConfig).toEqual(expect.objectContaining({
+      analysisBundle: expect.objectContaining({ semanticContext: analyzed.context }),
+    }));
+    expect(agentsConfig).toEqual(expect.objectContaining({
+      semanticContext: analyzed.context,
+      analysisBundle: docsConfig.analysisBundle,
+    }));
+    expect(snapshot.mock.calls[0][1]).toEqual(expect.objectContaining({
+      semantics: analyzed.context,
+      functionalPatterns: analyzed.functionalPatterns,
+    }));
+  });
+
+  it('performs one bundle discovery plus publication verification per operation', async () => {
+    const repositoryDiscovery = jest.spyOn(FileMapper.prototype, 'mapRepository');
+
+    const first = await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'both',
+        semantic: true,
+        generateQA: false,
+        generateSkills: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    ) as Record<string, any>;
+    const second = await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'both',
+        semantic: true,
+        generateQA: false,
+        generateSkills: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    ) as Record<string, any>;
+
+    const firstFingerprint = first._metadata.analysis.metrics.fingerprint;
+    const secondFingerprint = second._metadata.analysis.metrics.fingerprint;
+    expect(repositoryDiscovery).toHaveBeenCalledTimes(4);
+    expect(firstFingerprint.discoveries).toBe(0);
+    expect(firstFingerprint.contentReads).toBe(firstFingerprint.files);
+    expect(secondFingerprint.discoveries).toBe(0);
+    expect(secondFingerprint.contentReads).toBe(0);
+    expect(secondFingerprint.bytesRead).toBe(0);
+    expect(secondFingerprint.cacheHits).toBe(secondFingerprint.files);
+  });
+
+  it('propagates discovery skips and partial state without reading oversized source files', async () => {
+    const hugePath = path.join(tempDir, 'src', 'huge.ts');
+    const handle = await nativeFs.open(hugePath, 'w');
+    await handle.truncate(3 * 1024 * 1024);
+    await handle.close();
+
+    const result = await initializeContextTool.execute!(
+      {
+        repoPath: tempDir,
+        type: 'agents',
+        semantic: true,
+        generateQA: false,
+        generateSkills: false,
+        skipContentGeneration: true,
+      },
+      toolExecutionContext
+    ) as Record<string, any>;
+
+    expect(result._metadata.analysis.partial).toBe(true);
+    expect(result._metadata.analysis.skipped).toEqual(expect.arrayContaining([
+      expect.objectContaining({ file: hugePath, reason: 'file-too-large' }),
+    ]));
+    expect(result._metadata.analysis.metrics.fingerprint.bytesRead)
+      .toBeLessThan(3 * 1024 * 1024);
   });
 
   it('includes bootstrap sensors.json in pending writes and listToFill', async () => {
