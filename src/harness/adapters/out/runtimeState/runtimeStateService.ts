@@ -33,6 +33,55 @@ import {
 } from '../../../application/history/runtimeHistory';
 
 const traceWriteQueues = new Map<string, Promise<void>>();
+const TRACE_LOCK_STALE_MS = 60_000;
+const ROTATION_EVENT_RESERVE_BYTES = 2 * 1024;
+
+interface TraceLockIdentity {
+  pid: number;
+  token: string;
+  createdAt?: string;
+}
+
+interface TraceFileLock extends TraceLockIdentity {
+  lockFile: string;
+  handle: FileHandle;
+  inode: bigint | number;
+  device: bigint | number;
+}
+
+interface TraceLockSnapshot extends TraceLockIdentity {
+  inode: bigint | number;
+  device: bigint | number;
+  mtimeMs: number;
+}
+
+interface TraceTakeoverDocument extends TraceLockIdentity {
+  createdAt: string;
+  inode: string;
+  device: string;
+  target: {
+    inode: string;
+    device: string;
+    token: string;
+  };
+}
+
+interface CurrentTraceTakeoverSnapshot extends TraceTakeoverDocument {
+  format: 'current';
+  actualInode: bigint | number;
+  actualDevice: bigint | number;
+  mtimeMs: number;
+}
+
+interface LegacyTraceTakeoverSnapshot extends TraceLockIdentity {
+  format: 'legacy';
+  createdAt: string;
+  actualInode: bigint | number;
+  actualDevice: bigint | number;
+  mtimeMs: number;
+}
+
+type TraceTakeoverSnapshot = CurrentTraceTakeoverSnapshot | LegacyTraceTakeoverSnapshot;
 
 function waitForLock(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
@@ -48,29 +97,273 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-async function acquireTraceFileLock(
-  traceFile: string
-): Promise<{ lockFile: string; handle: FileHandle; inode: bigint | number }> {
+function parseTraceLockIdentity(value: string): TraceLockIdentity {
+  try {
+    const parsed = JSON.parse(value) as Partial<TraceLockIdentity>;
+    return {
+      pid: typeof parsed.pid === 'number' ? parsed.pid : Number.NaN,
+      token: typeof parsed.token === 'string' ? parsed.token : '',
+      createdAt: typeof parsed.createdAt === 'string' ? parsed.createdAt : undefined,
+    };
+  } catch {
+    // Preserve takeover compatibility with locks written by the first F-02
+    // implementation (`pid timestamp`).
+    return { pid: Number.parseInt(value.split(/\s/, 1)[0], 10), token: value.trim() };
+  }
+}
+
+async function sameLockIdentity(
+  file: string,
+  expected: {
+    inode: bigint | number;
+    device: bigint | number;
+    token: string;
+    pid?: number;
+    createdAt?: string;
+  }
+): Promise<boolean> {
+  try {
+    const handle = await nodeFs.open(file, 'r');
+    try {
+      const [stat, contents] = await Promise.all([
+        handle.stat({ bigint: true }),
+        handle.readFile('utf8'),
+      ]);
+      const identity = parseTraceLockIdentity(contents);
+      return stat.ino === expected.inode
+        && stat.dev === expected.device
+        && identity.token === expected.token
+        && (expected.pid === undefined || identity.pid === expected.pid)
+        && (expected.createdAt === undefined || identity.createdAt === expected.createdAt);
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function readTraceLockSnapshot(lockFile: string): Promise<TraceLockSnapshot | undefined> {
+  try {
+    const handle = await nodeFs.open(lockFile, 'r');
+    try {
+      const [stat, contents] = await Promise.all([
+        handle.stat({ bigint: true }),
+        handle.readFile('utf8'),
+      ]);
+      return {
+        ...parseTraceLockIdentity(contents),
+        inode: stat.ino,
+        device: stat.dev,
+        mtimeMs: Number(stat.mtimeMs),
+      };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function parseTraceTakeoverDocument(value: string): TraceTakeoverDocument | undefined {
+  try {
+    const parsed = JSON.parse(value) as Partial<TraceTakeoverDocument>;
+    if (
+      typeof parsed.pid !== 'number'
+      || typeof parsed.token !== 'string'
+      || typeof parsed.createdAt !== 'string'
+      || typeof parsed.inode !== 'string'
+      || typeof parsed.device !== 'string'
+      || !parsed.target
+      || typeof parsed.target.inode !== 'string'
+      || typeof parsed.target.device !== 'string'
+      || typeof parsed.target.token !== 'string'
+    ) return undefined;
+    return parsed as TraceTakeoverDocument;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readTraceTakeoverSnapshot(takeoverFile: string): Promise<TraceTakeoverSnapshot | undefined> {
+  try {
+    const handle = await nodeFs.open(takeoverFile, 'r');
+    try {
+      const [stat, contents] = await Promise.all([
+        handle.stat({ bigint: true }),
+        handle.readFile('utf8'),
+      ]);
+      const document = parseTraceTakeoverDocument(contents);
+      if (document) {
+        if (document.inode !== String(stat.ino) || document.device !== String(stat.dev)) return undefined;
+        return {
+          ...document,
+          format: 'current',
+          actualInode: stat.ino,
+          actualDevice: stat.dev,
+          mtimeMs: Number(stat.mtimeMs),
+        };
+      }
+      const legacy = parseTraceLockIdentity(contents);
+      if (!Number.isInteger(legacy.pid) || !legacy.token || !legacy.createdAt) return undefined;
+      return {
+        ...legacy,
+        format: 'legacy',
+        createdAt: legacy.createdAt,
+        actualInode: stat.ino,
+        actualDevice: stat.dev,
+        mtimeMs: Number(stat.mtimeMs),
+      };
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+async function sameTakeoverIdentity(file: string, expected: TraceTakeoverSnapshot): Promise<boolean> {
+  const current = await readTraceTakeoverSnapshot(file);
+  return current !== undefined
+    && current.format === expected.format
+    && current.actualInode === expected.actualInode
+    && current.actualDevice === expected.actualDevice
+    && current.pid === expected.pid
+    && current.token === expected.token
+    && current.createdAt === expected.createdAt;
+}
+
+function takeoverCandidateFile(takeoverFile: string, pid: number, token: string): string {
+  return `${takeoverFile}.${pid}.${token}.candidate`;
+}
+
+async function publishTraceTakeover(
+  takeoverFile: string,
+  target: TraceLockSnapshot
+): Promise<CurrentTraceTakeoverSnapshot | undefined> {
+  const token = randomUUID();
+  const candidateFile = takeoverCandidateFile(takeoverFile, process.pid, token);
+  let handle: FileHandle | undefined;
+  try {
+    handle = await nodeFs.open(candidateFile, 'wx');
+    const stat = await handle.stat({ bigint: true });
+    const document: TraceTakeoverDocument = {
+      pid: process.pid,
+      token,
+      createdAt: new Date().toISOString(),
+      inode: String(stat.ino),
+      device: String(stat.dev),
+      target: {
+        inode: String(target.inode),
+        device: String(target.device),
+        token: target.token,
+      },
+    };
+    await handle.writeFile(JSON.stringify(document), 'utf8');
+    await handle.sync();
+    try {
+      // Publish a fully-written identity atomically. The candidate and fixed
+      // election name refer to the same inode, so a crash cannot expose a
+      // partially initialized takeover owner.
+      await nodeFs.link(candidateFile, takeoverFile);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'EEXIST' || code === 'ENOENT') return undefined;
+      throw error;
+    }
+    const published = await readTraceTakeoverSnapshot(takeoverFile);
+    return published?.format === 'current' ? published : undefined;
+  } finally {
+    await handle?.close().catch(() => undefined);
+    await nodeFs.unlink(candidateFile).catch(() => undefined);
+  }
+}
+
+async function recoverOrphanedTraceTakeover(takeoverFile: string): Promise<boolean> {
+  const takeover = await readTraceTakeoverSnapshot(takeoverFile);
+  if (!takeover) return false;
+  const age = Date.now() - takeover.mtimeMs;
+  if (age <= TRACE_LOCK_STALE_MS || isProcessAlive(takeover.pid)) return false;
+  if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+
+  if (takeover.format === 'legacy') {
+    const lockFile = takeoverFile.slice(0, -'.takeover'.length);
+    const target = await readTraceLockSnapshot(lockFile);
+    if (
+      !target
+      || target.inode !== takeover.actualInode
+      || target.device !== takeover.actualDevice
+      || target.pid !== takeover.pid
+      || target.token !== takeover.token
+      || target.createdAt !== takeover.createdAt
+    ) return false;
+    // Legacy elections from the previous branch head were hard links to the
+    // target lock. Re-open both names immediately before unlinking only the
+    // election name, so a replacement identity survives the race.
+    if (!(await sameLockIdentity(lockFile, target))) return false;
+    if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+    await nodeFs.unlink(takeoverFile).catch(() => undefined);
+    return true;
+  }
+
+  const candidateFile = takeoverCandidateFile(takeoverFile, takeover.pid, takeover.token);
+  if (await sameTakeoverIdentity(candidateFile, takeover)) {
+    await nodeFs.unlink(candidateFile).catch(() => undefined);
+  }
+  // Revalidate immediately before removal: a waiter that inspected an old
+  // election must not unlink a replacement published under the fixed name.
+  if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+  await nodeFs.unlink(takeoverFile).catch(() => undefined);
+  return true;
+}
+
+async function tryTakeOverStaleTraceLock(lockFile: string): Promise<boolean> {
+  const takeoverFile = `${lockFile}.takeover`;
+  const target = await readTraceLockSnapshot(lockFile);
+  if (!target || Date.now() - target.mtimeMs <= TRACE_LOCK_STALE_MS || isProcessAlive(target.pid)) return false;
+  const takeover = await publishTraceTakeover(takeoverFile, target);
+  if (!takeover) return false;
+
+  try {
+    if (!(await sameTakeoverIdentity(takeoverFile, takeover))) return false;
+    if (!(await sameLockIdentity(lockFile, {
+      inode: target.inode,
+      device: target.device,
+      token: target.token,
+    }))) return false;
+    await nodeFs.unlink(lockFile);
+    return true;
+  } finally {
+    if (await sameTakeoverIdentity(takeoverFile, takeover)) {
+      await nodeFs.unlink(takeoverFile).catch(() => undefined);
+    }
+  }
+}
+
+async function acquireTraceFileLock(traceFile: string): Promise<TraceFileLock> {
   const lockFile = `${traceFile}.lock`;
+  const takeoverFile = `${lockFile}.takeover`;
   const deadline = Date.now() + 10_000;
   while (true) {
+    if (await nodeFs.stat(takeoverFile).then(() => true).catch(() => false)) {
+      if (await recoverOrphanedTraceTakeover(takeoverFile)) continue;
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for trace lock takeover: ${path.basename(traceFile)}`);
+      }
+      await waitForLock(10 + Math.floor(Math.random() * 20));
+      continue;
+    }
     try {
       const handle = await nodeFs.open(lockFile, 'wx');
-      await handle.writeFile(`${process.pid} ${new Date().toISOString()}\n`, 'utf8');
+      const token = randomUUID();
+      await handle.writeFile(JSON.stringify({ pid: process.pid, token, createdAt: new Date().toISOString() }), 'utf8');
       const stat = await handle.stat({ bigint: true });
-      return { lockFile, handle, inode: stat.ino };
+      return { lockFile, handle, inode: stat.ino, device: stat.dev, pid: process.pid, token };
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EEXIST') throw error;
 
-      const [age, ownerPid] = await Promise.all([
-        nodeFs.stat(lockFile).then((stat) => Date.now() - stat.mtimeMs).catch(() => 0),
-        nodeFs.readFile(lockFile, 'utf8')
-          .then((value) => Number.parseInt(value.split(/\s/, 1)[0], 10))
-          .catch(() => Number.NaN),
-      ]);
-      if (age > 60_000 && !isProcessAlive(ownerPid)) {
-        await nodeFs.unlink(lockFile).catch(() => undefined);
+      if (await tryTakeOverStaleTraceLock(lockFile)) {
         continue;
       }
       if (Date.now() >= deadline) {
@@ -87,10 +380,7 @@ async function withCrossProcessTraceLock<T>(traceFile: string, operation: () => 
     return await operation();
   } finally {
     await lock.handle.close().catch(() => undefined);
-    const currentInode = await nodeFs.stat(lock.lockFile, { bigint: true })
-      .then((stat) => stat.ino)
-      .catch(() => undefined);
-    if (currentInode === lock.inode) {
+    if (await sameLockIdentity(lock.lockFile, lock)) {
       await nodeFs.unlink(lock.lockFile).catch(() => undefined);
     }
   }
@@ -522,11 +812,38 @@ export class HarnessRuntimeStateService {
     if (!(await fs.pathExists(sessionDir))) {
       return [];
     }
-    const entries = await fs.readdir(sessionDir);
-    return entries
-      .filter((entry) => /^trace\..+\.jsonl$/.test(entry))
-      .sort()
-      .map((entry) => path.join(sessionDir, entry));
+    const entries = (await fs.readdir(sessionDir)).filter((entry) => /^trace\..+\.jsonl$/.test(entry));
+    const segments = await Promise.all(entries.map(async (entry) => {
+      const file = path.join(sessionDir, entry);
+      const stat = await fs.stat(file);
+      const sequence = /^trace\.(\d{12})\./.exec(entry)?.[1];
+      return { file, entry, mtimeMs: stat.mtimeMs, sequence: sequence ? Number(sequence) : undefined };
+    }));
+    return segments.sort((a, b) => {
+      if (a.sequence !== undefined && b.sequence !== undefined) return a.sequence - b.sequence;
+      return a.mtimeMs - b.mtimeMs || (a.sequence ?? 0) - (b.sequence ?? 0) || a.entry.localeCompare(b.entry);
+    }).map(({ file }) => file);
+  }
+
+  private async nextTraceSegmentSequence(sessionId: string): Promise<number> {
+    const sequenceFile = path.join(this.layout.sessionDir(sessionId), 'trace.sequence');
+    const configured = await fs.readFile(sequenceFile, 'utf8')
+      .then((value) => Number.parseInt(value, 10))
+      .catch(() => 0);
+    const existing = await this.listTraceSegmentFiles(sessionId);
+    const maximumExisting = existing.reduce((maximum, file) => {
+      const sequence = Number(/^trace\.(\d{12})\./.exec(path.basename(file))?.[1] ?? 0);
+      return Math.max(maximum, sequence);
+    }, 0);
+    const next = Math.max(Number.isSafeInteger(configured) ? configured : 0, maximumExisting) + 1;
+    const temporary = `${sequenceFile}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, `${next}\n`, 'utf8');
+      await fs.rename(temporary, sequenceFile);
+    } finally {
+      await fs.remove(temporary).catch(() => undefined);
+    }
+    return next;
   }
 
   private async pruneTraceSegments(sessionId: string): Promise<void> {
@@ -562,7 +879,8 @@ export class HarnessRuntimeStateService {
     let rotationTrace: HarnessTraceRecord | undefined;
 
     if (activeBytes > 0 && activeBytes + Buffer.byteLength(serialized, 'utf8') > policy.traceRotationBytes) {
-      const rotationId = `${new Date().toISOString().replace(/[:.]/g, '-')}.${randomUUID()}`;
+      const sequence = await this.nextTraceSegmentSequence(sessionId);
+      const rotationId = `${String(sequence).padStart(12, '0')}.${new Date().toISOString().replace(/[:.]/g, '-')}.${randomUUID()}`;
       const segmentFile = `${this.traceSegmentPrefix(sessionId)}${rotationId}.jsonl`;
       await fs.rename(activeFile, segmentFile);
       rotationTrace = boundGenericTraceRecord<HarnessTraceRecord>({
@@ -734,7 +1052,16 @@ export class HarnessRuntimeStateService {
     }
     return withTraceWriteLock(this.traceFile(sessionId), async () => {
       const session = await this.readSession(sessionId);
-      const boundedTrace = boundGenericTraceRecord(trace, loadGenericTraceEventMaxBytes(this.repoPath));
+      const policy = loadHookTracePolicy(this.repoPath);
+      const traceBudget = Math.max(
+        1024,
+        Math.min(
+          loadGenericTraceEventMaxBytes(this.repoPath),
+          policy.traceRotationBytes - ROTATION_EVENT_RESERVE_BYTES,
+          policy.maxSessionTraceBytes - ROTATION_EVENT_RESERVE_BYTES
+        )
+      );
+      const boundedTrace = boundGenericTraceRecord(trace, traceBudget);
       const rotationTrace = await this.appendTraceLine(sessionId, boundedTrace);
 
       session.traceCount += rotationTrace ? 2 : 1;

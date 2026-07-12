@@ -28,8 +28,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bounded `explore` reads before file materialization and replaced whole-glob/whole-file code search with byte-capped streaming discovery, search, and cursor pages.
 - Bounded `explore.list` traversal even when callers disable default ignores, and isolated caller regex evaluation in a worker with a hard CPU deadline.
 - Prevented Claude Code, Codex, and Pi Write/Edit hooks from retaining source bodies or sensitive fields by persisting bounded metadata summaries instead.
+- Redacted Bash credentials across header, JSON, assignment, camel-case, and flag forms, omitting ambiguous command tails rather than risking secret disclosure.
 - Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
 - Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
+- Made stale trace-lock takeover verify process ownership, token, device, and inode across competing processes, recover both current and legacy orphaned takeover elections after a reaper crash, and preserve live or replaced owners; same-millisecond rotations now use a monotonic segment sequence.
+- Kept the active rotation threshold and individual events within the configured per-session trace quota, including contradictory configurations and a single oversized event.
 - Replaced whole-file trace reads and post-materialization replay limits with rotation-aware streaming and source-level event bounds.
 - Added aggregate UTF-8 page budgets to runtime history so large valid records cannot multiply count limits into unbounded materialization.
 - Made replay use one count/byte budget and one continuation cursor across every source, without persisting duplicate source arrays; datasets now enforce per-failure, aggregate, and on-disk byte limits.
