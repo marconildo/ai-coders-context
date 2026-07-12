@@ -41,7 +41,7 @@ Cada replay é um snapshot autocontido. Além dos dados coletados, ele carrega u
 | `nextCursor` | Cursor opaco de continuação quando o replay é parcial |
 | `summary` | Descrição legível da execução |
 
-Os arrays de origem coletados e o array mesclado `events` são limitados por `maxEvents` (100 por padrão, máximo de 1.000). Um replay parcial persiste somente essa materialização limitada:
+O array mesclado `events` usa um único orçamento compartilhado de `maxEvents` e bytes (100 eventos por padrão, máximo de 1.000). Quando solicitados, os registros de origem ficam apenas no campo `record` do evento; o arquivo de replay não os duplica em arrays separados. Um replay parcial continua todas as fontes pelo mesmo cursor opaco:
 
 ```json
 {
@@ -105,7 +105,7 @@ Construa um replay logo após a sessão terminar — tendo ela completado ou fal
 
 ## Datasets de falha: agrupando o que continua quebrando
 
-Um único replay conta sobre uma execução. Um **dataset de falha** processa sessões com um worker por padrão (configurável até quatro), retém no máximo 10.000 falhas por padrão e informa `partial` e `omittedFailureCount` quando o limite é atingido.
+Um único replay conta sobre uma execução. Um **dataset de falha** processa sessões com um worker por padrão (configurável até quatro), retém no máximo 10.000 falhas por padrão e também aplica limites de bytes por falha, agregados e no arquivo persistido. Ele informa `partial` e `omittedFailureCount` quando qualquer limite é atingido.
 
 ### Como as falhas são coletadas
 

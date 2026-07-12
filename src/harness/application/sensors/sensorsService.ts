@@ -11,6 +11,7 @@ import type {
   HarnessRuntimeStatePort,
   HarnessTraceRecord,
 } from '../../adapters/out/runtimeState/runtimeStateService';
+import type { RuntimeHistoryPage, RuntimeHistoryQuery } from '../history/runtimeHistory';
 
 export type HarnessSensorSeverity = 'info' | 'warning' | 'critical';
 export type HarnessSensorStatus = 'passed' | 'failed' | 'skipped' | 'blocked';
@@ -122,9 +123,48 @@ export class HarnessSensorsService {
     return run;
   }
 
-  async getSessionSensorRuns(sessionId: string): Promise<HarnessSensorRun[]> {
+  async getLatestSessionSensorRuns(sessionId: string): Promise<HarnessSensorRun[]> {
     const summary = await this.options.stateService.getSensorSummary(sessionId);
     return Object.values(summary.latestBySensor) as HarnessSensorRun[];
+  }
+
+  async getSessionSensorRunCount(sessionId: string): Promise<number> {
+    const summary = await this.options.stateService.getSensorSummary(sessionId);
+    return Math.max(Object.keys(summary.latestBySensor).length, summary.runCount ?? 0);
+  }
+
+  async getSessionSensorRunPage(
+    sessionId: string,
+    query: RuntimeHistoryQuery = {}
+  ): Promise<RuntimeHistoryPage<HarnessSensorRun>> {
+    const page = await this.options.stateService.listTracePage(sessionId, {
+      ...query,
+      event: 'sensor.run',
+    });
+    const items = page.items
+      .map((trace) => trace.data?.run)
+      .filter((run): run is HarnessSensorRun => Boolean(run && typeof run === 'object'));
+    return {
+      ...page,
+      items,
+      recordsReturned: items.length,
+    };
+  }
+
+  /** @deprecated Use getSessionSensorRunPage for history or getLatestSessionSensorRuns for status. */
+  async getSessionSensorRuns(sessionId: string): Promise<HarnessSensorRun[]> {
+    const runs: HarnessSensorRun[] = [];
+    let cursor: string | undefined;
+    do {
+      const page = await this.getSessionSensorRunPage(sessionId, {
+        limit: 1000,
+        cursor,
+        direction: 'oldest',
+      });
+      runs.push(...page.items);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return runs;
   }
 
   evaluateBackpressure(

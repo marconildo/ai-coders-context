@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added configurable, globally clamped hook stdin, field, event, rotation, segment-retention, and per-session trace limits.
 - Added opaque cursor pages for sessions, traces, artifacts, replay summaries, and dataset summaries, including bounded defaults, query-bound cursors, and scan metadata.
 - Added latest-sensor summary indexes, bounded dataset concurrency/failure retention, and dry-run runtime pruning with active workflow protection.
+- Added paginated sensor-run history alongside sharded, byte-capped latest-sensor summaries, plus small replay/dataset retention sidecars.
 
 ### Fixed
 
@@ -24,6 +25,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
 - Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
 - Replaced whole-file trace reads and post-materialization replay limits with rotation-aware streaming and source-level event bounds.
+- Added aggregate UTF-8 page budgets to runtime history so large valid records cannot multiply count limits into unbounded materialization.
+- Made replay use one count/byte budget and one continuation cursor across every source, without persisting duplicate source arrays; datasets now enforce per-failure, aggregate, and on-disk byte limits.
+- Made retention inspect bounded metadata prefixes and include young terminal sessions when enforcing the repository runtime quota.
 
 ## [1.1.1] - 2026-06-27
 

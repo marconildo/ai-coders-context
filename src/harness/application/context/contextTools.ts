@@ -31,12 +31,12 @@ import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
 import {
   boundedLimit,
   RUNTIME_HISTORY_LIMITS,
-  type RuntimeHistoryPage,
 } from '../history/runtimeHistory';
 import {
   listBoundedExploreFiles,
   readBoundedExploreFile,
   searchBoundedCode,
+  type BoundedExploreListResult,
 } from './boundedExplore';
 
 type ToolContext = unknown;
@@ -360,7 +360,7 @@ export const listFilesTool = createInternalTool<
     files?: string[];
     count?: number;
     pattern: string;
-    page?: Omit<RuntimeHistoryPage<string>, 'items'>;
+    page?: BoundedExploreListResult['page'];
     error?: string;
   }
 >(

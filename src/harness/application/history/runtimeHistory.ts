@@ -15,10 +15,14 @@ export const RUNTIME_HISTORY_LIMITS = {
   replayEvents: { default: 100, maximum: 1000 },
 } as const;
 
+export const DEFAULT_RUNTIME_HISTORY_PAGE_BYTES = 1024 * 1024;
+export const MAX_RUNTIME_HISTORY_PAGE_BYTES = 16 * 1024 * 1024;
+
 export interface RuntimeHistoryQuery {
   limit?: number;
   cursor?: string;
   direction?: RuntimeHistoryDirection;
+  maxBytes?: number;
 }
 
 export interface RuntimeHistoryPage<T> {
@@ -28,6 +32,10 @@ export interface RuntimeHistoryPage<T> {
   recordsReturned: number;
   recordsScanned: number;
   scannedBytes?: number;
+  returnedBytes: number;
+  byteBudget: number;
+  byteLimited: boolean;
+  oversizedRecordsSkipped: number;
   malformedCount?: number;
   cursorVersion: 1;
   partial: boolean;
@@ -79,4 +87,21 @@ export function boundedLimit(value: number | undefined, defaultLimit: number, ma
     throw new RangeError(`${resource} limit must be an integer between 1 and ${maximum}`);
   }
   return limit;
+}
+
+export function boundedPageBytes(
+  value: number | undefined,
+  resource: string,
+  defaultBytes = DEFAULT_RUNTIME_HISTORY_PAGE_BYTES,
+  maximumBytes = MAX_RUNTIME_HISTORY_PAGE_BYTES
+): number {
+  const bytes = value ?? defaultBytes;
+  if (!Number.isInteger(bytes) || bytes < 1024 || bytes > maximumBytes) {
+    throw new RangeError(`${resource} maxBytes must be an integer between 1024 and ${maximumBytes}`);
+  }
+  return bytes;
+}
+
+export function serializedHistoryItemBytes(value: unknown): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8');
 }

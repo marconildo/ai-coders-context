@@ -41,7 +41,7 @@ Each replay is a self-contained snapshot. Beyond the collected data, it carries 
 | `nextCursor` | Opaque continuation cursor when the replay is partial |
 | `summary` | Human-readable description of the run |
 
-The collected source arrays and the merged `events` array are all constrained by `maxEvents` (100 by default, 1,000 maximum). A partial replay persists only that bounded materialization:
+The merged `events` array is constrained by one shared `maxEvents` and byte budget (100 events by default, 1,000 maximum). Source records, when requested, live only under their event's `record` field; replay files no longer duplicate them in separate source arrays. A partial replay can continue every source through the same opaque cursor:
 
 ```json
 {
@@ -105,7 +105,7 @@ Build a replay right after a session finishes — whether it completed or failed
 
 ## Failure datasets: clustering what keeps breaking
 
-A single replay tells you about one run. A **failure dataset** processes sessions with one worker by default (configurable up to four), retains at most 10,000 failures by default, and reports `partial` plus `omittedFailureCount` when capped.
+A single replay tells you about one run. A **failure dataset** processes sessions with one worker by default (configurable up to four), retains at most 10,000 failures by default, and also applies per-failure, aggregate, and persisted-file byte budgets. It reports `partial` plus `omittedFailureCount` when any limit is reached.
 
 ### How failures are collected
 

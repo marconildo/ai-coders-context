@@ -40,4 +40,23 @@ describe('typecheck-clean sensor', () => {
     expect(out.tail).not.toContain('line 0');
     expect(out.tail).toContain('line 59');
   });
+
+  it('clamps an enormous metadata tail and exposes stable truncation counters', async () => {
+    const result = await executeTypecheckClean(tempDir, {
+      sessionId: 's',
+      metadata: {
+        command: ['node', '-e', 'process.stdout.write("x".repeat(12 * 1024)); process.exit(2)'],
+        tailBytes: Number.MAX_SAFE_INTEGER,
+      },
+    });
+
+    expect(result.status).toBe('failed');
+    expect(result.details).toEqual(expect.objectContaining({
+      stdoutBytes: 12 * 1024,
+      stdoutDroppedBytes: 4 * 1024,
+      outputTruncated: true,
+    }));
+    const output = result.output as { tail: string };
+    expect(Buffer.byteLength(output.tail)).toBe(8 * 1024);
+  });
 });
