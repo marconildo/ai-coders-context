@@ -144,7 +144,7 @@ export class HarnessSessionFacade {
     const binding = await this.ensureHarnessSession(workflowName);
 
     const session = await this.runtimeStateService.getSession(binding.sessionId);
-    const allSensorRuns = await this.sensorsService.getSessionSensorRuns(binding.sessionId);
+    const allSensorRuns = await this.sensorsService.getLatestSessionSensorRuns(binding.sessionId);
     const policyRules = await this.policyService.listRules();
     const latestRuns = new Map<string, HarnessSensorRun>();
     for (const run of allSensorRuns) {

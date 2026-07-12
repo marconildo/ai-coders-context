@@ -16,12 +16,18 @@ import type {
   HarnessSensorExecutionInput,
   HarnessSensorExecutionResult,
 } from '../../../application/sensors/sensorsService';
-import { runShell } from './testsPassing';
+import {
+  DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
+  DEFAULT_SUBPROCESS_TAIL_BYTES,
+} from '../../../domain/execution';
+import { runShell, subprocessDetails } from './testsPassing';
 
 export interface TypecheckCleanOptions {
   command?: string[];
   timeoutMs?: number;
   tailLines?: number;
+  tailBytes?: number;
+  hardOutputLimitBytes?: number;
 }
 
 const DEFAULT_COMMAND: string[] = ['npx', 'tsc', '--noEmit'];
@@ -38,6 +44,9 @@ function readOptions(input: HarnessSensorExecutionInput): Required<TypecheckClea
     command: Array.isArray(cmd) && cmd.length > 0 ? cmd : DEFAULT_COMMAND,
     timeoutMs: ctx.timeoutMs ?? meta.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     tailLines: ctx.tailLines ?? meta.tailLines ?? DEFAULT_TAIL_LINES,
+    tailBytes: ctx.tailBytes ?? meta.tailBytes ?? DEFAULT_SUBPROCESS_TAIL_BYTES,
+    hardOutputLimitBytes:
+      ctx.hardOutputLimitBytes ?? meta.hardOutputLimitBytes ?? DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
   };
 }
 
@@ -53,13 +62,27 @@ export async function executeTypecheckClean(
 ): Promise<HarnessSensorExecutionResult> {
   const opts = readOptions(input);
 
-  const result = await runShell(opts.command, repoPath, opts.timeoutMs);
+  const result = await runShell(opts.command, repoPath, opts.timeoutMs, {
+    tailBytes: opts.tailBytes,
+    hardCombinedOutputBytes: opts.hardOutputLimitBytes,
+  });
+  const details = subprocessDetails(result, opts.command);
 
   if (result.spawnError) {
     return {
       status: 'failed',
       summary: `typecheck-clean: spawn error: ${result.spawnError}`,
       evidence: [`command: ${opts.command.join(' ')}`],
+      details,
+    };
+  }
+
+  if (result.outputLimitExceeded) {
+    return {
+      status: 'failed',
+      summary: 'typecheck-clean: outputLimitExceeded',
+      evidence: [`command: ${opts.command.join(' ')}`, result.stderrTail].filter(Boolean),
+      details,
     };
   }
 
@@ -67,7 +90,11 @@ export async function executeTypecheckClean(
     return {
       status: 'failed',
       summary: `typecheck-clean: timed out after ${opts.timeoutMs}ms`,
-      evidence: [`command: ${opts.command.join(' ')}`, tailLines(result.stderr, opts.tailLines)],
+      evidence: [
+        `command: ${opts.command.join(' ')}`,
+        tailLines(result.stderrTail, opts.tailLines),
+      ].filter(Boolean),
+      details,
     };
   }
 
@@ -76,14 +103,15 @@ export async function executeTypecheckClean(
       status: 'passed',
       summary: 'typecheck-clean: tsc reported no errors',
       evidence: [`command: ${opts.command.join(' ')}`],
+      details,
     };
   }
 
   // tsc writes diagnostics to stdout, errors are typically there. Capture
   // both tails so the operator sees what went wrong regardless of where
   // they landed.
-  const stderrTail = tailLines(result.stderr, opts.tailLines);
-  const stdoutTail = tailLines(result.stdout, opts.tailLines);
+  const stderrTail = tailLines(result.stderrTail, opts.tailLines);
+  const stdoutTail = tailLines(result.stdoutTail, opts.tailLines);
   const combinedTail = [stdoutTail, stderrTail].filter(Boolean).join('\n');
 
   return {
@@ -91,6 +119,7 @@ export async function executeTypecheckClean(
     summary: `typecheck-clean: tsc exit ${result.exitCode}`,
     evidence: [`command: ${opts.command.join(' ')}`, combinedTail].filter(Boolean) as string[],
     output: { exitCode: result.exitCode, tail: combinedTail },
+    details,
   };
 }
 

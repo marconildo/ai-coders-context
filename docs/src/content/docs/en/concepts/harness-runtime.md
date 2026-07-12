@@ -120,7 +120,7 @@ Each trace entry looks like this:
 | `message` | Human-readable description |
 | `data` | Optional structured payload (sensor results, context, etc.) |
 
-Because the file is **append-only** (`.jsonl`, one JSON object per line), traces are cheap to write and never rewrite earlier entries. Use the `harness` tool's `appendTrace` action to add an event and `listTraces` to read the timeline.
+Because the file is **append-only** (`.jsonl`, one JSON object per line), traces are cheap to write and never rewrite earlier entries. The harness reads legacy and rotated segments incrementally. `listTraces` returns a bounded page (100 records by default, 1,000 maximum) with an opaque `nextCursor`, `hasMore`, scan-byte, malformed-line, and duration metadata. Pages also have a 1 MiB aggregate UTF-8 budget by default (16 MiB absolute maximum) and stop before materializing the next over-budget item. `returnedBytes`, `byteBudget`, `byteLimited`, and `oversizedRecordsSkipped` make that behavior explicit. A single valid record that cannot fit is skipped with metadata so cursor continuation cannot loop forever. Filters support `event`, `level`, `createdAfter`, and `createdBefore`; point reads remain available through their resource-specific actions.
 
 ::: note
 Trace `event` values like `sensor.run` are how the harness records [sensor](/concepts/sensors/) results into a session. That's what later lets task contracts check whether required sensors passed, and lets [failure datasets](/concepts/replay-and-datasets/) cluster error-level events.

@@ -118,10 +118,15 @@ async function resolveMcpActivitySessionId(
     }
   }
 
-  const existing = (await state.listSessions()).find((session) =>
-    session.name === MCP_ACTIVITY_NAME &&
-    session.metadata?.transport === 'mcp'
-  );
+  let existing;
+  let cursor: string | undefined;
+  do {
+    const page = await state.listSessionPage({ limit: 50, cursor });
+    existing = page.items.find((session) =>
+      session.name === MCP_ACTIVITY_NAME && session.metadata?.transport === 'mcp'
+    );
+    cursor = existing ? undefined : page.nextCursor;
+  } while (!existing && cursor);
 
   if (existing) {
     sessionCache.set(repoPath, existing.id);
