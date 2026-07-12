@@ -1,4 +1,4 @@
-import { HarnessExploreActionService } from '../../harness';
+import { HarnessExploreActionService, RUNTIME_HISTORY_LIMITS } from '../../harness';
 
 import type { ExploreParams } from './types';
 import type { MCPToolResponse } from './response';
@@ -18,7 +18,12 @@ export async function handleExplore(
   const service = new HarnessExploreActionService({ repoPath: options.repoPath });
 
   try {
-    return createJsonResponse(await service.execute(params));
+    return createJsonResponse(await service.execute(params), {
+      requestedLimit: params.limit,
+      appliedLimit: params.action === 'list'
+        ? params.limit ?? RUNTIME_HISTORY_LIMITS.exploreFiles.default
+        : undefined,
+    });
   } catch (error) {
     return createErrorResponse(error);
   }

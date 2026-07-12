@@ -11,7 +11,7 @@ import {
 import { HarnessReplayService, type HarnessReplayRecord } from '../replay/replayService';
 import { HarnessSensorsService } from '../sensors/sensorsService';
 import { HarnessTaskContractsService } from '../contracts/taskContractsService';
-import { boundedPageBytes, boundedLimit, decodeHistoryCursor, encodeHistoryCursor, MAX_RUNTIME_HISTORY_PAGE_BYTES, queryBinding, serializedHistoryItemBytes, type RuntimeHistoryPage, type RuntimeHistoryQuery } from '../history/runtimeHistory';
+import { boundedPageBytes, boundedLimit, decodeHistoryCursor, encodeHistoryCursor, MAX_RUNTIME_HISTORY_PAGE_BYTES, queryBinding, RUNTIME_HISTORY_LIMITS, serializedHistoryItemBytes, type RuntimeHistoryPage, type RuntimeHistoryQuery } from '../history/runtimeHistory';
 
 export type HarnessFailureKind = 'sensor' | 'task' | 'session' | 'trace';
 
@@ -417,7 +417,7 @@ export class HarnessDatasetService {
 
   async listDatasetPage(query: RuntimeHistoryQuery = {}): Promise<RuntimeHistoryPage<HarnessDatasetSummary>> {
     const started = Date.now();
-    const limit = boundedLimit(query.limit, 25, 100, 'dataset summaries');
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.datasets.default, RUNTIME_HISTORY_LIMITS.datasets.maximum, 'dataset summaries');
     const byteBudget = boundedPageBytes(query.maxBytes, 'dataset summaries');
     const binding = queryBinding({ resource: 'datasets' });
     const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(query.cursor, 'datasets', binding);

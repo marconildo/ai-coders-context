@@ -2,6 +2,19 @@ import { createHash } from 'crypto';
 
 export type RuntimeHistoryDirection = 'oldest' | 'newest';
 
+/** Source-of-truth limits shared by harness callers and transport adapters. */
+export const RUNTIME_HISTORY_LIMITS = {
+  sessions: { default: 50, maximum: 200 },
+  artifacts: { default: 50, maximum: 200 },
+  traces: { default: 100, maximum: 1000 },
+  tasks: { default: 100, maximum: 1000 },
+  handoffs: { default: 100, maximum: 1000 },
+  replays: { default: 25, maximum: 100 },
+  datasets: { default: 25, maximum: 100 },
+  exploreFiles: { default: 100, maximum: 1000 },
+  replayEvents: { default: 100, maximum: 1000 },
+} as const;
+
 export const DEFAULT_RUNTIME_HISTORY_PAGE_BYTES = 1024 * 1024;
 export const MAX_RUNTIME_HISTORY_PAGE_BYTES = 16 * 1024 * 1024;
 

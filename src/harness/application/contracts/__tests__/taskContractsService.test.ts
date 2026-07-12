@@ -73,6 +73,25 @@ describe('HarnessTaskContractsService', () => {
     expect(await fs.pathExists(contractPath)).toBe(true);
   });
 
+  it('paginates growing task and handoff contract collections with opaque cursors', async () => {
+    for (let index = 0; index < 3; index += 1) {
+      await service.createTaskContract({ title: `Task ${index}` });
+      await service.createHandoffContract({ from: `agent-${index}`, to: 'reviewer' });
+    }
+
+    const tasksFirst = await service.listTaskContractPage({ limit: 2 });
+    const tasksSecond = await service.listTaskContractPage({ limit: 2, cursor: tasksFirst.nextCursor });
+    const handoffsFirst = await service.listHandoffContractPage({ limit: 2 });
+    const handoffsSecond = await service.listHandoffContractPage({ limit: 2, cursor: handoffsFirst.nextCursor });
+
+    expect(tasksFirst).toMatchObject({ recordsReturned: 2, hasMore: true, partial: true });
+    expect(tasksSecond).toMatchObject({ recordsReturned: 1, hasMore: false, partial: false });
+    expect(new Set([...tasksFirst.items, ...tasksSecond.items].map((item) => item.id)).size).toBe(3);
+    expect(handoffsFirst).toMatchObject({ recordsReturned: 2, hasMore: true, partial: true });
+    expect(handoffsSecond).toMatchObject({ recordsReturned: 1, hasMore: false, partial: false });
+    expect(new Set([...handoffsFirst.items, ...handoffsSecond.items].map((item) => item.id)).size).toBe(3);
+  });
+
   describe('structured artifact specs', () => {
     it('glob spec with minMatches blocks when fewer artifacts match', async () => {
       const session = await stateService.createSession({ name: 'glob-min' });
@@ -250,4 +269,3 @@ describe('HarnessTaskContractsService', () => {
     });
   });
 });
-

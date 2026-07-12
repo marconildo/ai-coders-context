@@ -14,7 +14,16 @@ export {
   createJsonResponse,
   createErrorResponse,
   createTextResponse,
+  type DotcontextAuditMetadata,
+  DEFAULT_MCP_TEXT_PAYLOAD_BYTES,
+  ABSOLUTE_MCP_TEXT_PAYLOAD_BYTES,
 } from './response';
+
+export {
+  MCP_INPUT_LIMITS,
+  MCPInputLimitError,
+  validateMcpInput,
+} from './inputLimits';
 
 // Shared utilities
 export { minimalUI, mockTranslate, toolContext } from './shared';

@@ -185,6 +185,7 @@ export {
   DEFAULT_RUNTIME_HISTORY_PAGE_BYTES,
   MAX_RUNTIME_HISTORY_PAGE_BYTES,
   RuntimeHistoryCursorError,
+  RUNTIME_HISTORY_LIMITS,
   type RuntimeHistoryDirection,
   type RuntimeHistoryQuery,
   type RuntimeHistoryPage,
