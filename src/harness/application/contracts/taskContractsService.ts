@@ -232,10 +232,6 @@ export class HarnessTaskContractsService {
     return resolveRuntimeLayoutFromRepo(this.options.repoPath);
   }
 
-  private get contractsPath(): string {
-    return this.layout.contractsDir;
-  }
-
   private get tasksPath(): string {
     return this.layout.contractTasksDir;
   }

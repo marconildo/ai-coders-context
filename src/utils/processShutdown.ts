@@ -34,7 +34,7 @@ export function registerProcessShutdown(
     signalListeners.clear();
   };
 
-  const shutdown = async (signal?: NodeJS.Signals): Promise<void> => {
+  const shutdown = async (): Promise<void> => {
     if (shuttingDown) {
       return;
     }
@@ -55,7 +55,7 @@ export function registerProcessShutdown(
 
   for (const signal of signals) {
     const listener = () => {
-      void shutdown(signal);
+      void shutdown();
     };
     signalListeners.set(signal, listener);
     process.once(signal, listener);

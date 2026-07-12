@@ -6,7 +6,6 @@
  */
 
 import type { CLIInterface } from '../../utils/cliUI';
-import type { TranslateFn } from '../../utils/i18n';
 import type { OperationResult } from './types';
 import { typography } from '../../utils/theme';
 

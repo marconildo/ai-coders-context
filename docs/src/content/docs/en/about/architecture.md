@@ -123,7 +123,7 @@ The operator's package. It ships the full CLI stack and exports a handful of ser
 - `SyncService` — export/import rules, agents, and skills
 - `ReportService` — generate workflow progress reports
 
-It includes the `prompts/` directory used by the interactive CLI, and its bin is `dotcontext`.
+Its executable is exposed as the `dotcontext` bin.
 
 ### `@dotcontext/harness`
 

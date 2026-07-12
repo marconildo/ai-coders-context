@@ -1035,7 +1035,7 @@ export class HarnessRuntimeStateService {
     const summary: HarnessSensorSummary = { version: 1, updatedAt: nowIso(), latestBySensor, runCount };
     await this.ensureSessionDir(sessionId);
     await fs.ensureDir(this.sensorSummaryDir(sessionId));
-    for (const [sensorId, run] of Object.entries(latestBySensor)) {
+    for (const run of Object.values(latestBySensor)) {
       await this.updateSensorSummary(sessionId, {
         id: randomUUID(), sessionId, level: 'info', event: 'sensor.run', message: 'sensor summary migration',
         createdAt: (run as Record<string, unknown>).createdAt as string ?? summary.updatedAt, data: { run: run as Record<string, unknown> },

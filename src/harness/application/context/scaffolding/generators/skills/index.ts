@@ -9,6 +9,6 @@ export {
   createSkillGenerator,
 } from './skillGenerator';
 
-export { generateSkillContent, getDefaultPhases } from './templates/skillTemplate';
+export { getDefaultPhases } from './templates/skillTemplate';
 
 export { generateSkillsIndex } from './templates/indexTemplate';

@@ -44,9 +44,9 @@ export class PlanLinker {
   private readonly orchestrator: PlanUpdateOrchestrator;
 
   constructor(
-    private readonly repoPath: string,
-    private readonly statusManager?: PrevcStatusManager,
-    private readonly autoCommitOnPhaseComplete: boolean = true
+    repoPath: string,
+    statusManager?: PrevcStatusManager,
+    autoCommitOnPhaseComplete: boolean = true
   ) {
     this.contextPath = path.join(repoPath, '.context');
     this.plansPath = path.join(this.contextPath, 'plans');

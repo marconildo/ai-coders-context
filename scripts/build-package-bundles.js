@@ -130,11 +130,10 @@ function buildBundles() {
           exports: { '.': './dist/cli/index.js' },
           bin: { dotcontext: 'dist/index.js' },
           dependencies: rootPkg.dependencies,
-          files: ['dist/**/*', 'prompts/**/*', 'README.md', 'LICENSE'],
+          files: ['dist/**/*', 'README.md', 'LICENSE'],
         }
       ),
       readme: loadTemplate('cli.README.md'),
-      copyPrompts: true,
     },
     {
       slug: 'harness',
@@ -235,9 +234,6 @@ function buildBundles() {
       copyDir(distDir, path.join(pkgRoot, 'dist'));
     }
 
-    if (pkg.copyPrompts && fs.existsSync(path.join(repoRoot, 'prompts'))) {
-      copyDir(path.join(repoRoot, 'prompts'), path.join(pkgRoot, 'prompts'));
-    }
     for (const file of commonFiles) {
       copyFile(path.join(repoRoot, file), path.join(pkgRoot, file));
     }

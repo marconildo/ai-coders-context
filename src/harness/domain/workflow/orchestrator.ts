@@ -18,7 +18,7 @@ import {
 import { PrevcStatusManager } from './status/statusManager';
 import { detectProjectScale, getScaleRoute } from './scaling';
 import { PREVC_PHASE_ORDER, getPhaseDefinition } from './phases';
-import { WorkflowGateChecker, GateCheckResult, getDefaultSettings, ExecutionEvidence } from './gates';
+import { WorkflowGateChecker, GateCheckResult, ExecutionEvidence } from './gates';
 import { PlanLinker } from './plans/planLinker';
 import { assertPhaseStatusConverges } from './plans/invariants';
 import { WorkflowGuidanceService } from './orchestration/workflowGuidanceService';
@@ -53,7 +53,6 @@ export interface InitWorkflowOptions {
  */
 export class PrevcOrchestrator {
   private repoPath: string;
-  private contextPath: string;
   private statusManager: PrevcStatusManager;
   private gateChecker: WorkflowGateChecker;
   private planLinker: PlanLinker;
@@ -61,7 +60,6 @@ export class PrevcOrchestrator {
 
   constructor(contextPath: string, workflowState: HarnessWorkflowStateService) {
     this.repoPath = path.dirname(contextPath);
-    this.contextPath = contextPath;
     this.statusManager = new PrevcStatusManager(workflowState);
     this.gateChecker = new WorkflowGateChecker();
     // Pass statusManager to PlanLinker for breadcrumb trail logging

@@ -81,14 +81,12 @@ export function migrateDocument(
 }
 
 export class FileCollaborationStore implements CollaborationSessionStore {
-  private readonly contextPath: string;
   private readonly filePath: string;
   private readonly tmpPath: string;
   private readonly maxConcludedAgeMs: number;
   private readonly logger: NonNullable<FileCollaborationStoreOptions['logger']>;
 
   constructor(contextPath: string, options: FileCollaborationStoreOptions = {}) {
-    this.contextPath = contextPath;
     this.filePath = resolveRuntimeLayout(contextPath).collaborationFile;
     this.tmpPath = `${this.filePath}.tmp`;
     const envMax = process.env.DOTCONTEXT_COLLAB_MAX_CONCLUDED_AGE_MS;

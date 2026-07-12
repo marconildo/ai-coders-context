@@ -64,7 +64,6 @@ Builds the five isolated package bundles into `.release/packages/{cli,harness,mc
 - Writes a package-specific `package.json` manifest for each surface — filtered dependencies, `exports`, and `bin` entries.
 - Copies shared files (`LICENSE`, `README.md`).
 - Generates bin shims for the executables (`dotcontext`, `dotcontext-mcp`).
-- Copies the `prompts/` directory (CLI only).
 
 ### `npm run smoke:packages`
 
@@ -75,7 +74,7 @@ Runs `scripts/smoke-package-bundles.js` to validate the bundles you just built. 
 - The expected exports are present in each compiled index.
 - Bin entries and local shims exist for CLI and MCP.
 - **No legacy `dist/services/` folder** ships — this enforces the architecture (domain behavior must not leak into the transport surfaces).
-- `README.md` and `LICENSE` are included; the `prompts/` directory is present for CLI.
+- `README.md` and `LICENSE` are included.
 
 :::caution
 The "no `dist/services/`" check is intentional. If a package smoke test fails on it, you have probably moved domain behavior into `cli` or `mcp` instead of `harness`. See [Architecture](/about/architecture/) for the boundary rules.

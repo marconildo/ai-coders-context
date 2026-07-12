@@ -21,7 +21,6 @@ const bundles = [
       'ReportService',
     ],
     bin: 'dotcontext',
-    requiresPrompts: true,
   },
   {
     slug: 'harness',
@@ -142,10 +141,6 @@ function smokeBundle(bundle) {
       fs.existsSync(path.join(bundleRoot, 'node_modules', '.bin', bundle.bin)),
       `${bundle.slug}: local bin shim missing`
     );
-  }
-
-  if (bundle.requiresPrompts) {
-    assert(fs.existsSync(path.join(bundleRoot, 'prompts')), `${bundle.slug}: prompts missing`);
   }
 
   const mod = requireFresh(mainPath);

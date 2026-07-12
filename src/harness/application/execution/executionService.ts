@@ -61,7 +61,7 @@ export class HarnessExecutionService {
   readonly replay: HarnessReplayService;
   readonly datasets: HarnessDatasetService;
 
-  constructor(private readonly options: HarnessExecutionServiceOptions) {
+  constructor(options: HarnessExecutionServiceOptions) {
     this.state = new HarnessRuntimeStateService({ repoPath: options.repoPath });
     this.sensors = new HarnessSensorsService({ stateService: this.state });
     this.contracts = new HarnessTaskContractsService({

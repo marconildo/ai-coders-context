@@ -16,7 +16,7 @@
 import * as path from 'path';
 import * as fs from 'fs-extra';
 import { glob } from 'glob';
-import { needsFill, getFilledStats } from '../../../utils/frontMatter';
+import { getFilledStats } from '../../../utils/frontMatter';
 
 export type ProjectState = 'new' | 'unfilled' | 'ready' | 'outdated';
 
@@ -200,5 +200,3 @@ export class StateDetector {
     }
   }
 }
-
-export { StateDetector as default };

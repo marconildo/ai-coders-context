@@ -64,7 +64,6 @@ Faz o build dos cinco bundles de pacote isolados em `.release/packages/{cli,harn
 - Escreve um manifesto `package.json` específico para cada surface — dependências filtradas, `exports` e entradas `bin`.
 - Copia arquivos compartilhados (`LICENSE`, `README.md`).
 - Gera os shims de bin para os executáveis (`dotcontext`, `dotcontext-mcp`).
-- Copia o diretório `prompts/` (somente CLI).
 
 ### `npm run smoke:packages`
 
@@ -75,7 +74,7 @@ Roda `scripts/smoke-package-bundles.js` para validar os bundles que você acabou
 - Que os `exports` esperados estão presentes em cada index compilado.
 - Que as entradas `bin` e os shims locais existem para CLI e MCP.
 - Que **nenhuma pasta legada `dist/services/`** é publicada — isso reforça a arquitetura (comportamento de domínio não pode vazar para as surfaces de transporte).
-- Que `README.md` e `LICENSE` estão incluídos; e que o diretório `prompts/` está presente para a CLI.
+- Que `README.md` e `LICENSE` estão incluídos.
 
 :::caution
 A verificação de "nenhum `dist/services/`" é intencional. Se um smoke test de pacote falhar nela, provavelmente você moveu comportamento de domínio para `cli` ou `mcp` em vez de para o `harness`. Veja a [Arquitetura](/pt-br/about/architecture/) para as regras de fronteira.

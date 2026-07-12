@@ -348,5 +348,3 @@ export const PREVC_DOC_GUIDES: Record<PrevcDocType, PrevcDocGuide> = {
     description: 'Index of the repository knowledge base and supporting guides.',
   },
 };
-
-export { PREVC_SKILL_PHASES } from '../skills/builtInSkillCatalog';

@@ -110,7 +110,7 @@ export class ContextCache {
      */
     async get(repoPath: string, contextType: string, keyOptions?: unknown): Promise<string | null> {
         const cache = await this.cacheForRepo(repoPath);
-        const key = this.buildKey(repoPath, contextType, keyOptions);
+        const key = this.buildKey(contextType, keyOptions);
         const entry = cache.get(key);
 
         if (!entry) {
@@ -136,7 +136,7 @@ export class ContextCache {
      */
     async set(repoPath: string, contextType: string, content: string, keyOptions?: unknown): Promise<void> {
         const cache = await this.cacheForRepo(repoPath);
-        const key = this.buildKey(repoPath, contextType, keyOptions);
+        const key = this.buildKey(contextType, keyOptions);
         const freshness = await this.captureFreshness(repoPath);
 
         // Without an injected strong fingerprint, partial discovery cannot
@@ -218,7 +218,7 @@ export class ContextCache {
     /**
      * Build a unique cache key from repo path and context type.
      */
-    private buildKey(repoPath: string, contextType: string, keyOptions?: unknown): string {
+    private buildKey(contextType: string, keyOptions?: unknown): string {
         const optionsKey = keyOptions === undefined ? '' : `:${JSON.stringify(keyOptions)}`;
         return `${contextType}${optionsKey}`;
     }

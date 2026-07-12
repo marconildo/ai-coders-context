@@ -36,11 +36,9 @@ CONTRIBUTING.md
 LICENSE
 README.md
 docs/             -- Published documentation produced by this tool
-example-documentation.ts
 jest.config.js
 package.json
 package-lock.json
-prompts/          -- Prompt templates (update_plan_prompt.md, update_scaffold_prompt.md)
 scripts/          -- Build and test helper scripts
 src/              -- TypeScript source (~240 files): CLI entrypoint, services, generators, utilities
 tsconfig.json
@@ -70,4 +68,3 @@ Generated: 2026-03-18T21:32:55.004Z
 ## Testing
 
 See [testing-strategy.md](../testing-strategy.md) in the parent docs directory for full test framework documentation.
-

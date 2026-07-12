@@ -13,7 +13,6 @@ import {
   isPromptCancelled,
   themedCheckbox,
   themedConfirm,
-  themedInput,
   themedSelect,
 } from '../utils/themedPrompt';
 import { CLIInterface } from '../utils/cliUI';
@@ -60,21 +59,10 @@ import {
 } from '../harness';
 import {
   detectSmartDefaults,
-  displayConfigSummary,
-  type ConfigSummary
 } from '../utils/prompts';
 import { VERSION, PACKAGE_NAME } from '../version';
 
 const rawArgs = process.argv.slice(2);
-const isMcpCommand = rawArgs.includes('mcp');
-
-// Determine if we're in interactive mode (no command args, only flags like --lang)
-const isInteractiveMode = rawArgs.every(arg =>
-  arg.startsWith('-') ||
-  rawArgs[rawArgs.indexOf(arg) - 1]?.startsWith('--lang') ||
-  rawArgs[rawArgs.indexOf(arg) - 1]?.startsWith('--language') ||
-  rawArgs[rawArgs.indexOf(arg) - 1]?.startsWith('-l')
-);
 
 const initialLocale = detectLocale(rawArgs, process.env.DOTCONTEXT_LANG, [
   process.env.LC_ALL,
@@ -1429,72 +1417,6 @@ async function runIntegrationsMenu(): Promise<void> {
     }
   }
 }
-
-async function runInteractiveSync(): Promise<void> {
-  const defaults = await detectSmartDefaults();
-  const defaultSource = path.resolve(defaults.repoPath, '.context/agents');
-
-  // Simplified: single prompt for target selection with common presets
-  const quickTarget = await themedSelect<string>({
-    message: t('prompts.sync.quickTarget'),
-    choices: [
-      { name: t('prompts.sync.quickTarget.common'), value: 'common' },
-      { name: t('prompts.sync.quickTarget.claude'), value: 'claude' },
-      { name: t('prompts.sync.quickTarget.all'), value: 'all' },
-      { name: t('prompts.sync.quickTarget.custom'), value: 'custom' }
-    ],
-    default: 'common'
-  });
-
-  let preset: string | undefined;
-  let target: string[] | undefined;
-  let sourcePath = defaultSource;
-
-  if (quickTarget === 'custom') {
-    // Custom path: ask for source and target
-    sourcePath = await themedInput({
-      message: t('prompts.sync.source'),
-      default: defaultSource
-    });
-    target = [await themedInput({
-      message: t('prompts.sync.customPath')
-    })];
-  } else if (quickTarget === 'common') {
-    // Common: Claude + GitHub - use explicit target paths instead of preset
-    target = [
-      path.resolve(defaults.repoPath, '.claude/agents'),
-      path.resolve(defaults.repoPath, '.github/agents')
-    ];
-  } else {
-    preset = quickTarget;
-  }
-
-  // Show summary
-  const summary: ConfigSummary = {
-    operation: 'sync',
-    repoPath: sourcePath,
-    options: {
-      Target: quickTarget === 'custom' ? (target?.[0] || 'custom') : quickTarget,
-      Mode: 'symlink'
-    }
-  };
-
-  displayConfigSummary(summary, t);
-
-  try {
-    await syncService.run({
-      source: sourcePath,
-      mode: 'symlink',
-      preset: preset as any,
-      target,
-      force: false,
-      dryRun: false
-    });
-  } catch (error) {
-    ui.displayError(t('errors.sync.failed'), error as Error);
-  }
-}
-
 
 // ============================================================================
 // Synchronize my context - unified sync for agents, skills, and docs

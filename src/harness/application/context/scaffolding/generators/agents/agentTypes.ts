@@ -16,9 +16,3 @@ export const AGENT_TYPES = [
 ] as const;
 
 export type AgentType = typeof AGENT_TYPES[number];
-
-export const IMPORTANT_FILES = [
-  'package.json', 'tsconfig.json', 'webpack.config.js', 
-  'next.config.js', 'tailwind.config.js', 'README.md',
-  '.gitignore', 'Dockerfile', 'docker-compose.yml'
-];

@@ -10,12 +10,10 @@ import * as fs from 'fs-extra';
 
 import { colors, symbols, typography } from '../../../../utils/theme';
 import type { CLIInterface } from '../../../../utils/cliUI';
-import type { TranslateFn } from '../../../../utils/i18n';
 import type {
   ImportSkillsCommandFlags,
   ImportSkillsOptions,
   SkillFileInfo,
-  MergeStrategy,
   ImportMetadata,
   ReverseSyncServiceDependencies,
   ImportAction,
@@ -40,14 +38,10 @@ export interface ImportSkillsResult {
 
 export class ImportSkillsService {
   private readonly ui: CLIInterface;
-  private readonly t: TranslateFn;
-  private readonly version: string;
   private readonly detector: SkillsDetector;
 
   constructor(dependencies: ReverseSyncServiceDependencies) {
     this.ui = dependencies.ui;
-    this.t = dependencies.t;
-    this.version = dependencies.version;
     this.detector = new SkillsDetector();
   }
 
@@ -185,7 +179,7 @@ export class ImportSkillsService {
         }
 
         if (options.verbose) {
-          this.logImportAction(file, importResult);
+          this.logImportAction(importResult);
         }
       } catch (error) {
         result.filesFailed++;
@@ -379,7 +373,6 @@ export class ImportSkillsService {
   }
 
   private logImportAction(
-    skill: SkillFileInfo,
     result: { action: ImportAction; targetPath: string }
   ): void {
     const actionSymbols: Record<ImportAction, string> = {

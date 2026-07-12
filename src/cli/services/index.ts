@@ -88,7 +88,6 @@ export {
 
 export {
   StateDetector,
-  default as DefaultStateDetector,
   type ProjectState,
   type StateDetectionResult,
   type StateDetectorOptions,

@@ -1,9 +1,8 @@
 import {
   WorkflowGateChecker,
   getDefaultSettings,
-  GateCheckResult,
 } from '../gateChecker';
-import { PrevcStatus, ProjectScale, WorkflowSettings } from '../../types';
+import { PrevcStatus, ProjectScale } from '../../types';
 
 // Helper to create a minimal valid PrevcStatus
 function createMockStatus(overrides: Partial<PrevcStatus> = {}): PrevcStatus {

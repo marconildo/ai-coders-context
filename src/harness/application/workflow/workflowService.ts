@@ -124,7 +124,6 @@ export class WorkflowService {
   // Narrow accessors used by advance/handoff/plan-sync logic below.
   // Fresh `get` each call keeps the facade as the single owner.
   private get runtimeStateService() { return this.harness.runtimeStateService; }
-  private get sensorsService() { return this.harness.sensorsService; }
   private get taskContractsService() { return this.harness.taskContractsService; }
   private get policyService() { return this.harness.policyService; }
 

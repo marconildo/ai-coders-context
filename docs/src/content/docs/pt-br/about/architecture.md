@@ -116,7 +116,7 @@ O pacote do operador. Ele entrega a stack completa da CLI e exporta um punhado d
 - `SyncService` — exportar/importar rules, agents e skills
 - `ReportService` — gerar relatórios de progresso do workflow
 
-Ele inclui o diretório `prompts/` usado pela CLI interativa, e seu bin é `dotcontext`.
+Seu executável é exposto pelo bin `dotcontext`.
 
 ### `@dotcontext/harness`
 
