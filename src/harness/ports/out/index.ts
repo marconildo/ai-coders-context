@@ -4,6 +4,8 @@ export {
   type AppendTraceInput,
   type AddArtifactInput,
   type CheckpointInput,
+  type HarnessCheckpointPage,
+  type ListCheckpointsOptions,
 } from '../../adapters/out/runtimeState/runtimeStateService';
 export {
   type HarnessWorkflowRecord,

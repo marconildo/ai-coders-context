@@ -5,3 +5,4 @@ export * from './codebaseAnalyzer';
 export * from './semanticSnapshotService';
 export * from './treeSitter';
 export * from './lsp';
+export * from './discovery';

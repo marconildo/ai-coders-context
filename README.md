@@ -117,7 +117,7 @@ One `.context/` directory stores durable project knowledge and workflow state.
 ├── agents/      # Agent playbooks
 ├── skills/      # On-demand expertise guides
 ├── plans/       # Structured PREVC plans and execution tracking
-├── config/      # Authored config: policy.json and sensors.json (version-controlled)
+├── config/      # Authored config: policy.json, sensors.json, runtime.json (version-controlled)
 └── runtime/     # Generated state (gitignored):
     ├── sessions/      # one folder per session: session.json, trace.jsonl, artifacts/
     ├── workflows/     # PREVC state (prevc.json), plan tracking, collaboration records

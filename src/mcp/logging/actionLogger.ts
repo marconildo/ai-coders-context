@@ -6,8 +6,11 @@
  */
 
 import * as fs from 'fs-extra';
+import * as path from 'path';
 
 import { HarnessRuntimeStateService } from '../../harness/adapters/out/runtimeState/runtimeStateService';
+import { BoundedLruCache, type BoundedLruCacheMetrics } from '../../harness/domain/retention/boundedLruCache';
+import { loadRuntimeRetentionConfig } from '../../harness/application/retention/runtimeRetentionConfig';
 import { HarnessWorkflowStateService } from '../../harness/adapters/out/workflowState/workflowStateService';
 import { resolveContextRoot } from '../../shared/context/contextRootResolver';
 
@@ -39,7 +42,67 @@ const MAX_ARRAY = 20;
 const MAX_STRING = 200;
 const MCP_ACTIVITY_NAME = 'mcp-activity';
 
-const sessionCache = new Map<string, string>();
+const sessionCaches = new Map<string, {
+  cache: BoundedLruCache<string, string>;
+  signature: string;
+  diagnostics: string[];
+}>();
+
+function normalizeRepoPath(repoPath: string): string {
+  const resolved = path.resolve(repoPath);
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+async function sessionCacheForRepo(repoPath: string): Promise<BoundedLruCache<string, string>> {
+  const normalized = normalizeRepoPath(repoPath);
+  for (const [ownerPath, owner] of sessionCaches) {
+    if (owner.cache.size === 0) {
+      owner.cache.dispose();
+      sessionCaches.delete(ownerPath);
+    }
+  }
+  const loaded = await loadRuntimeRetentionConfig(normalized);
+  const limits = loaded.config.caches.mcpSessions;
+  const signature = JSON.stringify(limits);
+  const current = sessionCaches.get(normalized);
+  if (current?.signature === signature) {
+    sessionCaches.delete(normalized);
+    sessionCaches.set(normalized, current);
+    return current.cache;
+  }
+  current?.cache.dispose();
+  const cache = new BoundedLruCache<string, string>({
+    maxEntries: limits.maxEntries,
+    maxBytes: 64 * 1024,
+    ttlMs: limits.ttlMs,
+    estimateBytes: (sessionId, key) => Buffer.byteLength(sessionId) + Buffer.byteLength(key),
+  });
+  sessionCaches.set(normalized, { cache, signature, diagnostics: loaded.diagnostics });
+  while (sessionCaches.size > limits.maxEntries) {
+    const oldest = sessionCaches.keys().next().value as string | undefined;
+    if (!oldest) break;
+    sessionCaches.get(oldest)?.cache.dispose();
+    sessionCaches.delete(oldest);
+  }
+  return cache;
+}
+
+export function clearMcpActionSessionCache(): void {
+  for (const owner of sessionCaches.values()) owner.cache.dispose();
+  sessionCaches.clear();
+}
+
+export function getMcpActionSessionCacheSize(): number {
+  return [...sessionCaches.values()].reduce((total, owner) => total + owner.cache.size, 0);
+}
+
+export function getMcpActionSessionCacheDiagnostics(repoPath: string): string[] {
+  return [...(sessionCaches.get(normalizeRepoPath(repoPath))?.diagnostics ?? [])];
+}
+
+export function getMcpActionSessionCacheMetrics(repoPath: string): BoundedLruCacheMetrics | undefined {
+  return sessionCaches.get(normalizeRepoPath(repoPath))?.cache.metrics();
+}
 
 async function resolveContextPath(repoPath: string): Promise<string> {
   const resolution = await resolveContextRoot({
@@ -108,13 +171,16 @@ async function resolveMcpActivitySessionId(
   repoPath: string,
   state: HarnessRuntimeStateService
 ): Promise<string> {
-  const cached = sessionCache.get(repoPath);
+  const cacheKey = 'mcp-activity';
+  const sessionCache = await sessionCacheForRepo(repoPath);
+  const cached = sessionCache.get(cacheKey);
   if (cached) {
     try {
-      await state.getSession(cached);
-      return cached;
+      const session = await state.getSession(cached);
+      if (session.status === 'active' || session.status === 'paused') return cached;
+      sessionCache.delete(cacheKey);
     } catch {
-      sessionCache.delete(repoPath);
+      sessionCache.delete(cacheKey);
     }
   }
 
@@ -123,13 +189,15 @@ async function resolveMcpActivitySessionId(
   do {
     const page = await state.listSessionPage({ limit: 50, cursor });
     existing = page.items.find((session) =>
-      session.name === MCP_ACTIVITY_NAME && session.metadata?.transport === 'mcp'
+      session.name === MCP_ACTIVITY_NAME &&
+      session.metadata?.transport === 'mcp' &&
+      (session.status === 'active' || session.status === 'paused')
     );
     cursor = existing ? undefined : page.nextCursor;
   } while (!existing && cursor);
 
   if (existing) {
-    sessionCache.set(repoPath, existing.id);
+    sessionCache.set(cacheKey, existing.id);
     return existing.id;
   }
 
@@ -140,7 +208,7 @@ async function resolveMcpActivitySessionId(
       purpose: 'tool-audit',
     },
   });
-  sessionCache.set(repoPath, created.id);
+  sessionCache.set(cacheKey, created.id);
   return created.id;
 }
 

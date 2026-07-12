@@ -58,6 +58,13 @@ describe('ContextCache', () => {
     });
 
     describe('TTL expiration', () => {
+        it('proactively sweeps expired entries', async () => {
+            const cache = new ContextCache({ ttlMs: 20, sweepIntervalMs: 5 });
+            await cache.set(tempDir, 'compact', 'content');
+            await new Promise(resolve => setTimeout(resolve, 40));
+            expect(cache.size).toBe(0);
+            cache.dispose();
+        });
         it('should expire entries after TTL', async () => {
             // Create cache with very short TTL
             const cache = new ContextCache({ ttlMs: 50 });
@@ -96,6 +103,100 @@ describe('ContextCache', () => {
             await fs.utimes(srcPath, now, now);
 
             expect(await cache.get(tempDir, 'compact')).toBeNull();
+        });
+
+        it('invalidates when a configured watch root is created after caching', async () => {
+            const cache = new ContextCache({ watchDirs: ['src', 'packages'] });
+            await cache.set(tempDir, 'compact', 'before-packages');
+            expect(await cache.get(tempDir, 'compact')).toBe('before-packages');
+
+            await fs.outputFile(path.join(tempDir, 'packages', 'new.ts'), 'export const created = true;');
+
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            cache.dispose();
+        });
+
+        it('validates cache hits from bounded signals and ignores irrelevant runtime files', async () => {
+            await fs.writeFile(path.join(tempDir, 'src', 'index.ts'), 'export const value = 1;');
+            const cache = new ContextCache({ watchDirs: ['src', '.context'], freshnessMaxFiles: 4 });
+            await cache.set(tempDir, 'compact', 'content');
+            const afterSet = cache.freshnessMetrics();
+            expect(afterSet).toMatchObject({ discoveries: 1, filesSelected: 1, partialDiscoveries: 0 });
+
+            expect(await cache.get(tempDir, 'compact')).toBe('content');
+            expect(await cache.get(tempDir, 'compact')).toBe('content');
+            expect(cache.freshnessMetrics().discoveries).toBe(1);
+            expect(cache.freshnessMetrics().signalsChecked).toBeGreaterThan(0);
+
+            await fs.outputFile(path.join(tempDir, '.context', 'runtime', 'ignored.json'), '{"ignored":true}');
+            expect(await cache.get(tempDir, 'compact')).toBe('content');
+            await fs.writeFile(path.join(tempDir, 'src', 'index.ts'), 'export const value = 222;');
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            expect(cache.freshnessMetrics().invalidations).toBe(1);
+            cache.dispose();
+        });
+
+        it('does not cache partial discoveries that cannot prove full freshness', async () => {
+            await fs.outputFile(path.join(tempDir, 'src', 'a.ts'), 'export const a = 1;');
+            await fs.outputFile(path.join(tempDir, 'src', 'b.ts'), 'export const b = 1;');
+            await fs.outputFile(path.join(tempDir, 'src', 'z.ts'), 'export const z = 1;');
+            const cache = new ContextCache({ watchDirs: ['src'], freshnessMaxFiles: 2 });
+
+            await cache.set(tempDir, 'compact', 'stale-content');
+            expect(cache.freshnessMetrics().partialDiscoveries).toBe(1);
+            expect(cache.size).toBe(0);
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+
+            await fs.writeFile(path.join(tempDir, 'src', 'z.ts'), 'export const z = 222;');
+            await cache.set(tempDir, 'compact', 'still-not-cacheable');
+            await fs.outputFile(path.join(tempDir, 'src', 'zz-added.ts'), 'export const added = true;');
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            await fs.remove(path.join(tempDir, 'src', 'z.ts'));
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            cache.dispose();
+        });
+
+        it('does not cache when irrelevant raw entries exhaust the configured freshness budget', async () => {
+            for (let index = 0; index < 40; index += 1) {
+                await fs.writeFile(path.join(tempDir, 'src', `${index}.txt`), 'ignored');
+            }
+            const cache = new ContextCache({
+                watchDirs: ['src'],
+                freshnessMaxFiles: 20,
+                freshnessMaxEntriesScanned: 7,
+            });
+
+            await cache.set(tempDir, 'compact', 'must-not-be-reused');
+            await cache.set(tempDir, 'compact', 'still-partial');
+
+            expect(cache.size).toBe(0);
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            expect(cache.freshnessMetrics()).toMatchObject({
+                discoveries: 2,
+                entriesScanned: 14,
+                partialDiscoveries: 2,
+                entryLimitDiscoveries: 2,
+            });
+            cache.dispose();
+        });
+
+        it('allows cache hits when an injected strong fingerprint proves freshness', async () => {
+            let fingerprint = 'source-v1';
+            const cache = new ContextCache({
+                watchDirs: ['src'],
+                freshnessMaxFiles: 1,
+                fingerprintProvider: async () => fingerprint,
+            });
+            await fs.outputFile(path.join(tempDir, 'src', 'a.ts'), 'export const a = 1;');
+            await fs.outputFile(path.join(tempDir, 'src', 'b.ts'), 'export const b = 1;');
+            await cache.set(tempDir, 'compact', 'strong-content');
+
+            expect(await cache.get(tempDir, 'compact')).toBe('strong-content');
+            await fs.writeFile(path.join(tempDir, 'src', 'b.ts'), 'export const b = 222;');
+            expect(await cache.get(tempDir, 'compact')).toBe('strong-content');
+            fingerprint = 'source-v2';
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            cache.dispose();
         });
     });
 
@@ -143,6 +244,50 @@ describe('ContextCache', () => {
     });
 
     describe('overwrite behavior', () => {
+        it('applies repository runtime overrides without leaking limits across repositories', async () => {
+            const otherDir = await fs.mkdtemp(path.join(os.tmpdir(), 'context-cache-other-'));
+            await fs.ensureDir(path.join(otherDir, 'src'));
+            await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+                version: 1,
+                caches: { context: { maxEntries: 1, maxBytes: 1024, ttlMs: 1000 } },
+            });
+            const now = jest.spyOn(Date, 'now').mockReturnValue(10_000);
+            const cache = new ContextCache({ sweepIntervalMs: 0 });
+            await cache.set(tempDir, 'compact', 'first');
+            await cache.set(tempDir, 'documentation', 'second');
+            expect(await cache.get(tempDir, 'compact')).toBeNull();
+            expect(await cache.get(tempDir, 'documentation')).toBe('second');
+            await cache.set(tempDir, 'plan', 'x'.repeat(2_000));
+            expect(await cache.get(tempDir, 'plan')).toBeNull();
+
+            await cache.set(otherDir, 'compact', 'y'.repeat(2_000));
+            expect(await cache.get(otherDir, 'compact')).toBe('y'.repeat(2_000));
+            now.mockReturnValue(11_001);
+            expect(await cache.get(tempDir, 'documentation')).toBeNull();
+            expect(cache.metrics().evictions.expired).toBeGreaterThan(0);
+            now.mockRestore();
+            cache.dispose();
+            expect(cache.size).toBe(0);
+            await fs.remove(otherDir);
+        });
+
+        it('evicts least recently used contexts over the entry limit', async () => {
+            const cache = new ContextCache({ maxEntries: 2 });
+            await cache.set(tempDir, 'compact', 'a');
+            await cache.set(tempDir, 'documentation', 'b');
+            await cache.get(tempDir, 'compact');
+            await cache.set(tempDir, 'plan', 'c');
+            expect(await cache.get(tempDir, 'documentation')).toBeNull();
+            expect(await cache.get(tempDir, 'compact')).toBe('a');
+            cache.dispose();
+        });
+
+        it('does not retain a single entry larger than the byte budget', async () => {
+            const cache = new ContextCache({ maxBytes: 32 });
+            await cache.set(tempDir, 'compact', 'x'.repeat(100));
+            expect(cache.size).toBe(0);
+            cache.dispose();
+        });
         it('should overwrite existing entries', async () => {
             const cache = new ContextCache();
 

@@ -12,6 +12,7 @@ import { createHash, randomUUID } from 'crypto';
 import { promises as nodeFs } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { resolveRuntimeLayout, type RuntimeLayout } from '../../../../shared/fs/pathHelpers';
+import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
 import {
   boundGenericTraceRecord,
   loadGenericTraceEventMaxBytes,
@@ -127,6 +128,18 @@ export interface HarnessSessionCheckpoint {
   createdAt: string;
 }
 
+export interface ListCheckpointsOptions {
+  /** Opaque cursor returned by the preceding page. */
+  cursor?: string;
+  /** Records per page. Clamped to 1..200 (default 100). */
+  limit?: number;
+}
+
+export interface HarnessCheckpointPage {
+  records: HarnessSessionCheckpoint[];
+  nextCursor?: string;
+}
+
 export interface HarnessSessionRecord {
   id: string;
   name: string;
@@ -139,6 +152,7 @@ export interface HarnessSessionRecord {
   failedAt?: string;
   lastTraceAt?: string;
   lastCheckpointAt?: string;
+  lastCheckpointId?: string;
   traceCount: number;
   artifactCount: number;
   checkpointCount: number;
@@ -175,6 +189,7 @@ export interface HarnessRuntimeStatePort {
   addArtifact(sessionId: string, input: AddArtifactInput): Promise<HarnessArtifactRecord>;
   listArtifacts(sessionId: string): Promise<HarnessArtifactRecord[]>;
   checkpointSession(sessionId: string, input?: CheckpointInput): Promise<HarnessSessionRecord>;
+  listCheckpointsPage(sessionId: string, options?: ListCheckpointsOptions): Promise<HarnessCheckpointPage>;
   listCheckpoints(sessionId: string): Promise<HarnessSessionCheckpoint[]>;
   listTracePage(sessionId: string, query?: HarnessTracePageQuery): Promise<RuntimeHistoryPage<HarnessTraceRecord>>;
   listSessionPage(query?: RuntimeHistoryQuery): Promise<RuntimeHistoryPage<HarnessSessionRecord>>;
@@ -382,6 +397,19 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+function encodeCheckpointCursor(offset: number): string {
+  return Buffer.from(String(offset), 'utf8').toString('base64url');
+}
+
+function decodeCheckpointCursor(cursor: string | undefined): number {
+  if (!cursor) return 0;
+  const decoded = Buffer.from(cursor, 'base64url').toString('utf8');
+  if (!/^\d+$/.test(decoded)) throw new Error('Invalid checkpoint cursor');
+  const offset = Number(decoded);
+  if (!Number.isSafeInteger(offset) || offset < 0) throw new Error('Invalid checkpoint cursor');
+  return offset;
+}
+
 function normalizeContent(content: unknown): unknown {
   if (content === undefined) {
     return undefined;
@@ -430,6 +458,10 @@ export class HarnessRuntimeStateService {
     return this.layout.sessionArtifactFile(sessionId, artifactId);
   }
 
+  private checkpointFile(sessionId: string, checkpointId: string): string {
+    return this.layout.sessionCheckpointFile(sessionId, checkpointId);
+  }
+
   private sensorSummaryFile(sessionId: string): string {
     return path.join(this.layout.sessionDir(sessionId), 'sensor-summary.json');
   }
@@ -461,7 +493,8 @@ export class HarnessRuntimeStateService {
       throw new Error(`Harness session not found: ${sessionId}`);
     }
 
-    return fs.readJson(file) as Promise<HarnessSessionRecord>;
+    const session = await fs.readJson(file) as HarnessSessionRecord;
+    return { ...session, checkpoints: Array.isArray(session.checkpoints) ? session.checkpoints : [] };
   }
 
   private async saveSession(session: HarnessSessionRecord): Promise<void> {
@@ -469,7 +502,14 @@ export class HarnessRuntimeStateService {
     const sessionFile = this.sessionFile(session.id);
     const tmpFile = `${sessionFile}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await fs.writeJson(tmpFile, session, { spaces: 2 });
+      // Preserve legacy inline records until checkpointSession has copied them.
+      // New-format sessions carry an empty in-memory array and persist only the summary.
+      if (session.checkpoints.length > 0) {
+        await fs.writeJson(tmpFile, session, { spaces: 2 });
+      } else {
+        const { checkpoints: _checkpointPayloads, ...document } = session;
+        await fs.writeJson(tmpFile, document, { spaces: 2 });
+      }
       await fs.rename(tmpFile, sessionFile);
     } finally {
       await fs.remove(tmpFile).catch(() => undefined);
@@ -733,7 +773,7 @@ export class HarnessRuntimeStateService {
       data: input.metadata ? { metadata: input.metadata } : undefined,
     });
 
-    return this.readSession(session.id);
+    return this.getSession(session.id);
   }
 
   async listSessions(): Promise<HarnessSessionRecord[]> {
@@ -823,6 +863,9 @@ export class HarnessRuntimeStateService {
   }
 
   async getSession(sessionId: string): Promise<HarnessSessionRecord> {
+    // Session lookup is a hot path for trace logging. The record already
+    // carries checkpointCount/lastCheckpoint*, so never materialize payload
+    // history here. Call listCheckpointsPage() when records are required.
     return this.readSession(sessionId);
   }
 
@@ -878,9 +921,69 @@ export class HarnessRuntimeStateService {
     return artifact;
   }
 
-  async listCheckpoints(sessionId: string): Promise<HarnessSessionCheckpoint[]> {
+  async listCheckpointsPage(
+    sessionId: string,
+    options: ListCheckpointsOptions = {},
+  ): Promise<HarnessCheckpointPage> {
     const session = await this.readSession(sessionId);
-    return [...session.checkpoints].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const limit = Math.min(200, Math.max(1, Math.floor(options.limit ?? 100)));
+    const offset = decodeCheckpointCursor(options.cursor);
+    const records: HarnessSessionCheckpoint[] = [];
+    let visited = 0;
+    let hasMore = false;
+    const legacyIds = new Set((session.checkpoints ?? []).map(checkpoint => checkpoint.id));
+
+    const consider = (checkpoint: HarnessSessionCheckpoint): boolean => {
+      if (visited < offset) {
+        visited += 1;
+        return true;
+      }
+      if (records.length >= limit) {
+        hasMore = true;
+        return false;
+      }
+      records.push(checkpoint);
+      visited += 1;
+      return true;
+    };
+
+    for (const checkpoint of session.checkpoints ?? []) {
+      if (!consider(checkpoint)) break;
+    }
+
+    const dir = this.layout.sessionCheckpointsDir(sessionId);
+    if (!hasMore && await fs.pathExists(dir)) {
+      const directory = await fs.opendir(dir);
+      for await (const entry of directory) {
+        if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+        try {
+          const checkpoint = await fs.readJson(path.join(dir, entry.name)) as HarnessSessionCheckpoint;
+          // An interrupted legacy migration can temporarily leave the same
+          // record inline and external. It still occupies one logical slot.
+          if (legacyIds.has(checkpoint.id)) continue;
+          if (!consider(checkpoint)) break;
+        } catch {
+          // Preserve availability when one record is corrupt or partially written.
+        }
+      }
+    }
+    records.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    return {
+      records,
+      ...(hasMore ? { nextCursor: encodeCheckpointCursor(visited) } : {}),
+    };
+  }
+
+  /** Compatibility helper for explicit callers that need the complete history. */
+  async listCheckpoints(sessionId: string): Promise<HarnessSessionCheckpoint[]> {
+    const checkpoints = new Map<string, HarnessSessionCheckpoint>();
+    let cursor: string | undefined;
+    do {
+      const page = await this.listCheckpointsPage(sessionId, { cursor, limit: 200 });
+      for (const checkpoint of page.records) checkpoints.set(checkpoint.id, checkpoint);
+      cursor = page.nextCursor;
+    } while (cursor);
+    return [...checkpoints.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }
 
   async listArtifacts(sessionId: string): Promise<HarnessArtifactRecord[]> {
@@ -1079,6 +1182,34 @@ export class HarnessRuntimeStateService {
 
   async checkpointSession(sessionId: string, input: CheckpointInput = {}): Promise<HarnessSessionRecord> {
     const session = await this.readSession(sessionId);
+    const { config } = await loadRuntimeRetentionConfig(this.repoPath);
+    let serializedData = '';
+    try {
+      if (input.data !== undefined) {
+        const encoded = JSON.stringify(input.data);
+        if (encoded === undefined) throw new Error('unsupported value');
+        serializedData = encoded;
+      }
+    } catch {
+      throw new Error('Checkpoint data must be JSON serializable');
+    }
+    const dataBytes = Buffer.byteLength(serializedData);
+    if (dataBytes > config.checkpoints.maxDataBytes) {
+      throw new Error(`Checkpoint data exceeds ${config.checkpoints.maxDataBytes} byte limit`);
+    }
+    if (input.note !== undefined) {
+      if (typeof input.note !== 'string' || Buffer.byteLength(input.note) > config.checkpoints.maxNoteBytes) {
+        throw new Error(`Checkpoint note exceeds ${config.checkpoints.maxNoteBytes} byte limit`);
+      }
+    }
+    if ((input.artifactIds?.length ?? 0) > config.checkpoints.maxArtifactIds) {
+      throw new Error(`Checkpoint artifactIds exceed ${config.checkpoints.maxArtifactIds} item limit`);
+    }
+    for (const artifactId of input.artifactIds ?? []) {
+      if (typeof artifactId !== 'string' || Buffer.byteLength(artifactId) > config.checkpoints.maxArtifactIdBytes) {
+        throw new Error(`Checkpoint artifactId exceeds ${config.checkpoints.maxArtifactIdBytes} byte limit`);
+      }
+    }
     const createdAt = nowIso();
     const checkpoint: HarnessSessionCheckpoint = {
       id: randomUUID(),
@@ -1087,10 +1218,30 @@ export class HarnessRuntimeStateService {
       artifactIds: input.artifactIds || [],
       createdAt,
     };
+    const serializedCheckpoint = JSON.stringify(checkpoint);
+    const serializedBytes = Buffer.byteLength(serializedCheckpoint);
+    if (serializedBytes > config.checkpoints.maxSerializedBytes) {
+      throw new Error(`Checkpoint record exceeds ${config.checkpoints.maxSerializedBytes} byte limit`);
+    }
 
-    session.checkpoints.push(checkpoint);
-    session.checkpointCount = session.checkpoints.length;
+    // Lazy, lossless migration: legacy inline records are copied before the
+    // next new-write strips the embedded array from session.json.
+    for (const legacy of session.checkpoints ?? []) {
+      const file = this.checkpointFile(sessionId, legacy.id);
+      if (!await fs.pathExists(file)) {
+        await fs.ensureDir(path.dirname(file));
+        await fs.writeJson(file, legacy, { spaces: 2 });
+      }
+    }
+    await fs.ensureDir(this.layout.sessionCheckpointsDir(sessionId));
+    await fs.writeFile(this.checkpointFile(sessionId, checkpoint.id), serializedCheckpoint, 'utf8');
+    const storedCount = Number.isSafeInteger(session.checkpointCount) && session.checkpointCount >= 0
+      ? session.checkpointCount
+      : 0;
+    session.checkpointCount = Math.max(storedCount, session.checkpoints.length) + 1;
+    session.checkpoints = [];
     session.lastCheckpointAt = createdAt;
+    session.lastCheckpointId = checkpoint.id;
     session.updatedAt = createdAt;
     session.status = input.pause ? 'paused' : session.status;
 
@@ -1105,7 +1256,7 @@ export class HarnessRuntimeStateService {
       data: {
         checkpointId: checkpoint.id,
         artifactIds: checkpoint.artifactIds,
-        payload: input.data,
+        payloadBytes: serializedBytes,
       },
     });
 

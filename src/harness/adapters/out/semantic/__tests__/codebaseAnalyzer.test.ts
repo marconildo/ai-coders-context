@@ -84,6 +84,14 @@ describe('CodebaseAnalyzer', () => {
 
   beforeEach(async () => {
     tempDir = await createTempOutput('dotcontext-analyzer-');
+    for (const relative of [
+      'src/services/userService.ts',
+      'src/controllers/userController.ts',
+      'src/models/user.ts',
+      'src/utils/helper.ts',
+    ]) {
+      await fs.outputFile(path.join(tempDir, relative), 'export const value = 1;');
+    }
     jest.clearAllMocks();
   });
 
@@ -193,18 +201,8 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should find entry points based on file names', async () => {
-      // Override glob to return an entry point file
-      const { glob } = require('glob');
-      glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        if (pattern.includes('.ts')) {
-          return [
-            path.join(options.cwd, 'src', 'index.ts'),
-            path.join(options.cwd, 'src', 'main.ts'),
-            path.join(options.cwd, 'src', 'services', 'userService.ts'),
-          ];
-        }
-        return [];
-      });
+      await fs.outputFile(path.join(tempDir, 'src', 'index.ts'), 'export const entry = true;');
+      await fs.outputFile(path.join(tempDir, 'src', 'main.ts'), 'export const main = true;');
 
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
       const context = await analyzer.analyze(tempDir);
@@ -389,15 +387,35 @@ describe('CodebaseAnalyzer', () => {
   describe('options handling', () => {
     it('should respect maxFiles option', async () => {
       const { glob } = require('glob');
-      const manyFiles = Array.from({ length: 100 }, (_, i) =>
-        path.join(tempDir, `file${i}.ts`)
-      );
-      glob.mockImplementationOnce(async () => manyFiles);
+      for (let index = 0; index < 30; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'many', `file${index}.ts`), `export const v${index} = ${index};`);
+      }
 
       const analyzer = new CodebaseAnalyzer({ useLSP: false, maxFiles: 10 });
       const context = await analyzer.analyze(tempDir);
 
       expect(context.stats.totalFiles).toBeLessThanOrEqual(10);
+      expect(analyzer.discoveryMetrics()).toMatchObject({ filesSelected: 10, partial: true });
+      expect(glob).not.toHaveBeenCalled();
+    });
+
+    it('should respect the raw directory-entry scan policy before analyzing files', async () => {
+      for (let index = 0; index < 40; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'irrelevant', `${index}.txt`), 'ignored');
+      }
+      const analyzer = new CodebaseAnalyzer({
+        useLSP: false,
+        maxFiles: 100,
+        maxEntriesScanned: 6,
+      });
+
+      await analyzer.analyze(tempDir);
+
+      expect(analyzer.discoveryMetrics()).toMatchObject({
+        entriesScanned: 6,
+        partial: true,
+        stopReason: 'maxEntriesScanned',
+      });
     });
 
     it('should respect languages option', async () => {
@@ -425,14 +443,7 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should respect include patterns', async () => {
-      const { glob } = require('glob');
-      glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        return [
-          path.join(options.cwd, 'src', 'services', 'userService.ts'),
-          path.join(options.cwd, 'src', 'controllers', 'userController.ts'),
-          path.join(options.cwd, 'tests', 'testFile.ts'),
-        ];
-      });
+      await fs.outputFile(path.join(tempDir, 'tests', 'testFile.ts'), 'export const testOnly = true;');
 
       const analyzer = new CodebaseAnalyzer({
         useLSP: false,

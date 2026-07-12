@@ -98,10 +98,6 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
-function sortByCreatedAt<T extends { createdAt: string }>(items: T[]): T[] {
-  return [...items].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-}
-
 interface ReplayCursorPosition {
   createdAt: string;
   source: HarnessReplayEventSource;
@@ -239,12 +235,27 @@ export class HarnessReplayService {
       cursor => this.stateService.listArtifactPage(sessionId, { limit: pageSize, cursor, direction: 'oldest', maxBytes: byteBudget }),
       artifact => ({ id: artifact.id, sessionId, createdAt: artifact.createdAt, source: 'artifact', label: artifact.name, record: recordFor(artifact) })
     );
-    const checkpointSource = (async function* (): AsyncGenerator<HarnessReplayEvent> {
-      for (const checkpoint of sortByCreatedAt(session.checkpoints)) {
-        const event: HarnessReplayEvent = { id: checkpoint.id, sessionId, createdAt: checkpoint.createdAt, source: 'checkpoint', label: checkpoint.note || checkpoint.id, record: recordFor(checkpoint) };
-        if (afterBoundary(event)) yield event;
-      }
-    })();
+    const checkpointSource = paged(
+      async cursor => {
+        // Checkpoint records are externalized by the retention layer, so the
+        // summary returned by getSession() intentionally does not embed them.
+        // Keep each prefetched page below the default replay byte budget using
+        // the checkpoint record's absolute 64 KiB ceiling.
+        const page = await this.stateService.listCheckpointsPage(sessionId, {
+          cursor,
+          limit: Math.min(pageSize, 16),
+        });
+        return { items: page.records, nextCursor: page.nextCursor };
+      },
+      checkpoint => ({
+        id: checkpoint.id,
+        sessionId,
+        createdAt: checkpoint.createdAt,
+        source: 'checkpoint',
+        label: checkpoint.note || checkpoint.id,
+        record: recordFor(checkpoint),
+      })
+    );
     const sensorSource = paged(
       cursor => this.sensorsService.getSessionSensorRunPage(sessionId, { limit: pageSize, cursor, direction: 'oldest', maxBytes: byteBudget }),
       run => ({ id: run.id, sessionId, createdAt: run.createdAt, source: 'sensor', label: run.sensorId, record: recordFor(run) })
