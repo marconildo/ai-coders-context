@@ -2,7 +2,6 @@ import * as fs from 'fs-extra';
 import * as os from 'os';
 import * as path from 'path';
 import { promises as nativeFs } from 'fs';
-import { randomUUID } from 'crypto';
 import { spawn } from 'child_process';
 
 import { createHarnessHookAdapter } from '../../../harness';
@@ -182,7 +181,85 @@ describe('hookSessionStore', () => {
     expect(await fs.pathExists(lockPath)).toBe(false);
   });
 
-  it('does not unlink a replacement lock with a different inode and token', async () => {
+  it('reads and recovers an aged legacy lock after its owner exits', async () => {
+    const storePath = path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json');
+    const lockPath = `${storePath}.lock`;
+    await fs.ensureDir(path.dirname(lockPath));
+    const childScript = [
+      "const fs = require('fs');",
+      'const lockPath = process.argv[1];',
+      'fs.writeFileSync(lockPath, JSON.stringify({',
+      '  pid: process.pid,',
+      '  createdAt: Date.now() - 60000',
+      '}));',
+      'process.exit(74);',
+    ].join('\n');
+    const child = spawn(process.execPath, ['-e', childScript, lockPath], { stdio: 'ignore' });
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', reject);
+      child.once('exit', () => resolve());
+    });
+
+    const now = new Date().toISOString();
+    await saveHookHarnessSession({
+      repoPath: tempDir,
+      source: 'claude-code',
+      hostSessionId: 'legacy-after-crash',
+      harnessSessionId: 'legacy-replacement-session',
+      createdAt: now,
+      updatedAt: now,
+    });
+
+    expect(await getHookHarnessSessionId({
+      repoPath: tempDir,
+      source: 'claude-code',
+      hostSessionId: 'legacy-after-crash',
+    })).toBe('legacy-replacement-session');
+    expect(await fs.pathExists(lockPath)).toBe(false);
+  });
+
+  it('does not steal an aged legacy lock from a live process and times out safely', async () => {
+    const storePath = path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json');
+    const lockPath = `${storePath}.lock`;
+    await fs.ensureDir(path.dirname(lockPath));
+    const childScript = [
+      "const fs = require('fs');",
+      'const lockPath = process.argv[1];',
+      'fs.writeFileSync(lockPath, JSON.stringify({',
+      '  pid: process.pid,',
+      '  createdAt: Date.now() - 60000',
+      '}));',
+      "process.stdout.write('ready\\n');",
+      'setInterval(() => {}, 1000);',
+    ].join('\n');
+    const child = spawn(process.execPath, ['-e', childScript, lockPath], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once('error', reject);
+      child.stdout!.once('data', () => resolve());
+    });
+    const originalLock = await fs.readFile(lockPath, 'utf8');
+
+    try {
+      const now = new Date().toISOString();
+      await expect(saveHookHarnessSession({
+        repoPath: tempDir,
+        source: 'codex',
+        hostSessionId: 'must-time-out',
+        harnessSessionId: 'must-not-be-saved',
+        createdAt: now,
+        updatedAt: now,
+      })).rejects.toThrow('Timed out waiting for hook session store lock');
+      expect(await fs.readFile(lockPath, 'utf8')).toBe(originalLock);
+    } finally {
+      child.kill('SIGKILL');
+      await new Promise<void>(resolve => child.once('exit', () => resolve()));
+      await fs.remove(lockPath);
+    }
+  }, 15_000);
+
+  it('does not unlink a replacement legacy lock with a different inode and owner content', async () => {
     const storePath = path.join(tempDir, '.context', 'runtime', 'hooks', 'host-sessions.json');
     const lockPath = `${storePath}.lock`;
     await fs.outputJson(storePath, { bindings: {} });
@@ -213,9 +290,7 @@ describe('hookSessionStore', () => {
     });
     await acquired;
     const replacement = {
-      version: 1,
       pid: process.pid,
-      token: randomUUID(),
       createdAt: Date.now(),
     };
     await nativeFs.unlink(lockPath);

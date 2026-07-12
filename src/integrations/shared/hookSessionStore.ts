@@ -36,11 +36,20 @@ interface HookSessionLockOwner {
   createdAt: number;
 }
 
+/** Lock shape written before owner tokens were introduced. */
+interface LegacyHookSessionLockOwner {
+  pid: number;
+  createdAt: number;
+}
+
+type AnyHookSessionLockOwner = HookSessionLockOwner | LegacyHookSessionLockOwner;
+
 interface HookSessionLockSnapshot {
-  owner?: HookSessionLockOwner;
+  owner?: AnyHookSessionLockOwner;
   device: number;
   inode: number;
   mtimeMs: number;
+  content: string;
 }
 
 export interface HookSessionPruneResult {
@@ -101,17 +110,27 @@ async function writeStore(repoPath: string, document: HookSessionStoreDocument):
   }
 }
 
-function parseLockOwner(value: string): HookSessionLockOwner | undefined {
+function validLockPidAndTimestamp(candidate: { pid?: unknown; createdAt?: unknown }): boolean {
+  return Number.isSafeInteger(candidate.pid)
+    && (candidate.pid as number) > 0
+    && Number.isFinite(candidate.createdAt)
+    && (candidate.createdAt as number) > 0;
+}
+
+function parseLockOwner(value: string): AnyHookSessionLockOwner | undefined {
   try {
     const candidate = JSON.parse(value) as Partial<HookSessionLockOwner>;
+    if (!validLockPidAndTimestamp(candidate)) return undefined;
+    // Rolling-upgrade compatibility: the original lock document had only
+    // pid/createdAt. Preserve that owner identity so a live legacy process is
+    // never mistaken for an orphan.
+    if (candidate.version === undefined && candidate.token === undefined) {
+      return { pid: candidate.pid!, createdAt: candidate.createdAt! };
+    }
     if (
       candidate.version !== 1
-      || !Number.isSafeInteger(candidate.pid)
-      || (candidate.pid ?? 0) <= 0
       || typeof candidate.token !== 'string'
       || !/^[0-9a-f-]{36}$/i.test(candidate.token)
-      || !Number.isFinite(candidate.createdAt)
-      || (candidate.createdAt ?? 0) <= 0
     ) return undefined;
     return candidate as HookSessionLockOwner;
   } catch {
@@ -131,6 +150,7 @@ async function readLockSnapshot(lockPath: string): Promise<HookSessionLockSnapsh
       device: stat.dev,
       inode: stat.ino,
       mtimeMs: stat.mtimeMs,
+      content,
     };
   } finally {
     await handle.close().catch(() => undefined);
@@ -140,7 +160,7 @@ async function readLockSnapshot(lockPath: string): Promise<HookSessionLockSnapsh
 function sameLock(left: HookSessionLockSnapshot, right: HookSessionLockSnapshot): boolean {
   return left.device === right.device
     && left.inode === right.inode
-    && left.owner?.token === right.owner?.token
+    && left.content === right.content
     && left.owner?.pid === right.owner?.pid
     && left.owner?.createdAt === right.owner?.createdAt;
 }
@@ -167,9 +187,9 @@ async function reclaimStaleLock(lockPath: string): Promise<boolean> {
   if (Date.now() - createdAt < LOCK_STALE_MS) return false;
   if (observed.owner && processIsAlive(observed.owner.pid)) return false;
 
-  // Re-open immediately before unlinking. Both inode and the unguessable
-  // owner token must still match, so a replacement lock is never removed on
-  // the basis of an earlier stale observation.
+  // Re-open immediately before unlinking. Inode and the complete owner
+  // document (including the token for current-format locks) must still match,
+  // so a replacement is never removed from an earlier stale observation.
   let current: HookSessionLockSnapshot;
   try {
     current = await readLockSnapshot(lockPath);
@@ -226,8 +246,9 @@ async function withInterProcessLock<T>(storePath: string, operation: () => Promi
     token,
     createdAt: Date.now(),
   };
+  const serializedOwner = JSON.stringify(owner);
   try {
-    await handle.writeFile(JSON.stringify(owner), 'utf8');
+    await handle.writeFile(serializedOwner, 'utf8');
     await handle.sync();
   } catch (error) {
     const stat = await handle.stat().catch(() => undefined);
@@ -238,6 +259,7 @@ async function withInterProcessLock<T>(storePath: string, operation: () => Promi
         device: stat.dev,
         inode: stat.ino,
         mtimeMs: stat.mtimeMs,
+        content: serializedOwner,
       });
     }
     throw error;
@@ -249,6 +271,7 @@ async function withInterProcessLock<T>(storePath: string, operation: () => Promi
     device: stat.dev,
     inode: stat.ino,
     mtimeMs: stat.mtimeMs,
+    content: serializedOwner,
   };
 
   try {
