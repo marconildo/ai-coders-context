@@ -2,9 +2,10 @@
  * Built-in `tests-passing` sensor.
  *
  * Two modes:
- *   - `kind: 'jest'` (default): runs `npm test -- --runInBand --json` (or a
- *     configured `testCommand` argv array) and parses the JSON result on
- *     stdout. Passes iff exit code 0 AND `numFailedTests === 0`.
+ *   - `kind: 'jest'` (default): runs `npm test -- --runInBand --json`, writes
+ *     structured results to a size-checked temporary file, and keeps console
+ *     output bounded. Configured commands spool structured stdout to disk.
+ *     Passes iff exit code 0 AND `numFailedTests === 0`.
  *   - `kind: 'exit-code'`: runs the configured `testCommand` argv array and
  *     passes iff the process exits with code 0. Use this for non-jest test
  *     runners.
@@ -16,16 +17,31 @@
  */
 
 import { spawn } from 'child_process';
+import { closeSync, openSync, promises as fs, writeSync } from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import type {
   HarnessSensorDefinition,
   HarnessSensorExecutionInput,
   HarnessSensorExecutionResult,
 } from '../../../application/sensors/sensorsService';
+import {
+  BoundedByteCollector,
+  DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
+  DEFAULT_SUBPROCESS_TAIL_BYTES,
+  resolveSubprocessOutputLimits,
+  subprocessSpawnOptions,
+  terminateProcessTree,
+  type SubprocessOutputLimitsInput,
+} from '../../../domain/execution';
+import { projectJestResultFile, type ProjectedJestResultRead } from './jestResultProjector';
 
 export interface TestsPassingOptions {
   kind?: 'jest' | 'exit-code';
   testCommand?: string[];
   timeoutMs?: number;
+  tailBytes?: number;
+  hardOutputLimitBytes?: number;
 }
 
 export interface TestsPassingReport {
@@ -37,9 +53,12 @@ export interface TestsPassingReport {
 
 const DEFAULT_TIMEOUT_MS = 300_000;
 const DEFAULT_JEST_COMMAND: string[] = ['npm', 'test', '--', '--runInBand', '--json'];
-const TAIL_LIMIT_BYTES = 8 * 1024;
 
-function readOptions(input: HarnessSensorExecutionInput): Required<TestsPassingOptions> {
+interface ResolvedTestsPassingOptions extends Required<TestsPassingOptions> {
+  usesDefaultCommand: boolean;
+}
+
+function readOptions(input: HarnessSensorExecutionInput): ResolvedTestsPassingOptions {
   const ctx = (input.context && typeof input.context === 'object' ? input.context : {}) as TestsPassingOptions;
   const meta = (input.metadata && typeof input.metadata === 'object'
     ? (input.metadata as Record<string, unknown>)
@@ -50,28 +69,72 @@ function readOptions(input: HarnessSensorExecutionInput): Required<TestsPassingO
     kind,
     testCommand: Array.isArray(cmd) && cmd.length > 0 ? cmd : DEFAULT_JEST_COMMAND,
     timeoutMs: ctx.timeoutMs ?? meta.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+    tailBytes: ctx.tailBytes ?? meta.tailBytes ?? DEFAULT_SUBPROCESS_TAIL_BYTES,
+    hardOutputLimitBytes:
+      ctx.hardOutputLimitBytes ?? meta.hardOutputLimitBytes ?? DEFAULT_SUBPROCESS_HARD_OUTPUT_BYTES,
+    usesDefaultCommand: !Array.isArray(cmd) || cmd.length === 0,
   };
 }
 
-interface SpawnResult {
+export interface SpawnResult {
   exitCode: number | null;
-  stdout: string;
-  stderr: string;
+  stdoutTail: string;
+  stderrTail: string;
+  stdoutBytes: number;
+  stderrBytes: number;
+  stdoutDroppedBytes: number;
+  stderrDroppedBytes: number;
+  outputTruncated: boolean;
+  outputLimitExceeded: boolean;
   timedOut: boolean;
+  durationMs: number;
   spawnError?: string;
+  terminationReason?: 'timeout' | 'outputLimit' | 'spawnError';
 }
 
-function tail(s: string, limit: number): string {
-  return s.length <= limit ? s : s.slice(s.length - limit);
+function writeComplete(fd: number, chunk: Buffer): void {
+  let offset = 0;
+  while (offset < chunk.length) offset += writeSync(fd, chunk, offset);
+}
+
+function emptySpawnResult(startedAt: number, spawnError: string): SpawnResult {
+  return {
+    exitCode: null,
+    stdoutTail: '',
+    stderrTail: '',
+    stdoutBytes: 0,
+    stderrBytes: 0,
+    stdoutDroppedBytes: 0,
+    stderrDroppedBytes: 0,
+    outputTruncated: false,
+    outputLimitExceeded: false,
+    timedOut: false,
+    durationMs: Date.now() - startedAt,
+    spawnError,
+    terminationReason: 'spawnError',
+  };
 }
 
 export function runShell(
   argv: string[],
   cwd: string,
-  timeoutMs: number
+  timeoutMs: number,
+  outputLimits: SubprocessOutputLimitsInput = {},
+  structuredStdoutPath?: string
 ): Promise<SpawnResult> {
   return new Promise((resolve) => {
+    const startedAt = Date.now();
     const [executable, ...args] = argv;
+    const limits = resolveSubprocessOutputLimits(outputLimits);
+    let structuredStdoutFd: number | undefined;
+    if (structuredStdoutPath) {
+      try {
+        structuredStdoutFd = openSync(structuredStdoutPath, 'w');
+      } catch (err) {
+        resolve(emptySpawnResult(startedAt, err instanceof Error ? err.message : String(err)));
+        return;
+      }
+    }
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(executable, args, {
@@ -79,64 +142,123 @@ export function runShell(
         shell: false,
         stdio: ['ignore', 'pipe', 'pipe'],
         env: process.env,
+        ...subprocessSpawnOptions(),
       });
     } catch (err) {
-      resolve({
-        exitCode: null,
-        stdout: '',
-        stderr: '',
-        timedOut: false,
-        spawnError: err instanceof Error ? err.message : String(err),
-      });
+      if (structuredStdoutFd !== undefined) closeSync(structuredStdoutFd);
+      resolve(emptySpawnResult(startedAt, err instanceof Error ? err.message : String(err)));
       return;
     }
 
-    const stdoutChunks: Buffer[] = [];
-    const stderrChunks: Buffer[] = [];
+    const stdout = new BoundedByteCollector(limits.tailBytes);
+    const stderr = new BoundedByteCollector(limits.tailBytes);
     let timedOut = false;
+    let outputLimitExceeded = false;
     let settled = false;
+    let spawnError: Error | undefined;
+    let exitCodeSeen: number | null = null;
+    let termination: Promise<void> | undefined;
 
-    child.stdout?.on('data', (c: Buffer) => stdoutChunks.push(c));
-    child.stderr?.on('data', (c: Buffer) => stderrChunks.push(c));
+    let timer: NodeJS.Timeout;
+    const requestTermination = () => {
+      if (termination) return;
+      clearTimeout(timer);
+      termination = terminateProcessTree(child);
+      void termination.then(() => {
+        // A hostile descendant may keep inherited pipes open. Once the whole
+        // tree has received the forced signal, stop waiting on those streams.
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        void finish(exitCodeSeen);
+      });
+    };
+    const capture = (collector: BoundedByteCollector, chunk: Buffer) => {
+      collector.append(chunk);
+      if (collector === stdout && structuredStdoutFd !== undefined) {
+        try {
+          writeComplete(structuredStdoutFd, chunk);
+        } catch (err) {
+          spawnError = err instanceof Error ? err : new Error(String(err));
+          requestTermination();
+        }
+      }
+      if (
+        !outputLimitExceeded &&
+        stdout.totalBytes + stderr.totalBytes > limits.hardCombinedOutputBytes
+      ) {
+        outputLimitExceeded = true;
+        requestTermination();
+      }
+    };
 
-    const timer = setTimeout(() => {
+    child.stdout?.on('data', (chunk: Buffer) => capture(stdout, chunk));
+    child.stderr?.on('data', (chunk: Buffer) => capture(stderr, chunk));
+
+    timer = setTimeout(() => {
+      if (outputLimitExceeded) return;
       timedOut = true;
-      child.kill('SIGKILL');
+      requestTermination();
     }, timeoutMs);
 
-    const finish = (exitCode: number | null, spawnError?: Error) => {
+    const finish = async (exitCode: number | null) => {
+      if (settled) return;
+      if (termination) await termination;
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (structuredStdoutFd !== undefined) {
+        closeSync(structuredStdoutFd);
+        structuredStdoutFd = undefined;
+      }
       resolve({
         exitCode,
-        stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
-        stderr: Buffer.concat(stderrChunks).toString('utf-8'),
+        stdoutTail: stdout.toString(),
+        stderrTail: stderr.toString(),
+        stdoutBytes: stdout.totalBytes,
+        stderrBytes: stderr.totalBytes,
+        stdoutDroppedBytes: stdout.droppedBytes,
+        stderrDroppedBytes: stderr.droppedBytes,
+        outputTruncated: stdout.truncated || stderr.truncated,
+        outputLimitExceeded,
         timedOut,
+        durationMs: Date.now() - startedAt,
         spawnError: spawnError?.message,
+        terminationReason: outputLimitExceeded
+          ? 'outputLimit'
+          : timedOut
+            ? 'timeout'
+            : spawnError
+              ? 'spawnError'
+              : undefined,
       });
     };
 
-    child.on('error', (err) => finish(null, err));
-    child.on('close', (code) => finish(code));
+    // Wait for close after error/kill so the child is always reaped before the
+    // promise resolves.
+    child.on('error', (err) => { spawnError = err; });
+    child.on('exit', (code) => { exitCodeSeen = code; });
+    child.on('close', (code) => { void finish(code); });
   });
 }
 
-function extractJsonFromStdout(stdout: string): unknown | null {
-  // Jest --json sometimes emits warnings on stdout before the JSON object.
-  // Find the first `{` and try to parse from there.
-  const trimmed = stdout.trim();
-  if (!trimmed) return null;
-  if (trimmed.startsWith('{')) {
-    try { return JSON.parse(trimmed); } catch { /* fallthrough */ }
-  }
-  const idx = stdout.indexOf('{');
-  if (idx === -1) return null;
-  try {
-    return JSON.parse(stdout.slice(idx));
-  } catch {
-    return null;
-  }
+export type JestResultFileRead = ProjectedJestResultRead;
+
+export async function readJestResultFile(resultPath: string): Promise<JestResultFileRead> {
+  return projectJestResultFile(resultPath);
+}
+
+export function subprocessDetails(result: SpawnResult, argv: string[]): Record<string, unknown> {
+  return {
+    command: path.basename(argv[0] ?? ''),
+    durationMs: result.durationMs,
+    stdoutBytes: result.stdoutBytes,
+    stderrBytes: result.stderrBytes,
+    stdoutDroppedBytes: result.stdoutDroppedBytes,
+    stderrDroppedBytes: result.stderrDroppedBytes,
+    outputTruncated: result.outputTruncated,
+    outputLimitExceeded: result.outputLimitExceeded,
+    terminationReason: result.terminationReason,
+  };
 }
 
 export async function executeTestsPassing(
@@ -144,102 +266,118 @@ export async function executeTestsPassing(
   input: HarnessSensorExecutionInput
 ): Promise<HarnessSensorExecutionResult> {
   const opts = readOptions(input);
-
-  const result = await runShell(opts.testCommand, repoPath, opts.timeoutMs);
-
-  if (result.spawnError) {
-    return {
-      status: 'failed',
-      summary: `tests-passing: spawn error: ${result.spawnError}`,
-      evidence: [`command: ${opts.testCommand.join(' ')}`],
-    };
+  let resultDirectory: string | undefined;
+  let resultPath: string | undefined;
+  let command = opts.testCommand;
+  let structuredStdoutPath: string | undefined;
+  if (opts.kind === 'jest') {
+    resultDirectory = await fs.mkdtemp(path.join(os.tmpdir(), 'dotcontext-jest-'));
+    resultPath = path.join(resultDirectory, 'result.json');
+    if (opts.usesDefaultCommand) command = [...DEFAULT_JEST_COMMAND, '--outputFile', resultPath];
+    else structuredStdoutPath = resultPath;
   }
 
-  if (result.timedOut) {
-    return {
-      status: 'failed',
-      summary: `tests-passing: timed out after ${opts.timeoutMs}ms`,
-      evidence: [`command: ${opts.testCommand.join(' ')}`, tail(result.stderr, TAIL_LIMIT_BYTES)],
-    };
-  }
+  try {
+    const result = await runShell(command, repoPath, opts.timeoutMs, {
+      tailBytes: opts.tailBytes,
+      hardCombinedOutputBytes: opts.hardOutputLimitBytes,
+    }, structuredStdoutPath);
 
-  if (opts.kind === 'exit-code') {
-    if (result.exitCode === 0) {
+    const details = subprocessDetails(result, command);
+
+    if (result.spawnError) {
       return {
-        status: 'passed',
-        summary: 'tests-passing: exit 0',
-        evidence: [`command: ${opts.testCommand.join(' ')}`],
+        status: 'failed',
+        summary: `tests-passing: spawn error: ${result.spawnError}`,
+        evidence: [`command: ${command.join(' ')}`],
+        details,
       };
     }
-    return {
-      status: 'failed',
-      summary: `tests-passing: exit ${result.exitCode}`,
-      evidence: [`command: ${opts.testCommand.join(' ')}`, tail(result.stderr, TAIL_LIMIT_BYTES)],
-    };
-  }
 
-  // jest mode
-  const parsed = extractJsonFromStdout(result.stdout);
-  if (!parsed || typeof parsed !== 'object') {
-    return {
-      status: 'failed',
-      summary: 'tests-passing: could not parse jest --json output',
-      evidence: [
-        `command: ${opts.testCommand.join(' ')}`,
-        `exitCode: ${result.exitCode}`,
-        tail(result.stdout, TAIL_LIMIT_BYTES),
-        tail(result.stderr, TAIL_LIMIT_BYTES),
-      ].filter(Boolean),
-    };
-  }
-
-  const j = parsed as Record<string, unknown>;
-  const numPassedTests = typeof j.numPassedTests === 'number' ? j.numPassedTests : 0;
-  const numFailedTests = typeof j.numFailedTests === 'number' ? j.numFailedTests : 0;
-  const numTotalTestSuites = typeof j.numTotalTestSuites === 'number' ? j.numTotalTestSuites : 0;
-
-  const failures: Array<{ name: string; message: string }> = [];
-  const testResults = Array.isArray(j.testResults) ? j.testResults : [];
-  for (const suite of testResults) {
-    if (!suite || typeof suite !== 'object') continue;
-    const s = suite as Record<string, unknown>;
-    const assertionResults = Array.isArray(s.assertionResults) ? s.assertionResults : [];
-    for (const a of assertionResults) {
-      if (!a || typeof a !== 'object') continue;
-      const ar = a as Record<string, unknown>;
-      if (ar.status === 'failed') {
-        const messages = Array.isArray(ar.failureMessages) ? ar.failureMessages : [];
-        failures.push({
-          name: typeof ar.fullName === 'string' ? ar.fullName : (typeof ar.title === 'string' ? ar.title : 'unknown'),
-          message: messages.map((m) => String(m)).join('\n').slice(0, 2000),
-        });
-      }
+    if (result.outputLimitExceeded) {
+      return {
+        status: 'failed',
+        summary: 'tests-passing: outputLimitExceeded',
+        evidence: [`command: ${command.join(' ')}`, result.stderrTail].filter(Boolean),
+        details,
+      };
     }
-  }
 
-  const report: TestsPassingReport = {
-    numPassedTests,
-    numFailedTests,
-    numTotalTestSuites,
-    failures,
-  };
+    if (result.timedOut) {
+      return {
+        status: 'failed',
+        summary: `tests-passing: timed out after ${opts.timeoutMs}ms`,
+        evidence: [`command: ${command.join(' ')}`, result.stderrTail].filter(Boolean),
+        details,
+      };
+    }
 
-  const passed = result.exitCode === 0 && numFailedTests === 0;
-  if (passed) {
+    if (opts.kind === 'exit-code') {
+      if (result.exitCode === 0) {
+        return {
+          status: 'passed',
+          summary: 'tests-passing: exit 0',
+          evidence: [`command: ${command.join(' ')}`],
+          details,
+        };
+      }
+      return {
+        status: 'failed',
+        summary: `tests-passing: exit ${result.exitCode}`,
+        evidence: [`command: ${command.join(' ')}`, result.stderrTail].filter(Boolean),
+        details,
+      };
+    }
+
+    // Default Jest writes with --outputFile; custom Jest commands have stdout
+    // spooled directly to the same size-checked structured-output path.
+    const fileRead = resultPath ? await readJestResultFile(resultPath) : undefined;
+    if (fileRead?.status === 'resultFileTooLarge') {
+      return {
+        status: 'failed',
+        summary: 'tests-passing: resultFileTooLarge',
+        evidence: [`command: ${command.join(' ')}`],
+        details,
+      };
+    }
+    if (fileRead?.status !== 'ok') {
+      return {
+        status: 'failed',
+        summary: 'tests-passing: could not parse jest --json output',
+        evidence: [
+          `command: ${command.join(' ')}`,
+          `exitCode: ${result.exitCode}`,
+          result.stdoutTail,
+          result.stderrTail,
+        ].filter(Boolean),
+        details,
+      };
+    }
+
+    const report: TestsPassingReport = fileRead.value;
+    const { numPassedTests, numFailedTests, numTotalTestSuites, failures } = report;
+
+    const passed = result.exitCode === 0 && numFailedTests === 0;
+    if (passed) {
+      return {
+        status: 'passed',
+        summary: `tests-passing: ${numPassedTests} passed across ${numTotalTestSuites} suites`,
+        evidence: [`command: ${command.join(' ')}`],
+        output: report,
+        details,
+      };
+    }
+
     return {
-      status: 'passed',
-      summary: `tests-passing: ${numPassedTests} passed across ${numTotalTestSuites} suites`,
-      evidence: [`command: ${opts.testCommand.join(' ')}`],
+      status: 'failed',
+      summary: `tests-passing: ${numFailedTests} failed (exit ${result.exitCode})`,
+      evidence: failures.slice(0, 10).map((f) => `${f.name}: ${f.message.split('\n')[0]}`),
       output: report,
+      details,
     };
+  } finally {
+    if (resultDirectory) await fs.rm(resultDirectory, { recursive: true, force: true });
   }
-
-  return {
-    status: 'failed',
-    summary: `tests-passing: ${numFailedTests} failed (exit ${result.exitCode})`,
-    evidence: failures.slice(0, 10).map((f) => `${f.name}: ${f.message.split('\n')[0]}`),
-    output: report,
-  };
 }
 
 export function createTestsPassingSensor(repoPath: string): HarnessSensorDefinition {
