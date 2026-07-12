@@ -14,9 +14,20 @@ import { resolveRuntimeLayoutFromRepo, type RuntimeLayout } from '../../../share
 import type {
   HarnessArtifactRecord,
   HarnessRuntimeStatePort,
-  HarnessTraceRecord,
 } from '../../adapters/out/runtimeState/runtimeStateService';
 import type { HarnessSensorRun } from '../sensors/sensorsService';
+import {
+  boundedLimit,
+  boundedPageBytes,
+  decodeHistoryCursor,
+  encodeHistoryCursor,
+  MAX_RUNTIME_HISTORY_PAGE_BYTES,
+  queryBinding,
+  RUNTIME_HISTORY_LIMITS,
+  serializedHistoryItemBytes,
+  type RuntimeHistoryPage,
+  type RuntimeHistoryQuery,
+} from '../history/runtimeHistory';
 
 /**
  * Structured artifact requirement.
@@ -187,6 +198,17 @@ export interface HarnessHandoffContract {
   metadata?: Record<string, unknown>;
 }
 
+export interface BoundedSessionContracts<T> {
+  items: T[];
+  total: number;
+  nextCursor?: string;
+  hasMore: boolean;
+  returnedBytes: number;
+  byteBudget: number;
+  byteLimited: boolean;
+  oversizedRecordsSkipped: number;
+}
+
 export interface HarnessTaskCompletionResult {
   taskId: string;
   sessionId?: string;
@@ -296,6 +318,100 @@ export class HarnessTaskContractsService {
     return contracts.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
+  async listTaskContractPage(
+    query: RuntimeHistoryQuery = {}
+  ): Promise<RuntimeHistoryPage<HarnessTaskContract>> {
+    const started = Date.now();
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.tasks.default, RUNTIME_HISTORY_LIMITS.tasks.maximum, 'task contracts');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'task contracts');
+    const direction = query.direction ?? 'newest';
+    const binding = queryBinding({ resource: 'task-contracts', direction });
+    const boundary = decodeHistoryCursor<{ updatedAt: string; id: string }>(
+      query.cursor,
+      'task-contracts',
+      binding
+    );
+    await this.ensureLayout();
+    const selected: Array<{ contract: HarnessTaskContract; bytes: number }> = [];
+    let recordsScanned = 0;
+    let oversizedRecordsSkipped = 0;
+    const directory = await fs.opendir(this.tasksPath);
+    for await (const entry of directory) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const file = path.join(this.tasksPath, entry.name);
+        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const contract = await fs.readJson(file) as HarnessTaskContract;
+        recordsScanned += 1;
+        const key = `${contract.updatedAt}\0${contract.id}`;
+        const boundaryKey = boundary ? `${boundary.updatedAt}\0${boundary.id}` : undefined;
+        if (boundaryKey && (direction === 'newest' ? key >= boundaryKey : key <= boundaryKey)) continue;
+        const bytes = serializedHistoryItemBytes(contract);
+        if (bytes + 2 > byteBudget) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        selected.push({ contract, bytes });
+        selected.sort((left, right) => {
+          const comparison = left.contract.updatedAt.localeCompare(right.contract.updatedAt)
+            || left.contract.id.localeCompare(right.contract.id);
+          return direction === 'newest' ? -comparison : comparison;
+        });
+        if (selected.length > limit + 1) selected.pop();
+      } catch { /* skip corrupt records */ }
+    }
+    const items: HarnessTaskContract[] = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected.slice(0, limit + 1)) {
+      if (items.length === limit) break;
+      const candidateTotal = returnedBytes + candidate.bytes + (items.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        break;
+      }
+      items.push(candidate.contract);
+      returnedBytes = candidateTotal;
+    }
+    const hasMore = selected.length > items.length;
+    const last = items.at(-1);
+    return {
+      items,
+      nextCursor: hasMore && last
+        ? encodeHistoryCursor('task-contracts', binding, { updatedAt: last.updatedAt, id: last.id })
+        : undefined,
+      hasMore,
+      recordsReturned: items.length,
+      recordsScanned,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
+      cursorVersion: 1,
+      partial: hasMore || oversizedRecordsSkipped > 0,
+      durationMs: Date.now() - started,
+    };
+  }
+
+  async listSessionTaskContracts(
+    sessionId: string,
+    limit = 100,
+    maxBytes?: number,
+    cursor?: string
+  ): Promise<BoundedSessionContracts<HarnessTaskContract>> {
+    return this.listBoundedSessionContracts<HarnessTaskContract>(
+      this.tasksPath,
+      sessionId,
+      boundedLimit(limit, 100, 1000, 'session task contracts'),
+      boundedPageBytes(maxBytes, 'session task contracts'),
+      cursor,
+      'session-task-contracts'
+    );
+  }
+
   async getTaskContract(taskId: string): Promise<HarnessTaskContract | null> {
     const filePath = await this.taskFile(taskId);
     if (!(await fs.pathExists(filePath))) {
@@ -371,16 +487,180 @@ export class HarnessTaskContractsService {
     return contracts.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
+  async listHandoffContractPage(
+    query: RuntimeHistoryQuery = {}
+  ): Promise<RuntimeHistoryPage<HarnessHandoffContract>> {
+    const started = Date.now();
+    const limit = boundedLimit(query.limit, RUNTIME_HISTORY_LIMITS.handoffs.default, RUNTIME_HISTORY_LIMITS.handoffs.maximum, 'handoff contracts');
+    const byteBudget = boundedPageBytes(query.maxBytes, 'handoff contracts');
+    const direction = query.direction ?? 'newest';
+    const binding = queryBinding({ resource: 'handoff-contracts', direction });
+    const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(
+      query.cursor,
+      'handoff-contracts',
+      binding
+    );
+    await this.ensureLayout();
+    const selected: Array<{ contract: HarnessHandoffContract; bytes: number }> = [];
+    let recordsScanned = 0;
+    let oversizedRecordsSkipped = 0;
+    const directory = await fs.opendir(this.handoffsPath);
+    for await (const entry of directory) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const file = path.join(this.handoffsPath, entry.name);
+        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const contract = await fs.readJson(file) as HarnessHandoffContract;
+        recordsScanned += 1;
+        const key = `${contract.createdAt}\0${contract.id}`;
+        const boundaryKey = boundary ? `${boundary.createdAt}\0${boundary.id}` : undefined;
+        if (boundaryKey && (direction === 'newest' ? key >= boundaryKey : key <= boundaryKey)) continue;
+        const bytes = serializedHistoryItemBytes(contract);
+        if (bytes + 2 > byteBudget) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        selected.push({ contract, bytes });
+        selected.sort((left, right) => {
+          const comparison = left.contract.createdAt.localeCompare(right.contract.createdAt)
+            || left.contract.id.localeCompare(right.contract.id);
+          return direction === 'newest' ? -comparison : comparison;
+        });
+        if (selected.length > limit + 1) selected.pop();
+      } catch { /* skip corrupt records */ }
+    }
+    const items: HarnessHandoffContract[] = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected.slice(0, limit + 1)) {
+      if (items.length === limit) break;
+      const candidateTotal = returnedBytes + candidate.bytes + (items.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        break;
+      }
+      items.push(candidate.contract);
+      returnedBytes = candidateTotal;
+    }
+    const hasMore = selected.length > items.length;
+    const last = items.at(-1);
+    return {
+      items,
+      nextCursor: hasMore && last
+        ? encodeHistoryCursor('handoff-contracts', binding, { createdAt: last.createdAt, id: last.id })
+        : undefined,
+      hasMore,
+      recordsReturned: items.length,
+      recordsScanned,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
+      cursorVersion: 1,
+      partial: hasMore || oversizedRecordsSkipped > 0,
+      durationMs: Date.now() - started,
+    };
+  }
+
+  async listSessionHandoffContracts(
+    sessionId: string,
+    limit = 100,
+    maxBytes?: number,
+    cursor?: string
+  ): Promise<BoundedSessionContracts<HarnessHandoffContract>> {
+    return this.listBoundedSessionContracts<HarnessHandoffContract>(
+      this.handoffsPath,
+      sessionId,
+      boundedLimit(limit, 100, 1000, 'session handoff contracts'),
+      boundedPageBytes(maxBytes, 'session handoff contracts'),
+      cursor,
+      'session-handoff-contracts'
+    );
+  }
+
+  private async listBoundedSessionContracts<T extends { id: string; sessionId?: string; createdAt: string }>(
+    directoryPath: string,
+    sessionId: string,
+    limit: number,
+    byteBudget: number,
+    cursor: string | undefined,
+    scope: string
+  ): Promise<BoundedSessionContracts<T>> {
+    await this.ensureLayout();
+    const binding = queryBinding({ sessionId, direction: 'oldest' });
+    const boundary = decodeHistoryCursor<{ createdAt: string; id: string }>(cursor, scope, binding);
+    const selected: Array<{ file: string; createdAt: string; id: string; bytes: number }> = [];
+    let total = 0;
+    let oversizedRecordsSkipped = 0;
+    const directory = await fs.opendir(directoryPath);
+    for await (const entry of directory) {
+      if (!entry.isFile() || !entry.name.endsWith('.json')) continue;
+      try {
+        const file = path.join(directoryPath, entry.name);
+        if ((await fs.stat(file)).size > MAX_RUNTIME_HISTORY_PAGE_BYTES) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        const contract = await fs.readJson(file) as T;
+        if (contract.sessionId !== sessionId) continue;
+        total += 1;
+        if (boundary && `${contract.createdAt}\0${contract.id}` <= `${boundary.createdAt}\0${boundary.id}`) continue;
+        const bytes = serializedHistoryItemBytes(contract);
+        if (bytes + 2 > byteBudget) {
+          oversizedRecordsSkipped += 1;
+          continue;
+        }
+        selected.push({ file, createdAt: contract.createdAt, id: contract.id, bytes });
+        selected.sort((left, right) =>
+          left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id)
+        );
+        if (selected.length > limit + 1) selected.pop();
+      } catch {
+        // A malformed unrelated contract must not make replay unavailable.
+      }
+    }
+    const chosen: typeof selected = [];
+    let returnedBytes = 2;
+    let byteLimited = false;
+    for (const candidate of selected.slice(0, limit + 1)) {
+      if (chosen.length === limit) break;
+      const candidateTotal = returnedBytes + candidate.bytes + (chosen.length > 0 ? 1 : 0);
+      if (candidateTotal > byteBudget) {
+        byteLimited = true;
+        break;
+      }
+      chosen.push(candidate);
+      returnedBytes = candidateTotal;
+    }
+    const items: T[] = [];
+    for (const candidate of chosen) items.push(await fs.readJson(candidate.file) as T);
+    const hasMore = selected.length > chosen.length;
+    const last = chosen.at(-1);
+    return {
+      items,
+      total,
+      nextCursor: hasMore && last
+        ? encodeHistoryCursor(scope, binding, { createdAt: last.createdAt, id: last.id })
+        : undefined,
+      hasMore,
+      returnedBytes,
+      byteBudget,
+      byteLimited,
+      oversizedRecordsSkipped,
+    };
+  }
+
   async evaluateTaskCompletion(taskId: string, sessionId?: string): Promise<HarnessTaskCompletionResult> {
     const contract = await this.getTaskContract(taskId);
     if (!contract) {
       throw new Error(`Task contract not found: ${taskId}`);
     }
 
-    const traces: HarnessTraceRecord[] = sessionId ? await this.options.stateService.listTraces(sessionId) : [];
-    const sensorRuns = traces
-      .filter((trace) => trace.event === 'sensor.run' && trace.data?.run)
-      .map((trace) => trace.data!.run as HarnessSensorRun);
+    const sensorSummary = sessionId ? await this.options.stateService.getSensorSummary(sessionId) : undefined;
+    const sensorRuns = sensorSummary ? Object.values(sensorSummary.latestBySensor) as HarnessSensorRun[] : [];
     const latestRunsBySensor = new Map<string, HarnessSensorRun>();
     for (const run of sensorRuns) {
       const current = latestRunsBySensor.get(run.sensorId);
@@ -388,7 +668,15 @@ export class HarnessTaskContractsService {
         latestRunsBySensor.set(run.sensorId, run);
       }
     }
-    const artifacts = sessionId ? await this.options.stateService.listArtifacts(sessionId) : [];
+    const artifacts: HarnessArtifactRecord[] = [];
+    if (sessionId) {
+      let cursor: string | undefined;
+      do {
+        const page = await this.options.stateService.listArtifactPage(sessionId, { limit: 200, cursor, direction: 'oldest' });
+        artifacts.push(...page.items);
+        cursor = page.nextCursor;
+      } while (cursor);
+    }
 
     const matchedSensorRuns = contract.requiredSensors
       .map((sensorId) => latestRunsBySensor.get(sensorId))

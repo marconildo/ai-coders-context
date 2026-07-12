@@ -117,7 +117,7 @@ One `.context/` directory stores durable project knowledge and workflow state.
 ├── agents/      # Agent playbooks
 ├── skills/      # On-demand expertise guides
 ├── plans/       # Structured PREVC plans and execution tracking
-├── config/      # Authored config: policy.json and sensors.json (version-controlled)
+├── config/      # Authored config: policy.json, sensors.json, runtime.json (version-controlled)
 └── runtime/     # Generated state (gitignored):
     ├── sessions/      # one folder per session: session.json, trace.jsonl, artifacts/
     ├── workflows/     # PREVC state (prevc.json), plan tracking, collaboration records
@@ -417,7 +417,7 @@ Hook install writes project-level configuration by default. Use `--global` only 
 
 `SessionStart` resolves the project root first (`--repo-path`, then the nearest parent with `.context/`, then `cwd`) and checks readiness. If the repository is not initialized yet, the hook returns a short JSON-safe hint and does not create `.context/runtime`. Partial context lists up to three missing areas. Ready context gets compact navigation, a daily no-workflow reminder, or active PREVC preflight when a workflow is running.
 
-`PostToolUse` appends durable `tool.use` traces for `Write`, `Edit`, and `Bash`. Bash traces include best-effort classification such as `test`, `build`, `lint`, or `inspection` without running extra commands. Repeated trace append failures are counted under `.context/runtime/hooks/trace-failures.json` and stay non-blocking.
+`PostToolUse` appends durable `tool.use` traces for `Write`, `Edit`, and `Bash` without retaining source bodies. Write/Edit traces keep paths, byte counts, and content hashes; Bash keeps a bounded preview and best-effort classification such as `test`, `build`, `lint`, or `inspection`. Hook stdin is capped at 8 MiB and oversized input remains non-blocking. Trace events are size-bounded, `trace.jsonl` rotates at 8 MiB, and up to four closed segments are retained by default. Repeated trace append or input failures are counted under `.context/runtime/hooks/trace-failures.json`.
 
 `Stop` and session-end hooks stay quiet unless there is an active PREVC workflow. Missing, inactive, malformed, or reentrant workflow state returns a successful no-op so end-of-turn feedback does not become noise.
 
@@ -521,6 +521,12 @@ The MCP adapter currently exposes 12 tools: 7 action-based gateways plus 5 dedic
 | `workflow-manage` | Manage handoffs, collaboration, workflow docs, gates, approvals, artifacts, checkpoints, manual contracts, and sensor runs |
 
 For AI-agent use, provide `repoPath` on the first context-heavy MCP call so dotcontext can cache the working repository.
+
+MCP JSON responses are compact and bounded to 1 MiB by default (4 MiB absolute). Growing `harness` lists return `page.nextCursor`; pass it back with a bounded `limit` to continue. If a selected page cannot fit, the tool returns `MCP_PAGE_TOO_LARGE` and a `suggestedLimit` instead of truncating JSON. The optional `_meta.dotcontext` envelope contains only bounded audit metrics, so existing clients can continue reading `content` unchanged.
+
+The same UTF-8 budget covers MCP resources (`context://`, `file://`, and `workflow://`). Oversized file resources return `MCP_RESOURCE_TOO_LARGE` before the file body is read. `explore` action `list` returns bounded pages (100 files by default, 1,000 maximum); continue with its opaque `page.nextCursor`.
+
+`explore` file reads use the same 1 MiB safety boundary and return `EXPLORE_FILE_TOO_LARGE` without opening an oversized body. Code search streams bounded discovery and files, reports partial/skip metrics, and supports continuation with `page.nextCursor`.
 
 ## CLI Reference
 

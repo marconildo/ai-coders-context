@@ -97,7 +97,7 @@ export function resolveHarnessHookFromHostEvent(
           level: 'info',
           event: 'tool.use',
           message: event.toolName ?? 'tool.use',
-          data: buildHookTraceData(event.toolName, event.toolInput),
+          data: buildHookTraceData(event.toolName, event.toolInput, { repoPath }),
         },
       };
     }

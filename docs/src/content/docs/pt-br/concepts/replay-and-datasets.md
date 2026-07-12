@@ -23,7 +23,7 @@ O replay responde as duas primeiras ao condensar uma sessão em um único log de
 
 ## Replay: um log de eventos durável e ordenado
 
-Um **replay** reconstrói a timeline completa de uma sessão a partir de tudo que o harness registrou: o próprio registro da sessão, seus traces, artifacts, checkpoints, execuções de sensor, tasks e handoffs. O resultado é um único documento com uma lista plana de eventos ordenada no tempo, que você pode reproduzir em sequência.
+Um **replay** reconstrói uma página limitada da timeline de uma sessão a partir do resumo da sessão, traces, artifacts, checkpoints, execuções de sensor, tasks e handoffs. O resultado é uma página de eventos ordenada no tempo que pode continuar por cursor opaco sem materializar primeiro todo o histórico.
 
 ### O que um replay contém
 
@@ -37,9 +37,11 @@ Cada replay é um snapshot autocontido. Além dos dados coletados, ele carrega u
 | `createdAt` / `replayedAt` | Quando o replay foi construído |
 | `fidelity` | `complete` ou `partial` (se todos os dados de origem estavam disponíveis) |
 | `eventCount` | Número de eventos na timeline ordenada |
+| `sourceCounts` / `omittedCounts` | Registros disponíveis e omitidos por origem |
+| `nextCursor` | Cursor opaco de continuação quando o replay é parcial |
 | `summary` | Descrição legível da execução |
 
-Os dados de origem coletados (`session`, `artifacts`, `checkpoints`, `traces`, `sensorRuns`, `tasks`, `handoffs`) são incluídos por completo, e o array `events` mescla tudo em uma única timeline:
+O array mesclado `events` usa um único orçamento compartilhado de `maxEvents` e bytes (100 eventos por padrão, máximo de 1.000). Quando solicitados, os registros de origem ficam apenas no campo `record` do evento; o arquivo de replay não os duplica em arrays separados. Um replay parcial continua todas as fontes pelo mesmo cursor opaco:
 
 ```json
 {
@@ -87,6 +89,9 @@ O replay é uma action da ferramenta MCP `harness`:
 // Re-executa uma sessão em um replay durável
 { "action": "replaySession", "sessionId": "session-..." }
 
+// Limita a resposta e o replay persistido a dez eventos
+{ "action": "replaySession", "sessionId": "session-...", "maxEvents": 10 }
+
 // Lista os replays existentes
 { "action": "listReplays" }
 
@@ -100,7 +105,7 @@ Construa um replay logo após a sessão terminar — tendo ela completado ou fal
 
 ## Datasets de falha: agrupando o que continua quebrando
 
-Um único replay conta sobre uma execução. Um **dataset de falha** varre vários replays para montar um corpus de falhas e então agrupa falhas relacionadas em clusters, para você ver quais problemas se repetem.
+Um único replay conta sobre uma execução. Um **dataset de falha** processa sessões com um worker por padrão (configurável até quatro), retém no máximo 10.000 falhas por padrão e também aplica limites de bytes por falha, agregados e no arquivo persistido. Ele informa `partial` e `omittedFailureCount` quando qualquer limite é atingido.
 
 ### Como as falhas são coletadas
 

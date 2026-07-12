@@ -49,7 +49,7 @@ The default export registers handlers through Pi's `ExtensionAPI`:
 | Pi event | Harness call | Effect |
 | --- | --- | --- |
 | `session_start` | `context` → `check` (+ optional navigation excerpt) | Inject bootstrap message or resource when `.context/` exists |
-| `tool_execution_end` | `harness` → `appendTrace` for write/edit/bash tools | Silent durable trace under `.context/runtime/` |
+| `tool_execution_end` | `harness` → `appendTrace` for write/edit/bash tools | Silent, size-bounded trace without Write/Edit source bodies |
 | `agent_end` | `workflow-guide` | Optional UI notification with PREVC next steps, skills, and gate hints |
 
 When `.context/` is missing, `session_start` injects a one-line hint to initialize context through MCP.
@@ -87,7 +87,7 @@ Global MCP config path: `~/.config/mcp/mcp.json`. Local: `.mcp.json` in the proj
 
 2. **Bootstrap injection** — in a repo with `.context/` initialized, start a session. You should see dotcontext bootstrap content on `session_start`.
 
-3. **Traces** — edit a file through Pi, then check `.context/runtime/sessions/*/trace.jsonl` for `tool.use` entries.
+3. **Traces** — edit a file through Pi, then check `.context/runtime/sessions/*/trace*.jsonl` for `tool.use` entries. Write/Edit bodies are omitted; paths, byte counts, and hashes remain available.
 
 4. **MCP tools** — with `pi-mcp-adapter` connected, ask Pi to run the context check tool against your repository.
 

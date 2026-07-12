@@ -107,7 +107,7 @@ export function mapPiEvent(
           event: 'tool.use',
           message: event.toolName,
           data: {
-            ...buildHookTraceData(event.toolName, event.toolInput),
+            ...buildHookTraceData(event.toolName, event.toolInput, { repoPath }),
             host: 'pi-dev',
           },
         },

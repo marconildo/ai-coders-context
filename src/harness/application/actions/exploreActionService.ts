@@ -15,6 +15,8 @@ export interface HarnessExploreActionInput {
   cwd?: string;
   encoding?: 'utf-8' | 'ascii' | 'binary';
   ignore?: string[];
+  limit?: number;
+  cursor?: string;
   symbolTypes?: Array<'class' | 'interface' | 'function' | 'type' | 'enum'>;
   fileGlob?: string;
   maxResults?: number;
@@ -44,6 +46,8 @@ export class HarnessExploreActionService {
           pattern: params.pattern!,
           cwd: params.cwd || this.options.repoPath,
           ignore: params.ignore,
+          limit: params.limit,
+          cursor: params.cursor,
         });
       case 'analyze':
         return analyzeSymbolsTool.execute({
@@ -56,6 +60,7 @@ export class HarnessExploreActionService {
           fileGlob: params.fileGlob,
           maxResults: params.maxResults || 50,
           cwd: params.cwd || this.options.repoPath,
+          cursor: params.cursor,
         });
       case 'getStructure':
         return getFileStructureTool.execute({

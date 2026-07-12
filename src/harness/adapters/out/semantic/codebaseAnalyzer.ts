@@ -12,6 +12,7 @@ import {
   ABSOLUTE_FILE_MAPPING_SCAN_LIMITS,
   FileMapper,
 } from '../../../../utils/fileMapper';
+import { loadRuntimeRetentionConfig } from '../../../application/retention/runtimeRetentionConfig';
 import { TreeSitterLayer } from './treeSitter/treeSitterLayer';
 import { LSPLayer } from './lsp/lspLayer';
 import {
@@ -45,6 +46,8 @@ const DEFAULT_OPTIONS: Required<AnalyzerOptions> = {
   maxEntriesScanned: 100_000,
   concurrency: 16,
   cacheEnabled: true,
+  fileAnalysisCacheMaxEntries: 5_000,
+  fileAnalysisCacheMaxBytes: 128 * 1024 * 1024,
 };
 
 /** Absolute ceiling for direct API callers to avoid allocating excessive workers. */
@@ -110,9 +113,15 @@ export class CodebaseAnalyzer {
   private treeSitter: TreeSitterLayer;
   private lspLayer?: LSPLayer;
   private options: Required<AnalyzerOptions>;
+  private readonly fileCacheEntriesExplicit: boolean;
+  private readonly fileCacheBytesExplicit: boolean;
+  private readonly maxEntriesScannedExplicit: boolean;
+  private lastDiscovery?: import('./discovery').BoundedDiscoveryMetrics;
 
   constructor(options: AnalyzerOptions = {}) {
-    this.treeSitter = new TreeSitterLayer();
+    this.fileCacheEntriesExplicit = options.fileAnalysisCacheMaxEntries !== undefined;
+    this.fileCacheBytesExplicit = options.fileAnalysisCacheMaxBytes !== undefined;
+    this.maxEntriesScannedExplicit = options.maxEntriesScanned !== undefined;
     this.options = { ...DEFAULT_OPTIONS, ...options };
     this.options.maxFiles = Math.max(0, this.options.maxFiles);
     this.options.maxTotalBytes = Math.max(0, this.options.maxTotalBytes);
@@ -132,6 +141,11 @@ export class CodebaseAnalyzer {
       MAX_FILE_ANALYSIS_CONCURRENCY,
       Math.max(1, configuredConcurrency)
     );
+    this.treeSitter = new TreeSitterLayer({
+      cacheEnabled: this.options.cacheEnabled,
+      maxEntries: this.options.fileAnalysisCacheMaxEntries,
+      maxBytes: this.options.fileAnalysisCacheMaxBytes,
+    });
 
     // Create LSPLayer if LSP mode is enabled
     if (this.options.useLSP) {
@@ -175,6 +189,18 @@ export class CodebaseAnalyzer {
     startedAt: number;
   }> {
     const startTime = Date.now();
+    const { config } = await loadRuntimeRetentionConfig(projectPath);
+    if (this.options.cacheEnabled) {
+      this.treeSitter.configureCache?.({
+        maxEntries: this.fileCacheEntriesExplicit
+          ? this.options.fileAnalysisCacheMaxEntries
+          : config.caches.fileAnalysis.maxEntries,
+        maxBytes: this.fileCacheBytesExplicit
+          ? this.options.fileAnalysisCacheMaxBytes
+          : config.caches.fileAnalysis.maxBytes,
+        scope: path.resolve(projectPath),
+      });
+    }
     const metrics: AnalysisMetrics = {
       directoriesScanned: 0,
       entriesScanned: 0,
@@ -199,7 +225,12 @@ export class CodebaseAnalyzer {
     const discoveryStartedAt = Date.now();
     const discovery = discoveryInput
       ? this.discoveryFromInput(projectPath, discoveryInput)
-      : await this.findCodeFiles(projectPath);
+      : await this.findCodeFiles(
+          projectPath,
+          this.maxEntriesScannedExplicit
+            ? this.options.maxEntriesScanned
+            : Math.min(this.options.maxEntriesScanned, config.caches.semantic.maxEntriesScanned)
+        );
     const candidates = discovery.files;
     metrics.directoriesScanned = discovery.metrics?.directoriesScanned ?? 0;
     metrics.entriesScanned = discovery.metrics?.entriesScanned ?? 0;
@@ -217,6 +248,7 @@ export class CodebaseAnalyzer {
     }
     const parsingStartedAt = Date.now();
     const fileAnalyses = await this.analyzeFiles(files, metrics);
+    this.treeSitter.retainOnly?.(files);
     metrics.filesParsed = fileAnalyses.size;
     metrics.durationsMs.parsing = Date.now() - parsingStartedAt;
 
@@ -262,19 +294,44 @@ export class CodebaseAnalyzer {
     };
   }
 
-  private async findCodeFiles(projectPath: string): Promise<{
+  private async findCodeFiles(
+    projectPath: string,
+    maxEntriesScanned = this.options.maxEntriesScanned
+  ): Promise<{
     files: Array<{ path: string; size?: number }>;
     skipped: SkippedAnalysisFile[];
     metrics?: RepoDiscoveryMetrics;
   }> {
+    const startedAt = Date.now();
     try {
       const structure = await new FileMapper(this.options.exclude, {
         maxFiles: this.options.maxFiles,
         maxTotalBytes: this.options.maxTotalBytes,
         maxFileBytes: this.options.maxFileBytes,
         maxDirectoriesScanned: this.options.maxDirectoriesScanned,
-        maxEntriesScanned: this.options.maxEntriesScanned,
+        maxEntriesScanned,
       }).mapRepository(projectPath);
+      const discoveryMetrics = structure.discoveryMetrics;
+      const limitSkip = structure.skipped?.find((item) =>
+        item.reason === 'file-limit' || item.reason === 'directory-limit' || item.reason === 'entry-limit'
+      );
+      if (discoveryMetrics) {
+        this.lastDiscovery = {
+          filesSelected: structure.files.length,
+          directoriesVisited: discoveryMetrics.directoriesScanned,
+          entriesScanned: discoveryMetrics.entriesScanned,
+          statsAttempted: discoveryMetrics.statCalls,
+          partial: Boolean(structure.partial || discoveryMetrics.stoppedEarly),
+          stopReason: limitSkip?.reason === 'file-limit'
+            ? 'maxFiles'
+            : limitSkip?.reason === 'directory-limit'
+              ? 'maxDirectories'
+              : limitSkip?.reason === 'entry-limit'
+                ? 'maxEntriesScanned'
+                : undefined,
+          durationMs: Date.now() - startedAt,
+        };
+      }
       return {
         files: this.filterCodeFiles(projectPath, structure.files),
         skipped: (structure.skipped ?? []).map((skip) => ({
@@ -874,11 +931,23 @@ export class CodebaseAnalyzer {
     this.treeSitter.clearCache();
   }
 
+  fileAnalysisCacheMetrics() {
+    return this.treeSitter.cacheMetrics();
+  }
+
+  discoveryMetrics(): import('./discovery').BoundedDiscoveryMetrics | undefined {
+    return this.lastDiscovery ? { ...this.lastDiscovery } : undefined;
+  }
+
   /**
    * Shutdown LSP servers gracefully
    */
   async shutdown(): Promise<void> {
-    this.treeSitter.clearCache();
+    if (this.options.cacheEnabled) {
+      this.treeSitter.dispose?.();
+    } else {
+      this.treeSitter.clearCache();
+    }
     if (this.lspLayer) {
       await this.lspLayer.shutdown();
     }

@@ -5,6 +5,8 @@ import * as fs from 'fs-extra';
 import { CodebaseAnalyzer, MAX_FILE_ANALYSIS_CONCURRENCY } from '../codebaseAnalyzer';
 import type { SemanticContext, FileAnalysis, ExtractedSymbol } from '../types';
 
+jest.mock('glob', () => ({ glob: jest.fn() }));
+
 // Mock TreeSitterLayer
 jest.mock('../treeSitter/treeSitterLayer', () => ({
   TreeSitterLayer: jest.fn().mockImplementation(() => ({
@@ -529,10 +531,36 @@ describe('CodebaseAnalyzer', () => {
 
   describe('options handling', () => {
     it('should respect maxFiles option', async () => {
-      const analyzer = new CodebaseAnalyzer({ useLSP: false, maxFiles: 2 });
+      const { glob } = require('glob');
+      for (let index = 0; index < 30; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'many', `file${index}.ts`), `export const v${index} = ${index};`);
+      }
+
+      const analyzer = new CodebaseAnalyzer({ useLSP: false, maxFiles: 10 });
       const context = await analyzer.analyze(tempDir);
 
-      expect(context.stats.totalFiles).toBe(2);
+      expect(context.stats.totalFiles).toBeLessThanOrEqual(10);
+      expect(analyzer.discoveryMetrics()).toMatchObject({ filesSelected: 10, partial: true });
+      expect(glob).not.toHaveBeenCalled();
+    });
+
+    it('should respect the raw directory-entry scan policy before analyzing files', async () => {
+      for (let index = 0; index < 40; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'irrelevant', `${index}.txt`), 'ignored');
+      }
+      const analyzer = new CodebaseAnalyzer({
+        useLSP: false,
+        maxFiles: 100,
+        maxEntriesScanned: 6,
+      });
+
+      await analyzer.analyze(tempDir);
+
+      expect(analyzer.discoveryMetrics()).toMatchObject({
+        entriesScanned: 6,
+        partial: true,
+        stopReason: 'maxEntriesScanned',
+      });
     });
 
     it('should respect languages option', async () => {
@@ -560,6 +588,7 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should respect include patterns', async () => {
+      await fs.outputFile(path.join(tempDir, 'tests', 'testFile.ts'), 'export const testOnly = true;');
       const analyzer = new CodebaseAnalyzer({
         useLSP: false,
         include: ['services'],

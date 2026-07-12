@@ -131,6 +131,10 @@ export interface RuntimeLayout {
   sessionArtifactsDir(sessionId: string): string;
   /** `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` */
   sessionArtifactFile(sessionId: string, artifactId: string): string;
+  /** `.context/runtime/sessions/<id>/checkpoints` */
+  sessionCheckpointsDir(sessionId: string): string;
+  /** `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` */
+  sessionCheckpointFile(sessionId: string, checkpointId: string): string;
 }
 
 /**
@@ -169,6 +173,9 @@ export function resolveRuntimeLayout(contextPath: string): RuntimeLayout {
     sessionArtifactsDir: (sessionId: string) => path.join(sessionsDir, sessionId, 'artifacts'),
     sessionArtifactFile: (sessionId: string, artifactId: string) =>
       path.join(sessionsDir, sessionId, 'artifacts', `${artifactId}.json`),
+    sessionCheckpointsDir: (sessionId: string) => path.join(sessionsDir, sessionId, 'checkpoints'),
+    sessionCheckpointFile: (sessionId: string, checkpointId: string) =>
+      path.join(sessionsDir, sessionId, 'checkpoints', `${checkpointId}.json`),
   };
 }
 

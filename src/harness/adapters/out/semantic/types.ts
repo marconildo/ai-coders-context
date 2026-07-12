@@ -198,9 +198,11 @@ export interface AnalyzerOptions {
   concurrency?: number;
   /** Maximum directories opened while discovering repository files. */
   maxDirectoriesScanned?: number;
-  /** Maximum raw directory entries inspected during discovery. */
+  /** Maximum raw directory entries inspected before returning a partial analysis. */
   maxEntriesScanned?: number;
   cacheEnabled?: boolean;
+  fileAnalysisCacheMaxEntries?: number;
+  fileAnalysisCacheMaxBytes?: number;
 }
 
 export interface LSPServerConfig {

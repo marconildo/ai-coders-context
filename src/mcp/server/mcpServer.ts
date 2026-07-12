@@ -13,13 +13,17 @@ import { z } from 'zod';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 
-import { readFileTool } from '../../harness/application/context/contextTools';
 import { PathValidator, SecurityError } from '../../utils/pathSecurity';
 import { SemanticContextBuilder, type ContextFormat } from '../../harness/adapters/out/semantic/contextBuilder';
 import { ContextCache } from '../../harness/adapters/out/semantic/contextCache';
 import { VERSION } from '../../version';
 import { WorkflowService } from '../../harness/application/workflow';
-import { logMcpAction } from '../logging/actionLogger';
+import { clearMcpActionSessionCache, logMcpAction } from '../logging/actionLogger';
+import {
+  createBoundedResourceJson,
+  createBoundedResourceText,
+  readBoundedFileResource,
+} from './resourceResponse';
 import {
   PREVC_ROLES,
   getScaleName,
@@ -53,6 +57,9 @@ import {
   type WorkflowAdvanceParams,
   type WorkflowManageParams,
   type MCPToolResponse,
+  createErrorResponse,
+  validateMcpInput,
+  MCP_INPUT_LIMITS,
 } from '../gateway';
 
 export interface MCPServerOptions {
@@ -65,6 +72,41 @@ export interface MCPServerOptions {
   /** Optional injected SemanticContextBuilder for testing */
   contextBuilder?: SemanticContextBuilder;
 }
+
+export const MCP_LIST_LIMIT_SCHEMA = z.number().int().min(1).max(MCP_INPUT_LIMITS.listMaximum);
+export const MCP_MAX_EVENTS_SCHEMA = z.number().int().min(1).max(MCP_INPUT_LIMITS.maxEventsMaximum);
+const MCP_MAX_BYTES_SCHEMA = z.number().int().min(1024).max(64 * 1024 * 1024);
+const MCP_MAX_FAILURE_BYTES_SCHEMA = z.number().int().min(1024).max(1024 * 1024);
+const MCP_HARNESS_LIST_MAXIMUMS: Record<string, number> = {
+  listSessions: 200,
+  listTraces: 1000,
+  listArtifacts: 200,
+  listTasks: 1000,
+  listHandoffs: 1000,
+  listReplays: 100,
+  listDatasets: 100,
+};
+export const MCP_HARNESS_ACTION_LIMIT_SCHEMA = z.object({
+  action: z.string(),
+  limit: MCP_LIST_LIMIT_SCHEMA.optional(),
+}).passthrough().superRefine((value, context) => {
+  const maximum = MCP_HARNESS_LIST_MAXIMUMS[value.action];
+  if (maximum !== undefined && value.limit !== undefined && value.limit > maximum) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ['limit'],
+      message: `${value.action} limit must be between 1 and ${maximum}`,
+    });
+  }
+});
+const mcpString = () => z.string().max(MCP_INPUT_LIMITS.scalarString);
+const mcpPattern = () => mcpString().max(MCP_INPUT_LIMITS.patternLength);
+const mcpArray = <T extends z.ZodTypeAny>(schema: T) => z.array(schema).max(MCP_INPUT_LIMITS.arrayItems);
+const mcpContent = () => z.unknown().superRefine((value, context) => {
+  if (typeof value === 'string' && Buffer.byteLength(value, 'utf8') > MCP_INPUT_LIMITS.contentString) {
+    context.addIssue({ code: z.ZodIssueCode.custom, message: `content exceeds ${MCP_INPUT_LIMITS.contentString} UTF-8 bytes` });
+  }
+});
 
 export class AIContextMCPServer {
   private server: McpServer;
@@ -115,35 +157,39 @@ export class AIContextMCPServer {
     // Gateway 1: explore - File and code exploration
     this.server.registerTool('explore', {
       description: `File and code exploration. Actions:
-- read: Read file contents (params: filePath, encoding?)
-- list: List files matching pattern (params: pattern, cwd?, ignore?)
+- read: Read bounded file contents (params: filePath, encoding?)
+- list: List files matching pattern (params: pattern, cwd?, ignore?, limit?, cursor?)
 - analyze: Analyze symbols in a file (params: filePath, symbolTypes?)
-- search: Search code with regex (params: pattern, fileGlob?, maxResults?, cwd?)
+- search: Search code with bounded streaming (params: pattern, fileGlob?, maxResults?, cwd?, cursor?)
 - getStructure: Get directory structure (params: rootPath?, maxDepth?, includePatterns?)`,
       inputSchema: {
         action: z.enum(['read', 'list', 'analyze', 'search', 'getStructure'])
           .describe('Action to perform'),
-        filePath: z.string().optional()
+        filePath: mcpString().optional()
           .describe('(read, analyze) File path to read or analyze'),
-        pattern: z.string().optional()
+        pattern: mcpPattern().optional()
           .describe('(list, search) Glob pattern for list, regex pattern for search'),
-        cwd: z.string().optional()
+        cwd: mcpString().optional()
           .describe('(list, search) Working directory'),
         encoding: z.enum(['utf-8', 'ascii', 'binary']).optional()
           .describe('(read) File encoding'),
-        ignore: z.array(z.string()).optional()
+        ignore: mcpArray(mcpPattern()).optional()
           .describe('(list) Patterns to ignore'),
-        symbolTypes: z.array(z.enum(['class', 'interface', 'function', 'type', 'enum'])).optional()
+        limit: MCP_LIST_LIMIT_SCHEMA.optional()
+          .describe('(list) Maximum files per page'),
+        cursor: mcpString().max(MCP_INPUT_LIMITS.cursorLength).optional()
+          .describe('(list, search) Opaque continuation cursor'),
+        symbolTypes: mcpArray(z.enum(['class', 'interface', 'function', 'type', 'enum'])).optional()
           .describe('(analyze) Types of symbols to extract'),
-        fileGlob: z.string().optional()
+        fileGlob: mcpPattern().optional()
           .describe('(search) Glob pattern to filter files'),
-        maxResults: z.number().optional()
+        maxResults: z.number().int().min(1).max(MCP_INPUT_LIMITS.listMaximum).optional()
           .describe('(search) Maximum results to return'),
-        rootPath: z.string().optional()
+        rootPath: mcpString().optional()
           .describe('(getStructure) Root path for structure'),
         maxDepth: z.number().optional()
           .describe('(getStructure) Maximum directory depth'),
-        includePatterns: z.array(z.string()).optional()
+        includePatterns: mcpArray(mcpPattern()).optional()
           .describe('(getStructure) Include patterns'),
       }
     }, wrap('explore', async (params): Promise<MCPToolResponse> => {
@@ -176,17 +222,17 @@ export class AIContextMCPServer {
       inputSchema: {
         action: z.enum(['check', 'bootstrapStatus', 'init', 'fill', 'fillSingle', 'listToFill', 'getMap', 'buildSemantic', 'scaffoldPlan', 'searchQA', 'generateQA', 'getFlow', 'detectPatterns'])
           .describe('Action to perform'),
-        repoPath: z.string().optional()
+        repoPath: mcpString().optional()
           .describe('Repository path (defaults to cwd)'),
-        outputDir: z.string().optional()
+        outputDir: mcpString().optional()
           .describe('Output directory (default: ./.context)'),
         type: z.enum(['docs', 'agents', 'both']).optional()
           .describe('(init) Type of scaffolding to create'),
         semantic: z.boolean().optional()
           .describe('(init, scaffoldPlan) Enable semantic analysis'),
-        include: z.array(z.string()).optional()
+        include: mcpArray(mcpString()).optional()
           .describe('(init) Include patterns'),
-        exclude: z.array(z.string()).optional()
+        exclude: mcpArray(mcpString()).optional()
           .describe('(init) Exclude patterns'),
         autoFill: z.boolean().optional()
           .describe('(init, scaffoldPlan) Auto-fill with codebase content'),
@@ -198,9 +244,9 @@ export class AIContextMCPServer {
           .describe('(fill, listToFill) Which scaffolding to target, including nested skills and harness sensors'),
         offset: z.number().optional()
           .describe('(fill) Skip first N files'),
-        limit: z.number().optional()
+        limit: MCP_LIST_LIMIT_SCHEMA.optional()
           .describe('(fill) Max files to return'),
-        filePath: z.string().optional()
+        filePath: mcpString().optional()
           .describe('(fillSingle) Absolute path to scaffold file'),
         section: z.enum([
           'all', 'meta', 'stack', 'structure', 'architecture',
@@ -209,7 +255,7 @@ export class AIContextMCPServer {
           .describe('(getMap) Section to retrieve; the snapshot auto-refreshes on read'),
         contextType: z.enum(['documentation', 'playbook', 'plan', 'compact']).optional()
           .describe('(buildSemantic) Type of context to build'),
-        targetFile: z.string().optional()
+        targetFile: mcpString().optional()
           .describe('(buildSemantic) Target file for focused context'),
         options: z.object({
           useLSP: z.boolean().optional(),
@@ -218,17 +264,17 @@ export class AIContextMCPServer {
           includeSignatures: z.boolean().optional()
         }).optional()
           .describe('(buildSemantic, generateQA, searchQA, getFlow, detectPatterns) Builder/analyzer options'),
-        planName: z.string().optional()
+        planName: mcpString().optional()
           .describe('(scaffoldPlan) Name of the plan'),
-        title: z.string().optional()
+        title: mcpString().optional()
           .describe('(scaffoldPlan) Plan title'),
-        summary: z.string().optional()
+        summary: mcpString().optional()
           .describe('(scaffoldPlan) Plan summary/goal'),
-        query: z.string().optional()
+        query: mcpString().optional()
           .describe('(searchQA) Query string used to rank generated Q&A helper docs'),
-        entryFile: z.string().optional()
+        entryFile: mcpString().optional()
           .describe('(getFlow) Entry file path for flow tracing'),
-        entryFunction: z.string().optional()
+        entryFunction: mcpString().optional()
           .describe('(getFlow) Optional entry function for flow tracing'),
       }
     }, wrap('context', async (params): Promise<MCPToolResponse> => {
@@ -264,8 +310,8 @@ This is the harness-backed entry point for planned work. If the user asked to cr
 - Just exploring/researching code
 - User explicitly wants to skip workflow`,
       inputSchema: {
-        name: z.string().describe('Workflow/feature name (required)'),
-        description: z.string().optional()
+        name: mcpString().describe('Workflow/feature name (required)'),
+        description: mcpString().optional()
           .describe('Task description for scale detection'),
         scale: z.enum(['QUICK', 'SMALL', 'MEDIUM', 'LARGE']).optional()
           .describe(`Project scale - AI should evaluate based on task characteristics:
@@ -323,7 +369,7 @@ Returns: Current phase, all phase statuses, gate settings, linked plans, agent a
 
 Use this for session orientation: current workflow state, next steps, relevant skills, and portable gate decision hints. Adapters should render this response instead of reimplementing workflow direction.`,
       inputSchema: {
-        repoPath: z.string().optional()
+        repoPath: mcpString().optional()
           .describe('Repository path'),
         phaseHint: z.enum(['P', 'R', 'E', 'V', 'C']).optional()
           .describe('Optional PREVC phase hint derived from the caller event'),
@@ -346,7 +392,7 @@ Enforces gates:
 
 Use force=true to bypass gates, or use workflow-manage({ action: 'setAutonomous' }).`,
       inputSchema: {
-        outputs: z.array(z.string()).optional()
+        outputs: mcpArray(mcpString()).optional()
           .describe('Artifact paths produced in current phase'),
         force: z.boolean().optional()
           .describe('Force advancement even if gates block'),
@@ -373,59 +419,59 @@ Actions:
       inputSchema: {
         action: z.enum(['handoff', 'collaborate', 'createDoc', 'getGates', 'approvePlan', 'setAutonomous', 'checkpoint', 'recordArtifact', 'defineTask', 'runSensors'])
           .describe('Action to perform'),
-        from: z.string().optional()
+        from: mcpString().optional()
           .describe('(handoff) Agent handing off (e.g., feature-developer)'),
-        to: z.string().optional()
+        to: mcpString().optional()
           .describe('(handoff) Agent receiving (e.g., code-reviewer)'),
-        artifacts: z.array(z.string()).optional()
+        artifacts: mcpArray(mcpString()).optional()
           .describe('(handoff) Artifacts to hand off'),
-        topic: z.string().optional()
+        topic: mcpString().optional()
           .describe('(collaborate) Collaboration topic'),
-        participants: z.array(z.enum(PREVC_ROLES as unknown as [string, ...string[]])).optional()
+        participants: mcpArray(z.enum(PREVC_ROLES as unknown as [string, ...string[]])).optional()
           .describe('(collaborate) Participating roles'),
         type: z.enum(['prd', 'tech-spec', 'architecture', 'adr', 'test-plan', 'changelog']).optional()
           .describe('(createDoc) Document type'),
-        docName: z.string().optional()
+        docName: mcpString().optional()
           .describe('(createDoc) Document name'),
-        planSlug: z.string().optional()
+        planSlug: mcpString().optional()
           .describe('(approvePlan) Plan to approve'),
         approver: z.enum(PREVC_ROLES as unknown as [string, ...string[]]).optional()
           .describe('(approvePlan) Approving role'),
-        notes: z.string().optional()
+        notes: mcpString().optional()
           .describe('(approvePlan) Approval notes'),
         enabled: z.boolean().optional()
           .describe('(setAutonomous) Enable/disable'),
-        reason: z.string().optional()
+        reason: mcpString().optional()
           .describe('(setAutonomous) Reason for change'),
-        name: z.string().optional()
+        name: mcpString().optional()
           .describe('(recordArtifact) Artifact name'),
         kind: z.enum(['text', 'json', 'file']).optional()
           .describe('(recordArtifact) Artifact kind'),
-        content: z.any().optional()
+        content: mcpContent().optional()
           .describe('(recordArtifact, checkpoint) Structured content or payload'),
-        filePath: z.string().optional()
+        filePath: mcpString().optional()
           .describe('(recordArtifact) Artifact file path'),
-        taskTitle: z.string().optional()
+        taskTitle: mcpString().optional()
           .describe('(defineTask) Task title'),
-        taskDescription: z.string().optional()
+        taskDescription: mcpString().optional()
           .describe('(defineTask) Task description'),
-        owner: z.string().optional()
+        owner: mcpString().optional()
           .describe('(defineTask) Task owner'),
-        inputs: z.array(z.string()).optional()
+        inputs: mcpArray(mcpString()).optional()
           .describe('(defineTask) Required inputs'),
-        expectedOutputs: z.array(z.string()).optional()
+        expectedOutputs: mcpArray(mcpString()).optional()
           .describe('(defineTask) Expected outputs'),
-        acceptanceCriteria: z.array(z.string()).optional()
+        acceptanceCriteria: mcpArray(mcpString()).optional()
           .describe('(defineTask) Acceptance criteria'),
-        requiredSensors: z.array(z.string()).optional()
+        requiredSensors: mcpArray(mcpString()).optional()
           .describe('(defineTask) Required sensors'),
-        requiredArtifacts: z.array(z.union([z.string(), z.record(z.string(), z.any())])).optional()
+        requiredArtifacts: mcpArray(z.union([mcpString(), z.record(mcpString(), z.any())])).optional()
           .describe('(defineTask) Required artifacts (string for exact name, or { kind: glob, glob, minMatches? } / { kind: file-count, glob, min } / { kind: name|path, ... })'),
-        sensors: z.array(z.string()).optional()
+        sensors: mcpArray(mcpString()).optional()
           .describe('(runSensors) Sensors to execute'),
         data: z.any().optional()
           .describe('(checkpoint) Optional checkpoint payload'),
-        artifactIds: z.array(z.string()).optional()
+        artifactIds: mcpArray(mcpString()).optional()
           .describe('(checkpoint) Artifact IDs associated with the checkpoint'),
         pause: z.boolean().optional()
           .describe('(checkpoint) Pause the active harness session after checkpoint'),
@@ -449,7 +495,7 @@ Actions:
       inputSchema: {
         action: z.enum(['exportRules', 'exportDocs', 'exportAgents', 'exportContext', 'exportSkills', 'reverseSync', 'importDocs', 'importAgents', 'importSkills'])
           .describe('Action to perform'),
-        preset: z.string().optional()
+        preset: mcpString().optional()
           .describe('Target AI tool preset'),
         force: z.boolean().optional()
           .describe('Overwrite existing files'),
@@ -481,7 +527,7 @@ Actions:
           .describe('(import*) Auto-detect files'),
         addMetadata: z.boolean().optional()
           .describe('(reverseSync) Add frontmatter metadata'),
-        repoPath: z.string().optional()
+        repoPath: mcpString().optional()
           .describe('Repository path'),
       }
     }, wrap('sync', async (params): Promise<MCPToolResponse> => {
@@ -508,29 +554,29 @@ Actions:
       inputSchema: {
         action: z.enum(['link', 'getLinked', 'getDetails', 'getForPhase', 'updatePhase', 'recordDecision', 'updateStep', 'getStatus', 'syncMarkdown', 'commitPhase'])
           .describe('Action to perform'),
-        planSlug: z.string().optional()
+        planSlug: mcpString().optional()
           .describe('Plan slug/identifier'),
-        phaseId: z.string().optional()
+        phaseId: mcpString().optional()
           .describe('(updatePhase, updateStep, commitPhase) Phase ID'),
         status: z.enum(['pending', 'in_progress', 'completed', 'skipped']).optional()
           .describe('(updatePhase, updateStep) New status'),
         phase: z.enum(['P', 'R', 'E', 'V', 'C']).optional()
           .describe('(getForPhase, recordDecision) PREVC phase'),
-        title: z.string().optional()
+        title: mcpString().optional()
           .describe('(recordDecision) Decision title'),
-        description: z.string().optional()
+        description: mcpString().optional()
           .describe('(recordDecision) Decision description'),
-        alternatives: z.array(z.string()).optional()
+        alternatives: mcpArray(mcpString()).optional()
           .describe('(recordDecision) Considered alternatives'),
         stepIndex: z.number().optional()
           .describe('(updateStep) Step number (1-based)'),
-        output: z.string().optional()
+        output: mcpString().optional()
           .describe('(updateStep) Step output artifact'),
-        notes: z.string().optional()
+        notes: mcpString().optional()
           .describe('(updateStep) Execution notes'),
-        coAuthor: z.string().optional()
+        coAuthor: mcpString().optional()
           .describe('(commitPhase) Agent name for Co-Authored-By footer'),
-        stagePatterns: z.array(z.string()).optional()
+        stagePatterns: mcpArray(mcpString()).optional()
           .describe('(commitPhase) Patterns for files to stage (default: [".context/**"])'),
         dryRun: z.boolean().optional()
           .describe('(commitPhase) Preview without committing'),
@@ -552,9 +598,9 @@ Actions:
       inputSchema: {
         action: z.enum(['discover', 'getInfo', 'orchestrate', 'getSequence', 'getDocs', 'getPhaseDocs', 'listTypes'])
           .describe('Action to perform'),
-        agentType: z.string().optional()
+        agentType: mcpString().optional()
           .describe('(getInfo) Agent type identifier'),
-        task: z.string().optional()
+        task: mcpString().optional()
           .describe('(orchestrate, getSequence) Task description'),
         phase: z.enum(['P', 'R', 'E', 'V', 'C']).optional()
           .describe('(orchestrate, getPhaseDocs) PREVC phase'),
@@ -562,7 +608,7 @@ Actions:
           .describe('(orchestrate) PREVC role'),
         includeReview: z.boolean().optional()
           .describe('(getSequence) Include code review'),
-        phases: z.array(z.enum(['P', 'R', 'E', 'V', 'C'])).optional()
+        phases: mcpArray(z.enum(['P', 'R', 'E', 'V', 'C'])).optional()
           .describe('(getSequence) Phases to include'),
         agent: z.enum(AGENT_TYPES as unknown as [string, ...string[]]).optional()
           .describe('(getDocs) Agent type for docs'),
@@ -583,17 +629,17 @@ Actions:
       inputSchema: {
         action: z.enum(['list', 'getContent', 'getForPhase', 'scaffold', 'export', 'fill'])
           .describe('Action to perform'),
-        skillSlug: z.string().optional()
+        skillSlug: mcpString().optional()
           .describe('(getContent) Skill identifier'),
         phase: z.enum(['P', 'R', 'E', 'V', 'C']).optional()
           .describe('(getForPhase) PREVC phase'),
-        skills: z.array(z.string()).optional()
+        skills: mcpArray(mcpString()).optional()
           .describe('(scaffold, fill) Specific skills to process'),
         includeContent: z.boolean().optional()
           .describe('(list) Include full content'),
         includeBuiltIn: z.boolean().optional()
           .describe('(export, fill) Include built-in skills'),
-        preset: z.string().optional()
+        preset: mcpString().optional()
           .describe('(export) Target AI tool preset'),
         force: z.boolean().optional()
           .describe('(scaffold, export) Overwrite existing'),
@@ -623,11 +669,11 @@ Actions:
 - evaluateTask: Evaluate task completion (params: taskId, sessionId?)
 - createHandoff: Create handoff contract (params: from, to, sessionId?, taskId?, artifacts?, evidence?)
 - listHandoffs: List handoff contracts
-- replaySession: Replay a durable session timeline (params: sessionId, includePayloads?, maxEvents?)
-- listReplays: List generated replays (params: sessionId?)
+- replaySession: Replay a durable session timeline (params: sessionId, includePayloads?, maxEvents?, maxBytes?, cursor?)
+- listReplays: List generated replay summaries (params: sessionId?, limit?, maxBytes?, cursor?)
 - getReplay: Get replay by id (params: replayId)
-- buildDataset: Build a failure dataset from sessions (params: sessionIds?, includeSuccessfulSessions?)
-- listDatasets: List failure datasets
+- buildDataset: Build a failure dataset from sessions (params: sessionIds?, includeSuccessfulSessions?, concurrency?, maxFailures?, maxFailureBytes?, maxBytes?)
+- listDatasets: List failure dataset summaries (params: limit?, maxBytes?, cursor?)
 - getDataset: Get failure dataset by id (params: datasetId)
 - getFailureClusters: Get clusters for a dataset (params: datasetId)
 - registerPolicy: Register policy rule (params: scope, effect, target?, pattern?, pathPattern?, risk?, description?)
@@ -670,71 +716,80 @@ Actions:
           'resetPolicy',
           'evaluatePolicy',
         ]).describe('Action to perform'),
-        sessionId: z.string().optional(),
-        taskId: z.string().optional(),
-        name: z.string().optional(),
-        title: z.string().optional(),
-        description: z.string().optional(),
-        owner: z.string().optional(),
+        sessionId: mcpString().optional(),
+        taskId: mcpString().optional(),
+        name: mcpString().optional(),
+        title: mcpString().optional(),
+        description: mcpString().optional(),
+        owner: mcpString().optional(),
         status: z.enum(['draft', 'ready', 'in_progress', 'blocked', 'completed', 'failed']).optional(),
-        metadata: z.record(z.string(), z.unknown()).optional(),
+        metadata: z.record(mcpString(), z.unknown()).optional(),
         level: z.enum(['debug', 'info', 'warn', 'error']).optional(),
-        event: z.string().optional(),
-        message: z.string().optional(),
-        data: z.record(z.string(), z.unknown()).optional(),
+        event: mcpString().optional(),
+        message: mcpString().optional(),
+        data: z.record(mcpString(), z.unknown()).optional(),
         kind: z.enum(['text', 'json', 'file']).optional(),
-        content: z.unknown().optional(),
-        path: z.string().optional(),
-        note: z.string().optional(),
-        artifactIds: z.array(z.string()).optional(),
+        content: mcpContent().optional(),
+        path: mcpString().optional(),
+        note: mcpString().optional(),
+        artifactIds: mcpArray(mcpString()).optional(),
         pause: z.boolean().optional(),
-        sensorId: z.string().optional(),
-        sensorName: z.string().optional(),
+        sensorId: mcpString().optional(),
+        sensorName: mcpString().optional(),
         sensorSeverity: z.enum(['info', 'warning', 'critical']).optional(),
         sensorBlocking: z.boolean().optional(),
         sensorStatus: z.enum(['passed', 'failed', 'skipped', 'blocked']).optional(),
-        summary: z.string().optional(),
-        evidence: z.array(z.string()).optional(),
+        summary: mcpString().optional(),
+        evidence: mcpArray(mcpString()).optional(),
         output: z.unknown().optional(),
-        details: z.record(z.string(), z.unknown()).optional(),
+        details: z.record(mcpString(), z.unknown()).optional(),
         blockOnWarnings: z.boolean().optional(),
         requireEvidence: z.boolean().optional(),
-        inputs: z.array(z.string()).optional(),
-        expectedOutputs: z.array(z.string()).optional(),
-        acceptanceCriteria: z.array(z.string()).optional(),
-        requiredSensors: z.array(z.string()).optional(),
-        requiredArtifacts: z.array(z.union([z.string(), z.record(z.string(), z.any())])).optional(),
-        from: z.string().optional(),
-        to: z.string().optional(),
-        artifacts: z.array(z.string()).optional(),
-        replayId: z.string().optional(),
+        inputs: mcpArray(mcpString()).optional(),
+        expectedOutputs: mcpArray(mcpString()).optional(),
+        acceptanceCriteria: mcpArray(mcpString()).optional(),
+        requiredSensors: mcpArray(mcpString()).optional(),
+        requiredArtifacts: mcpArray(z.union([mcpString(), z.record(mcpString(), z.any())])).optional(),
+        from: mcpString().optional(),
+        to: mcpString().optional(),
+        artifacts: mcpArray(mcpString()).optional(),
+        replayId: mcpString().optional(),
         includePayloads: z.boolean().optional(),
-        maxEvents: z.number().optional(),
-        datasetId: z.string().optional(),
-        sessionIds: z.array(z.string()).optional(),
+        maxEvents: MCP_MAX_EVENTS_SCHEMA.optional().default(MCP_INPUT_LIMITS.maxEventsDefault),
+        maxBytes: MCP_MAX_BYTES_SCHEMA.optional(),
+        datasetId: mcpString().optional(),
+        sessionIds: mcpArray(mcpString()).optional(),
         includeSuccessfulSessions: z.boolean().optional(),
+        limit: MCP_LIST_LIMIT_SCHEMA.optional(),
+        cursor: mcpString().max(MCP_INPUT_LIMITS.cursorLength).optional(),
+        direction: z.enum(['oldest', 'newest']).optional(),
+        createdAfter: mcpString().optional(),
+        createdBefore: mcpString().optional(),
+        concurrency: z.number().int().min(1).max(4).optional(),
+        maxFailures: z.number().int().min(1).max(10_000).optional(),
+        maxFailureBytes: MCP_MAX_FAILURE_BYTES_SCHEMA.optional(),
         scope: z.enum(['sensor', 'artifact', 'handoff', 'workflow', 'task', 'risk']).optional(),
         effect: z.enum(['allow', 'deny', 'require_approval']).optional(),
         target: z.enum(['tool', 'action', 'path', 'risk']).optional(),
-        pattern: z.string().optional(),
-        pathPattern: z.string().optional(),
-        approvalRole: z.string().optional(),
-        approvedBy: z.string().optional(),
-        approvalNote: z.string().optional(),
+        pattern: mcpPattern().optional(),
+        pathPattern: mcpPattern().optional(),
+        approvalRole: mcpString().optional(),
+        approvedBy: mcpString().optional(),
+        approvalNote: mcpString().optional(),
         risk: z.enum(['low', 'medium', 'high', 'critical']).optional(),
         policy: z.object({
           defaultEffect: z.enum(['allow', 'deny']).optional(),
-          rules: z.array(z.object({
-            id: z.string().optional(),
+          rules: mcpArray(z.object({
+            id: mcpString().optional(),
             effect: z.enum(['allow', 'deny', 'require_approval']),
             target: z.enum(['tool', 'action', 'path', 'risk']).optional(),
-            pattern: z.string().optional(),
-            pathPattern: z.string().optional(),
-            approvalRole: z.string().optional(),
-            reason: z.string().optional(),
-            description: z.string().optional(),
+            pattern: mcpPattern().optional(),
+            pathPattern: mcpPattern().optional(),
+            approvalRole: mcpString().optional(),
+            reason: mcpString().optional(),
+            description: mcpString().optional(),
             scope: z.enum(['sensor', 'artifact', 'handoff', 'workflow', 'task', 'risk']).optional(),
-          })).optional(),
+          })).max(MCP_INPUT_LIMITS.arrayItems).optional(),
         }).optional(),
       }
     }, wrap('harness', async (params): Promise<MCPToolResponse> => {
@@ -790,13 +845,7 @@ Actions:
           await this.contextCache.set(repoPath, contextType, context);
         }
 
-        return {
-          contents: [{
-            uri: uri.href,
-            mimeType: 'text/markdown',
-            text: context
-          }]
-        };
+        return createBoundedResourceText(uri.href, 'text/markdown', context);
       }
     );
 
@@ -810,22 +859,7 @@ Actions:
       },
       async (uri) => {
         const filePath = uri.pathname;
-        const result = await readFileTool.execute!(
-          { filePath },
-          { toolCallId: '', messages: [] }
-        ) as { success: boolean; content?: string; error?: string };
-
-        if (!result.success) {
-          throw new Error(result.error || 'Failed to read file');
-        }
-
-        return {
-          contents: [{
-            uri: uri.href,
-            mimeType: 'text/plain',
-            text: result.content || ''
-          }]
-        };
+        return readBoundedFileResource(uri.href, filePath);
       }
     );
 
@@ -855,43 +889,27 @@ Actions:
           const service = new WorkflowService(repoPath);
 
           if (!(await service.hasWorkflow())) {
-            return {
-              contents: [{
-                uri: 'workflow://status',
-                mimeType: 'application/json',
-                text: JSON.stringify({ error: 'No workflow found' }, null, 2)
-              }]
-            };
+            return createBoundedResourceJson('workflow://status', {
+              error: 'No workflow found',
+            });
           }
 
           const summary = await service.getSummary();
           const status = await service.getStatus();
 
-          return {
-            contents: [{
-              uri: 'workflow://status',
-              mimeType: 'application/json',
-              text: JSON.stringify({
-                name: summary.name,
-                scale: getScaleName(summary.scale as ProjectScale),
-                currentPhase: summary.currentPhase,
-                progress: summary.progress,
-                isComplete: summary.isComplete,
-                phases: status.phases,
-                roles: status.roles,
-              }, null, 2)
-            }]
-          };
+          return createBoundedResourceJson('workflow://status', {
+            name: summary.name,
+            scale: getScaleName(summary.scale as ProjectScale),
+            currentPhase: summary.currentPhase,
+            progress: summary.progress,
+            isComplete: summary.isComplete,
+            phases: status.phases,
+            roles: status.roles,
+          });
         } catch (error) {
-          return {
-            contents: [{
-              uri: 'workflow://status',
-              mimeType: 'application/json',
-              text: JSON.stringify({
-                error: error instanceof Error ? error.message : String(error)
-              }, null, 2)
-            }]
-          };
+          return createBoundedResourceJson('workflow://status', {
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       }
     );
@@ -995,10 +1013,23 @@ Actions:
     handler: (params: TParams) => Promise<MCPToolResponse>
   ): (params: TParams) => Promise<MCPToolResponse> {
     return async (params: TParams) => {
-      const resolvedRepoPath = this.getRepoPath((params as { repoPath?: string })?.repoPath);
       const action = typeof (params as { action?: string })?.action === 'string'
         ? (params as { action?: string }).action!
         : toolName;
+
+      try {
+        if (toolName === 'harness') {
+          MCP_HARNESS_ACTION_LIMIT_SCHEMA.parse(params);
+        }
+        validateMcpInput(params);
+      } catch (error) {
+        const resolvedRepoPath = this.getRepoPath();
+        const response = createErrorResponse(error);
+        await this.logToolError(resolvedRepoPath, toolName, action, {} as TParams, error);
+        return response;
+      }
+
+      const resolvedRepoPath = this.getRepoPath((params as { repoPath?: string })?.repoPath);
 
       // Validate file paths to prevent path traversal attacks
       try {
@@ -1006,10 +1037,7 @@ Actions:
       } catch (error) {
         if (error instanceof SecurityError) {
           this.log(`[SECURITY] Path traversal blocked: ${error.message} (tool: ${toolName}, path: ${error.attemptedPath})`);
-          const errorResponse: MCPToolResponse = {
-            content: [{ type: 'text', text: JSON.stringify({ success: false, error: `Security: ${error.message}` }) }],
-            isError: true,
-          };
+          const errorResponse = createErrorResponse(`Security: ${error.message}`);
           await this.logToolError(resolvedRepoPath, toolName, action, params, error);
           return errorResponse;
         }
@@ -1050,12 +1078,8 @@ Actions:
     params: TParams,
     response: MCPToolResponse
   ): Promise<void> {
-    const payload = this.parseResponsePayload(response);
-    const success = typeof payload?.success === 'boolean'
-      ? payload.success
-      : !response.isError;
-    const errorMessage = typeof payload?.error === 'string' ? payload.error : undefined;
-    const resultSummary = payload ? this.buildResultSummary(payload) : undefined;
+    const audit = response._meta?.dotcontext;
+    const success = audit?.success ?? !response.isError;
 
     await logMcpAction(repoPath, {
       tool: toolName,
@@ -1063,9 +1087,9 @@ Actions:
       status: success ? 'success' : 'error',
       details: {
         params,
-        ...(resultSummary ? { result: resultSummary } : {}),
+        ...(audit ? { response: audit } : {}),
       },
-      ...(success ? {} : { error: errorMessage || 'Tool reported failure' }),
+      ...(success ? {} : { error: audit?.errorCode || 'Tool reported failure' }),
     });
   }
 
@@ -1087,41 +1111,6 @@ Actions:
     });
   }
 
-  private parseResponsePayload(response: MCPToolResponse): Record<string, unknown> | null {
-    const text = response.content?.[0]?.text;
-    if (!text) return null;
-    try {
-      const parsed = JSON.parse(text);
-      return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null;
-    } catch {
-      return null;
-    }
-  }
-
-  private buildResultSummary(payload: Record<string, unknown>): Record<string, unknown> | null {
-    const summaryKeys = [
-      'success',
-      'message',
-      'currentPhase',
-      'nextPhase',
-      'phase',
-      'scale',
-      'planSlug',
-      'count',
-      'total',
-      'status',
-    ];
-    const summary: Record<string, unknown> = {};
-
-    for (const key of summaryKeys) {
-      if (key in payload) {
-        summary[key] = payload[key];
-      }
-    }
-
-    return Object.keys(summary).length > 0 ? summary : null;
-  }
-
   /**
    * Start the MCP server with stdio transport
    */
@@ -1136,6 +1125,8 @@ Actions:
    */
   async stop(): Promise<void> {
     await this.server.close();
+    this.contextCache.dispose();
+    clearMcpActionSessionCache();
     await this.contextBuilder.shutdown();
     this.log('MCP Server stopped');
   }

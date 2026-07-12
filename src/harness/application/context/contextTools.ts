@@ -34,6 +34,16 @@ import { resolveRuntimeLayout } from '../../../shared/fs/pathHelpers';
 import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
 import type { AnalysisBundle } from './analysisBundle';
+import {
+  boundedLimit,
+  RUNTIME_HISTORY_LIMITS,
+} from '../history/runtimeHistory';
+import {
+  listBoundedExploreFiles,
+  readBoundedExploreFile,
+  searchBoundedCode,
+  type BoundedExploreListResult,
+} from './boundedExplore';
 
 // Context tools are long-lived while each operation remains short-lived. Only
 // bounded fingerprint metadata/content hashes cross operation boundaries.
@@ -330,20 +340,23 @@ export async function cleanupSharedContext(): Promise<void> {
 }
 
 export const readFileTool = createInternalTool<
-  { filePath: string; encoding?: 'utf-8' | 'ascii' | 'binary' },
-  { success: boolean; content?: string; path: string; size?: number; error?: string }
+  { filePath: string; encoding?: 'utf-8' | 'ascii' | 'binary'; maxBytes?: number },
+  {
+    success: boolean;
+    content?: string;
+    path: string;
+    size?: number;
+    errorCode?: string;
+    error?: string;
+    budgetBytes?: number;
+    contentOmitted?: boolean;
+  }
 >(
   'Read the contents of a file from the filesystem',
   async (input) => {
     const { filePath, encoding = 'utf-8' } = input;
     try {
-      const content = await fs.readFile(filePath, encoding as BufferEncoding);
-      return {
-        success: true,
-        content,
-        path: filePath,
-        size: content.length
-      };
+      return await readBoundedExploreFile(filePath, encoding as BufferEncoding, input.maxBytes);
     } catch (error) {
       return {
         success: false,
@@ -355,24 +368,35 @@ export const readFileTool = createInternalTool<
 );
 
 export const listFilesTool = createInternalTool<
-  { pattern: string; cwd?: string; ignore?: string[] },
-  { success: boolean; files?: string[]; count?: number; pattern: string; error?: string }
+  { pattern: string; cwd?: string; ignore?: string[]; limit?: number; cursor?: string },
+  {
+    success: boolean;
+    files?: string[];
+    count?: number;
+    pattern: string;
+    page?: BoundedExploreListResult['page'];
+    error?: string;
+  }
 >(
   'List files matching a glob pattern in the repository',
   async (input) => {
     const { pattern, cwd, ignore } = input;
     try {
-      const files = (await glob(pattern, {
-        cwd: cwd || process.cwd(),
-        ignore: ignore || ['node_modules/**', '.git/**', 'dist/**'],
-        absolute: false
-      })).map((file) => file.split(path.sep).join('/'));
-      return {
-        success: true,
-        files,
-        count: files.length,
-        pattern
-      };
+      const resolvedCwd = path.resolve(cwd || process.cwd());
+      const resolvedIgnore = ignore || ['node_modules/**', '.git/**', 'dist/**'];
+      const limit = boundedLimit(
+        input.limit,
+        RUNTIME_HISTORY_LIMITS.exploreFiles.default,
+        RUNTIME_HISTORY_LIMITS.exploreFiles.maximum,
+        'explore files'
+      );
+      return await listBoundedExploreFiles({
+        pattern,
+        cwd: resolvedCwd,
+        ignore: resolvedIgnore,
+        limit,
+        cursor: input.cursor,
+      });
     } catch (error) {
       return {
         success: false,
@@ -477,52 +501,20 @@ export const getFileStructureTool = createInternalTool<
 );
 
 export const searchCodeTool = createInternalTool<
-  { pattern: string; fileGlob?: string; maxResults?: number; cwd?: string },
+  { pattern: string; fileGlob?: string; maxResults?: number; cwd?: string; cursor?: string },
   Record<string, unknown>
 >(
   'Search for code patterns across files using regex',
   async (input) => {
-    const { pattern, fileGlob, maxResults = 50, cwd } = input;
+    const { pattern, fileGlob, maxResults = 50, cwd, cursor } = input;
     try {
-      const files = await glob(fileGlob || '**/*.{ts,tsx,js,jsx,py,go,rs,java}', {
-        cwd: cwd || process.cwd(),
-        ignore: ['node_modules/**', '.git/**', 'dist/**', 'build/**'],
-        absolute: true
-      });
-
-      const regex = new RegExp(pattern, 'gm');
-      const matches: Array<{ file: string; line: number; match: string; context: string }> = [];
-
-      for (const file of files) {
-        if (matches.length >= maxResults) break;
-
-        try {
-          const content = await fs.readFile(file, 'utf-8');
-          const lines = content.split('\n');
-
-          for (let index = 0; index < lines.length && matches.length < maxResults; index++) {
-            if (regex.test(lines[index])) {
-              matches.push({
-                file: path.relative(cwd || process.cwd(), file),
-                line: index + 1,
-                match: lines[index].trim().slice(0, 200),
-                context: lines.slice(Math.max(0, index - 1), index + 2).join('\n').slice(0, 500)
-              });
-            }
-            regex.lastIndex = 0;
-          }
-        } catch {
-          // Skip unreadable files.
-        }
-      }
-
-      return {
-        success: true,
+      return await searchBoundedCode({
         pattern,
-        matches,
-        totalMatches: matches.length,
-        truncated: matches.length >= maxResults
-      };
+        fileGlob,
+        maxResults,
+        cwd: cwd || process.cwd(),
+        cursor,
+      });
     } catch (error) {
       return {
         success: false,
