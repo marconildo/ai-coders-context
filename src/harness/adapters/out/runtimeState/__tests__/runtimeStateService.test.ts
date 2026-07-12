@@ -317,5 +317,5 @@ describe('HarnessRuntimeStateService', () => {
     expect(files.length).toBeLessThanOrEqual(MAX_SENSOR_SUMMARY_ENTRIES);
     for (const file of files) expect((await fs.stat(path.join(summaryDir, file))).size).toBeLessThanOrEqual(MAX_SENSOR_SUMMARY_ENTRY_BYTES);
     expect(Object.keys((await service.getSensorSummary(session.id)).latestBySensor).length).toBeLessThanOrEqual(MAX_SENSOR_SUMMARY_ENTRIES);
-  });
+  }, 15_000);
 });

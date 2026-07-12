@@ -133,4 +133,20 @@ describe('HarnessReplayService', () => {
 
     expect([...sources]).toEqual(expect.arrayContaining(['session', 'trace', 'artifact', 'checkpoint', 'sensor', 'task', 'handoff']));
   });
+
+  it('reports the complete sensor history count when the replay page stops early', async () => {
+    const session = await execution.createSession({ name: 'sensor-count' });
+    for (let index = 0; index < 5; index += 1) {
+      await execution.runSensor({
+        id: 'tests',
+        name: 'Tests',
+        execute: () => ({ status: 'passed', summary: `run-${index}` }),
+      }, { sessionId: session.id });
+    }
+
+    const replay = await service.buildReplay(session.id, { maxEvents: 1 });
+
+    expect(replay.sourceCounts.sensor).toBe(5);
+    expect(replay.omittedCounts.sensor).toBe(5);
+  });
 });

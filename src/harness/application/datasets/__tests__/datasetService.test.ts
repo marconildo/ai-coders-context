@@ -182,4 +182,41 @@ describe('HarnessDatasetService', () => {
     expect((await fs.stat(file)).size).toBeLessThanOrEqual(4096);
     expect(await fs.pathExists(file.replace(/\.json$/, '.meta.json'))).toBe(true);
   });
+
+  it('falls back to legacy arrays when events predate event.record', async () => {
+    const session = await execution.createSession({ name: 'legacy-replay-shape' });
+    const replayService = new HarnessReplayService({ repoPath: tempDir });
+    const base = await replayService.buildReplay(session.id);
+    const legacyTrace = {
+      id: 'legacy-trace',
+      sessionId: session.id,
+      level: 'error' as const,
+      event: 'task.failed',
+      message: 'legacy failure',
+      createdAt: new Date().toISOString(),
+    };
+    const legacyReplay = {
+      ...base,
+      events: [{
+        id: legacyTrace.id,
+        sessionId: session.id,
+        createdAt: legacyTrace.createdAt,
+        source: 'trace' as const,
+        label: legacyTrace.event,
+      }],
+      traces: [legacyTrace],
+    } as any;
+    const legacyDataset = new HarnessDatasetService({
+      repoPath: tempDir,
+      dependencies: { replayService: { buildReplay: async () => legacyReplay } },
+    });
+
+    const dataset = await legacyDataset.buildFailureDataset({
+      sessionIds: [session.id],
+      includeSuccessfulSessions: true,
+    });
+
+    expect(dataset.failureCount).toBe(1);
+    expect(dataset.failures[0]).toMatchObject({ kind: 'trace', message: 'legacy failure' });
+  });
 });

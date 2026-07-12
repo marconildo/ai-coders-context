@@ -103,7 +103,7 @@ function replayRecords<T>(replay: HarnessReplayRecord, source: HarnessReplayReco
   const current = events
     .filter(event => event.source === source && event.record)
     .map(event => event.record as T);
-  if (current.length > 0 || events.length > 0) return current;
+  if (current.length > 0) return current;
   const legacyKey = ({ trace: 'traces', artifact: 'artifacts', checkpoint: 'checkpoints', sensor: 'sensorRuns', task: 'tasks', handoff: 'handoffs' } as const)[source as Exclude<typeof source, 'session'>];
   return legacyKey ? (((replay as unknown as Record<string, unknown>)[legacyKey] as T[] | undefined) ?? []) : [];
 }

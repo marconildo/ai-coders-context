@@ -87,7 +87,7 @@ export interface HarnessReplaySummary {
 
 export interface HarnessReplayDependencies {
   stateService: HarnessRuntimeStatePort;
-  sensorsService: Pick<HarnessSensorsService, 'getSessionSensorRunPage'>;
+  sensorsService: Pick<HarnessSensorsService, 'getSessionSensorRunPage' | 'getSessionSensorRunCount'>;
   contractsService: Pick<
     HarnessTaskContractsService,
     'listSessionTaskContracts' | 'listSessionHandoffContracts'
@@ -191,6 +191,7 @@ export class HarnessReplayService {
     const maxEvents = boundedLimit(options.maxEvents, 100, 1000, 'replay events');
     const byteBudget = boundedPageBytes(options.maxBytes, 'replay events');
     const session = await this.stateService.getSession(sessionId);
+    const sensorRunCount = await this.sensorsService.getSessionSensorRunCount(sessionId);
     const binding = queryBinding({ sessionId, direction: 'oldest', includePayloads: options.includePayloads !== false });
     const boundary = decodeHistoryCursor<ReplayCursorPosition>(options.cursor, 'replay-events', binding);
     const boundaryKey = boundary ? replayCursorKey(boundary) : undefined;
@@ -200,7 +201,7 @@ export class HarnessReplayService {
       trace: session.traceCount,
       artifact: session.artifactCount,
       checkpoint: session.checkpointCount,
-      sensor: 0,
+      sensor: sensorRunCount,
       task: 0,
       handoff: 0,
     };
@@ -246,10 +247,7 @@ export class HarnessReplayService {
     })();
     const sensorSource = paged(
       cursor => this.sensorsService.getSessionSensorRunPage(sessionId, { limit: pageSize, cursor, direction: 'oldest', maxBytes: byteBudget }),
-      run => {
-        sourceTotals.sensor += 1;
-        return { id: run.id, sessionId, createdAt: run.createdAt, source: 'sensor', label: run.sensorId, record: recordFor(run) };
-      }
+      run => ({ id: run.id, sessionId, createdAt: run.createdAt, source: 'sensor', label: run.sensorId, record: recordFor(run) })
     );
     const taskSource = paged(
       async cursor => {
@@ -298,10 +296,7 @@ export class HarnessReplayService {
       returnedBytes = candidateTotal;
     }
     const hasMore = heads.some(head => !head.done);
-    const sourceCounts: Record<HarnessReplayEventSource, number> = {
-      ...sourceTotals,
-      sensor: sourceTotals.sensor,
-    };
+    const sourceCounts: Record<HarnessReplayEventSource, number> = { ...sourceTotals };
     const includedCounts = orderedEvents.reduce((counts, event) => {
       counts[event.source] += 1;
       return counts;

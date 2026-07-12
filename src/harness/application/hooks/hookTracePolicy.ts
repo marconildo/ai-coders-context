@@ -160,23 +160,23 @@ function byteLength(value: unknown): number {
   }
 }
 
-function truncateUtf8(value: string, maximumBytes: number): { value: string; truncated: boolean } {
-  if (Buffer.byteLength(value, 'utf8') <= maximumBytes) {
+export function truncateUtf8Prefix(value: string, maximumBytes: number): { value: string; truncated: boolean } {
+  const limit = Math.max(0, Math.floor(maximumBytes));
+  // UTF-8 uses at least one byte per UTF-16 code unit. Inspecting limit + 1
+  // code units is enough to decide truncation without copying an untrusted
+  // multi-megabyte input into an Array of code points.
+  const prefix = value.slice(0, Math.min(value.length, limit + 1));
+  const encoded = Buffer.from(prefix, 'utf8');
+  if (value.length === prefix.length && encoded.length <= limit) {
     return { value, truncated: false };
   }
+  if (limit === 0) return { value: '', truncated: value.length > 0 };
 
-  const characters = Array.from(value);
-  let low = 0;
-  let high = characters.length;
-  while (low < high) {
-    const middle = Math.ceil((low + high) / 2);
-    if (Buffer.byteLength(characters.slice(0, middle).join(''), 'utf8') <= maximumBytes) {
-      low = middle;
-    } else {
-      high = middle - 1;
-    }
+  let end = Math.min(limit, encoded.length);
+  while (end > 0 && end < encoded.length && (encoded[end] & 0xc0) === 0x80) {
+    end -= 1;
   }
-  return { value: characters.slice(0, low).join(''), truncated: true };
+  return { value: encoded.subarray(0, end).toString('utf8'), truncated: true };
 }
 
 function hashText(value: string): string {
@@ -241,7 +241,7 @@ function summarizeUnknown(
     return value;
   }
   if (typeof value === 'string') {
-    const result = truncateUtf8(value, policy.maxStringBytes);
+    const result = truncateUtf8Prefix(value, policy.maxStringBytes);
     if (result.truncated) state.truncatedFieldCount += 1;
     return result.truncated ? `${result.value}…[truncated]` : result.value;
   }
@@ -317,7 +317,7 @@ function summarizeBash(input: Record<string, unknown>, policy: HookTracePolicy, 
   if (!command) return {};
   const redactedCommand = redactCommandSecrets(command);
   state.redactedFieldCount += redactedCommand.redacted;
-  const preview = truncateUtf8(redactedCommand.value, policy.maxStringBytes);
+  const preview = truncateUtf8Prefix(redactedCommand.value, policy.maxStringBytes);
   if (preview.truncated) state.truncatedFieldCount += 1;
   return {
     commandBasename: commandBasename(command),
@@ -390,10 +390,10 @@ export function boundGenericTraceRecord<T extends { message: string; event?: str
   }
 
   const originalBytes = byteLength(trace);
-  const boundedMessage = truncateUtf8(trace.message, 512);
+  const boundedMessage = truncateUtf8Prefix(trace.message, 512);
   const bounded = {
     ...trace,
-    ...(typeof trace.event === 'string' ? { event: truncateUtf8(trace.event, 256).value } : {}),
+    ...(typeof trace.event === 'string' ? { event: truncateUtf8Prefix(trace.event, 256).value } : {}),
     message: boundedMessage.truncated ? `${boundedMessage.value}…[truncated]` : boundedMessage.value,
     data: {
       traceDataOmitted: true,
