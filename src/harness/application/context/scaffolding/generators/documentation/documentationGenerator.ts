@@ -8,8 +8,13 @@ import {
   renderIndex,
 } from './templates';
 import { getGuidesByKeys, DOCUMENT_GUIDES } from './guideRegistry';
-import { CodebaseAnalyzer, SemanticContext, SemanticSnapshotService } from '../../../../../adapters/out/semantic';
-import { StackDetector } from '../../../intelligence/stack';
+import {
+  CodebaseAnalyzer,
+  SemanticContext,
+  SemanticSnapshotService,
+  type DetectedFunctionalPatterns,
+} from '../../../../../adapters/out/semantic';
+import { StackDetector, type StackInfo } from '../../../intelligence/stack';
 import {
   createDocFrontmatter,
   serializeFrontmatter,
@@ -17,6 +22,7 @@ import {
 } from '../../../../../../types/scaffoldFrontmatter';
 import { getScaffoldStructure, ScaffoldStructure, serializeStructureAsMarkdown } from '../shared/structures';
 import { AutoFillService, AutoFillContext } from '../../../intelligence/autoFill';
+import type { AnalysisBundle } from '../../../analysisBundle';
 
 /**
  * Category mapping from document name to frontmatter category.
@@ -57,6 +63,21 @@ interface DocumentationGenerationConfig {
   includeContentStubs?: boolean;
   /** Fill scaffolds with semantic data (no LLM required) */
   autoFill?: boolean;
+  /** Operation-scoped semantic data supplied by context init. */
+  semanticContext?: SemanticContext;
+  functionalPatterns?: DetectedFunctionalPatterns;
+  stackInfo?: StackInfo;
+  repoFingerprint?: string;
+  cacheEnabled?: boolean;
+  onSnapshotMetrics?: (metrics: {
+    generationMs: number;
+    publicationMs: number;
+    stabilizationAttempts: number;
+  }) => void;
+  /** Preferred operation-scoped input from context init. */
+  analysisBundle?: AnalysisBundle;
+  /** Operation-owned service; avoids rebuilding fingerprint cache ownership. */
+  snapshotService?: SemanticSnapshotService;
 }
 
 export class DocumentationGenerator {
@@ -72,29 +93,44 @@ export class DocumentationGenerator {
   ): Promise<number> {
     const docsDir = path.join(outputDir, 'docs');
     await GeneratorUtils.ensureDirectoryAndLog(docsDir, verbose, 'Generating documentation scaffold in');
-    const snapshotService = config.semantic ? new SemanticSnapshotService() : null;
+    const snapshotService = (config.semantic || config.semanticContext)
+      ? config.snapshotService ?? new SemanticSnapshotService(config.cacheEnabled ?? true)
+      : null;
 
     // Perform semantic analysis if enabled
-    let semantics: SemanticContext | undefined;
-    let snapshotFingerprint: string | undefined;
-    if (config.semantic) {
+    let semantics = config.analysisBundle?.semanticContext ?? config.semanticContext;
+    let functionalPatterns = config.analysisBundle?.functionalPatterns ?? config.functionalPatterns;
+    let snapshotFingerprint = config.analysisBundle?.repoFingerprint ?? config.repoFingerprint;
+    if (config.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis...', verbose);
-      this.analyzer = new CodebaseAnalyzer();
+      GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
+      this.analyzer = new CodebaseAnalyzer({ cacheEnabled: config.cacheEnabled ?? true });
       try {
-        snapshotFingerprint = await snapshotService!.captureRepoFingerprint(repoStructure.rootPath);
-        semantics = await this.analyzer.analyze(repoStructure.rootPath);
+        snapshotFingerprint = await snapshotService!.captureRepoFingerprint(
+          repoStructure.rootPath,
+          repoStructure
+        );
+        const bundle = await this.analyzer.analyzeBundle(
+          repoStructure.rootPath,
+          repoStructure
+        );
+        semantics = bundle.context;
+        functionalPatterns = bundle.functionalPatterns;
         GeneratorUtils.logProgress(
           `Analyzed ${semantics.stats.totalFiles} files, found ${semantics.stats.totalSymbols} symbols in ${semantics.stats.analysisTimeMs}ms`,
           verbose
         );
       } catch (error) {
         GeneratorUtils.logError('Semantic analysis failed, continuing without it', error, verbose);
+      } finally {
+        await this.analyzer.shutdown();
+        this.analyzer = undefined;
       }
     }
 
     // Detect stack info for codebase map and autoFill
-    let stackInfo;
-    if (semantics || config.autoFill) {
+    let stackInfo = config.analysisBundle?.stackInfo ?? config.stackInfo;
+    if (!stackInfo && (semantics || config.autoFill)) {
       try {
         const stackDetector = new StackDetector();
         stackInfo = await stackDetector.detect(repoStructure.rootPath);
@@ -111,8 +147,10 @@ export class DocumentationGenerator {
           outputDir,
           semantics,
           stackInfo,
+          functionalPatterns,
           repoFingerprint: snapshotFingerprint,
         });
+        config.onSnapshotMetrics?.(snapshot.metrics);
 
         GeneratorUtils.logProgress(
           `Created semantic snapshot summary at ${path.relative(outputDir, snapshot.publishedSummaryPath)}`,

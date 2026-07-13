@@ -95,6 +95,10 @@ export class HarnessExecutionService {
     return this.state.listSessions();
   }
 
+  listSessionPage(query: Parameters<HarnessRuntimeStateService['listSessionPage']>[0] = {}) {
+    return this.state.listSessionPage(query);
+  }
+
   getSession(sessionId: string) {
     return this.state.getSession(sessionId);
   }
@@ -105,6 +109,10 @@ export class HarnessExecutionService {
 
   listTraces(sessionId: string) {
     return this.state.listTraces(sessionId);
+  }
+
+  listTracePage(sessionId: string, query: Parameters<HarnessRuntimeStateService['listTracePage']>[1] = {}) {
+    return this.state.listTracePage(sessionId, query);
   }
 
   async addArtifact(sessionId: string, input: AddArtifactInput) {
@@ -120,6 +128,10 @@ export class HarnessExecutionService {
 
   listArtifacts(sessionId: string) {
     return this.state.listArtifacts(sessionId);
+  }
+
+  listArtifactPage(sessionId: string, query: Parameters<HarnessRuntimeStateService['listArtifactPage']>[1] = {}) {
+    return this.state.listArtifactPage(sessionId, query);
   }
 
   async checkpointSession(sessionId: string, input: CheckpointInput = {}) {
@@ -180,6 +192,10 @@ export class HarnessExecutionService {
     return this.sensors.getSessionSensorRuns(sessionId);
   }
 
+  getSessionSensorRunPage(sessionId: string, query: Parameters<HarnessSensorsService['getSessionSensorRunPage']>[1] = {}) {
+    return this.sensors.getSessionSensorRunPage(sessionId, query);
+  }
+
   async createTaskContract(input: Parameters<HarnessTaskContractsService['createTaskContract']>[0]) {
     await this.policy.authorize({
       tool: 'harness',
@@ -192,6 +208,10 @@ export class HarnessExecutionService {
 
   listTaskContracts() {
     return this.contracts.listTaskContracts();
+  }
+
+  listTaskContractPage(query: Parameters<HarnessTaskContractsService['listTaskContractPage']>[0] = {}) {
+    return this.contracts.listTaskContractPage(query);
   }
 
   evaluateTaskCompletion(taskId: string, sessionId?: string): Promise<HarnessTaskCompletionResult> {
@@ -210,6 +230,10 @@ export class HarnessExecutionService {
 
   listHandoffContracts() {
     return this.contracts.listHandoffContracts();
+  }
+
+  listHandoffContractPage(query: Parameters<HarnessTaskContractsService['listHandoffContractPage']>[0] = {}) {
+    return this.contracts.listHandoffContractPage(query);
   }
 
   listPolicies(): Promise<HarnessPolicyRule[]> {
@@ -276,6 +300,10 @@ export class HarnessExecutionService {
     return this.replay.listReplays(sessionId ? { sessionId } : undefined);
   }
 
+  listReplayPage(query: Parameters<HarnessReplayService['listReplayPage']>[0] = {}) {
+    return this.replay.listReplayPage(query);
+  }
+
   getReplay(replayId: string): Promise<HarnessReplayRecord> {
     return this.replay.getReplay(replayId);
   }
@@ -295,6 +323,10 @@ export class HarnessExecutionService {
     return this.datasets.listDatasets();
   }
 
+  listDatasetPage(query: Parameters<HarnessDatasetService['listDatasetPage']>[0] = {}) {
+    return this.datasets.listDatasetPage(query);
+  }
+
   getDataset(datasetId: string): Promise<HarnessFailureDataset> {
     return this.datasets.getDataset(datasetId);
   }
@@ -312,7 +344,7 @@ export class HarnessExecutionService {
   ): Promise<HarnessSessionQualitySnapshot> {
     const [session, sensorRuns, taskEvaluation] = await Promise.all([
       this.state.getSession(sessionId),
-      this.sensors.getSessionSensorRuns(sessionId),
+      this.sensors.getLatestSessionSensorRuns(sessionId),
       options.taskId
         ? this.contracts.evaluateTaskCompletion(options.taskId, sessionId)
         : Promise.resolve(null),

@@ -41,15 +41,18 @@ Cada session é dona de uma pasta em `.context/runtime/sessions/<sessionId>/`:
         └── <sessionId>/
             ├── session.json       # o registro da session
             ├── trace.jsonl        # log de eventos append-only (um JSON por linha)
-            └── artifacts/
-                └── <artifactId>.json
+            ├── artifacts/
+            │   └── <artifactId>.json
+            └── checkpoints/
+                └── <checkpointId>.json
 ```
 
 | Caminho | O que contém |
 | --- | --- |
-| `.context/runtime/sessions/<id>/session.json` | O registro da session — status, timestamps, contadores de atividade e checkpoints inline |
+| `.context/runtime/sessions/<id>/session.json` | O resumo limitado da session — status, timestamps, contadores e identidade do checkpoint mais recente |
 | `.context/runtime/sessions/<id>/trace.jsonl` | Log de eventos append-only, um objeto JSON por linha |
 | `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` | Um arquivo por artifact registrado |
+| `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` | Um registro limitado por checkpoint |
 
 ::: caution
 Tudo em `.context/runtime/` é regenerado conforme necessário e está no gitignore. Não edite esses arquivos manualmente — passe pelo harness para que os contadores e o trace permaneçam consistentes.
@@ -77,7 +80,7 @@ O registro da session é armazenado em `.context/runtime/sessions/<id>/session.j
   "checkpointCount": 1,
   "lastTraceAt": "2026-06-05T...",
   "lastCheckpointAt": "2026-06-05T...",
-  "checkpoints": [],
+  "lastCheckpointId": "ckpt_...",
   "metadata": {}
 }
 ```
@@ -120,7 +123,7 @@ Cada entrada de trace tem este formato:
 | `message` | Descrição legível por humanos |
 | `data` | Payload estruturado opcional (resultados de sensor, contexto, etc.) |
 
-Como o arquivo é **append-only** (`.jsonl`, um objeto JSON por linha), traces são baratos de escrever e nunca reescrevem entradas anteriores. Use a action `appendTrace` da tool `harness` para adicionar um evento e `listTraces` para ler a linha do tempo.
+Como o arquivo é **append-only** (`.jsonl`, um objeto JSON por linha), traces são baratos de escrever e nunca reescrevem entradas anteriores. O harness lê segmentos legados e rotacionados de forma incremental. `listTraces` retorna uma página limitada (100 registros por padrão, máximo de 1.000) com `nextCursor` opaco, `hasMore` e metadados de bytes lidos, linhas malformadas e duração. As páginas também têm orçamento UTF-8 agregado de 1 MiB por padrão (máximo absoluto de 16 MiB) e param antes de materializar o próximo item que excederia o limite. `returnedBytes`, `byteBudget`, `byteLimited` e `oversizedRecordsSkipped` tornam esse comportamento explícito. Um registro válido que não cabe sozinho é ignorado com metadados para que a continuação por cursor nunca entre em loop. Os filtros aceitos são `event`, `level`, `createdAfter` e `createdBefore`; leituras pontuais continuam disponíveis nas actions específicas de cada recurso.
 
 ::: note
 Valores de `event` de trace como `sensor.run` são a forma como o harness registra resultados de [sensores](/pt-br/concepts/sensors/) em uma session. É isso que depois permite que task contracts verifiquem se os sensores requeridos passaram, e que [failure datasets](/pt-br/concepts/replay-and-datasets/) agrupem eventos de nível de erro.
@@ -157,7 +160,9 @@ Adicione artifacts com a action `addArtifact` da tool `harness` e leia-os com `l
 
 Um **checkpoint** é um marco nomeado dentro de uma session. Ele agrupa um conjunto de artifacts e estado opcional, dando a você um ponto significativo e recuperável para o qual voltar — útil entre fases PREVC, antes de um passo arriscado ou sempre que você quiser um snapshot rotulado.
 
-Checkpoints são armazenados **inline** no array `checkpoints` do registro da session (não como arquivos separados):
+Checkpoints são armazenados como registros individuais em `.context/runtime/sessions/<id>/checkpoints/`. O `session.json` mantém apenas o contador e a identidade do checkpoint mais recente, então leituras e gravações normais da session nunca carregam o histórico completo. Consumidores do runtime podem paginar os registros com `listCheckpointsPage`; o helper completo `listCheckpoints` continua disponível para operações explícitas, como replay. Checkpoints legados inline continuam legíveis e são migrados na próxima gravação.
+
+Cada novo registro é limitado por `checkpoints.maxSerializedBytes`; `data`, `note`, quantidade de artifacts e cada ID de artifact também têm limites independentes. Assim, um rótulo ou identificador grande não consegue contornar o budget do payload.
 
 ```json
 {

@@ -28,7 +28,8 @@ A regra de bolso: se um humano escreveu, provavelmente é versioned e fica no co
 ├── config.json                  # versioned — config de geração
 ├── config/
 │   ├── policy.json              # versioned — regras de policy
-│   └── sensors.json             # versioned — catálogo de sensores
+│   ├── sensors.json             # versioned — catálogo de sensores
+│   └── runtime.json             # versioned — limites seguros de retenção
 ├── docs/                        # versioned — documentação + KB semântica
 ├── agents/                      # versioned — playbooks de agentes
 ├── skills/                      # versioned — expertise sob demanda
@@ -51,6 +52,7 @@ Esses arquivos governam como o harness se comporta. Você os escreve, os revisa 
 | `.context/config/` | versioned | Sim | O diretório de config autorada. |
 | `.context/config/policy.json` | versioned | Sim | Regras de [policy](/pt-br/concepts/policies/) do harness e restrições de aprovação. |
 | `.context/config/sensors.json` | versioned | Sim | Catálogo de [sensores](/pt-br/concepts/sensors/) do projeto mais informações da stack detectada. Gerado no bootstrap e depois customizado pelo time. |
+| `.context/config/runtime.json` | versioned | Sim | Limites versionados de retenção e descoberta semântica para traces, sessions, replays, datasets, checkpoints, bindings e caches. Registros de checkpoint têm limites total, de data, note, quantidade de artifacts e por ID de artifact. `caches.context.maxEntriesScanned` e `caches.semantic.maxEntriesScanned` limitam entradas brutas de diretório antes da filtragem; valores inseguros são limitados por tetos absolutos. |
 
 ## Conhecimento durável do projeto
 
@@ -80,9 +82,10 @@ Uma pasta por [session do harness](/pt-br/concepts/harness-runtime/), guardando 
 | Caminho | Classificação | Rastreado | Propósito |
 | --- | --- | --- | --- |
 | `.context/runtime/sessions/` | runtime | Não | Raiz de todo o estado de sessions. |
-| `.context/runtime/sessions/<id>/session.json` | runtime | Não | O registro da session (status, contadores, checkpoints). |
+| `.context/runtime/sessions/<id>/session.json` | runtime | Não | O resumo limitado da session (status, contadores e checkpoint mais recente). |
 | `.context/runtime/sessions/<id>/trace.jsonl` | runtime | Não | Log de eventos append-only, um objeto JSON por linha. |
 | `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` | runtime | Não | Registros de artefatos individuais produzidos durante a session. |
+| `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` | runtime | Não | Registros individuais de checkpoints produzidos durante a session. |
 
 ### Workflows
 

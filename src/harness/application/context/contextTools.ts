@@ -8,7 +8,12 @@ import { FileMapper } from '../../../utils/fileMapper';
 import { needsFill } from '../../../utils/frontMatter';
 import { getScaffoldStructure, serializeStructureForAI } from './scaffolding/generators/shared/structures';
 import { DocumentationGenerator } from './scaffolding/generators/documentation/documentationGenerator';
-import { SemanticSnapshotService } from '../../adapters/out/semantic';
+import {
+  CodebaseAnalyzer,
+  SemanticFingerprintCache,
+  SemanticSnapshotService,
+  type SemanticAnalysisBundle,
+} from '../../adapters/out/semantic';
 import { AgentGenerator } from './scaffolding/generators/agents/agentGenerator';
 import { SkillGenerator } from './scaffolding/generators/skills/skillGenerator';
 import { PlanGenerator } from './scaffolding/generators/plans/planGenerator';
@@ -28,6 +33,25 @@ import { getUntrackedContextLayoutEntries } from '../../../shared';
 import { resolveRuntimeLayout } from '../../../shared/fs/pathHelpers';
 import { createSkillRegistry } from '../../domain/workflow/skills';
 import { ensureGitignorePatterns } from '../../../utils/gitignoreManager';
+import type { AnalysisBundle } from './analysisBundle';
+import {
+  boundedLimit,
+  RUNTIME_HISTORY_LIMITS,
+} from '../history/runtimeHistory';
+import {
+  listBoundedExploreFiles,
+  readBoundedExploreFile,
+  searchBoundedCode,
+  type BoundedExploreListResult,
+} from './boundedExplore';
+
+// Context tools are long-lived while each operation remains short-lived. Only
+// bounded fingerprint metadata/content hashes cross operation boundaries.
+const contextFingerprintCache = new SemanticFingerprintCache();
+
+function createContextSnapshotService(cacheEnabled = true): SemanticSnapshotService {
+  return new SemanticSnapshotService(cacheEnabled, contextFingerprintCache);
+}
 
 type ToolContext = unknown;
 
@@ -316,20 +340,23 @@ export async function cleanupSharedContext(): Promise<void> {
 }
 
 export const readFileTool = createInternalTool<
-  { filePath: string; encoding?: 'utf-8' | 'ascii' | 'binary' },
-  { success: boolean; content?: string; path: string; size?: number; error?: string }
+  { filePath: string; encoding?: 'utf-8' | 'ascii' | 'binary'; maxBytes?: number },
+  {
+    success: boolean;
+    content?: string;
+    path: string;
+    size?: number;
+    errorCode?: string;
+    error?: string;
+    budgetBytes?: number;
+    contentOmitted?: boolean;
+  }
 >(
   'Read the contents of a file from the filesystem',
   async (input) => {
     const { filePath, encoding = 'utf-8' } = input;
     try {
-      const content = await fs.readFile(filePath, encoding as BufferEncoding);
-      return {
-        success: true,
-        content,
-        path: filePath,
-        size: content.length
-      };
+      return await readBoundedExploreFile(filePath, encoding as BufferEncoding, input.maxBytes);
     } catch (error) {
       return {
         success: false,
@@ -341,24 +368,35 @@ export const readFileTool = createInternalTool<
 );
 
 export const listFilesTool = createInternalTool<
-  { pattern: string; cwd?: string; ignore?: string[] },
-  { success: boolean; files?: string[]; count?: number; pattern: string; error?: string }
+  { pattern: string; cwd?: string; ignore?: string[]; limit?: number; cursor?: string },
+  {
+    success: boolean;
+    files?: string[];
+    count?: number;
+    pattern: string;
+    page?: BoundedExploreListResult['page'];
+    error?: string;
+  }
 >(
   'List files matching a glob pattern in the repository',
   async (input) => {
     const { pattern, cwd, ignore } = input;
     try {
-      const files = (await glob(pattern, {
-        cwd: cwd || process.cwd(),
-        ignore: ignore || ['node_modules/**', '.git/**', 'dist/**'],
-        absolute: false
-      })).map((file) => file.split(path.sep).join('/'));
-      return {
-        success: true,
-        files,
-        count: files.length,
-        pattern
-      };
+      const resolvedCwd = path.resolve(cwd || process.cwd());
+      const resolvedIgnore = ignore || ['node_modules/**', '.git/**', 'dist/**'];
+      const limit = boundedLimit(
+        input.limit,
+        RUNTIME_HISTORY_LIMITS.exploreFiles.default,
+        RUNTIME_HISTORY_LIMITS.exploreFiles.maximum,
+        'explore files'
+      );
+      return await listBoundedExploreFiles({
+        pattern,
+        cwd: resolvedCwd,
+        ignore: resolvedIgnore,
+        limit,
+        cursor: input.cursor,
+      });
     } catch (error) {
       return {
         success: false,
@@ -425,7 +463,12 @@ export const getFileStructureTool = createInternalTool<
     const { rootPath, maxDepth = 3, includePatterns } = input;
     try {
       const mapper = new FileMapper([]);
-      const structure = await mapper.mapRepository(rootPath, includePatterns || undefined);
+      // This explicit structure-inspection surface requests all paths, while
+      // context initialization uses the bounded relevant defaults.
+      const structure = await mapper.mapRepository(
+        rootPath,
+        includePatterns?.length ? includePatterns : ['**/*']
+      );
 
       const filterByDepth = (relativePath: string): boolean => relativePath.split('/').length <= maxDepth;
 
@@ -458,52 +501,20 @@ export const getFileStructureTool = createInternalTool<
 );
 
 export const searchCodeTool = createInternalTool<
-  { pattern: string; fileGlob?: string; maxResults?: number; cwd?: string },
+  { pattern: string; fileGlob?: string; maxResults?: number; cwd?: string; cursor?: string },
   Record<string, unknown>
 >(
   'Search for code patterns across files using regex',
   async (input) => {
-    const { pattern, fileGlob, maxResults = 50, cwd } = input;
+    const { pattern, fileGlob, maxResults = 50, cwd, cursor } = input;
     try {
-      const files = await glob(fileGlob || '**/*.{ts,tsx,js,jsx,py,go,rs,java}', {
-        cwd: cwd || process.cwd(),
-        ignore: ['node_modules/**', '.git/**', 'dist/**', 'build/**'],
-        absolute: true
-      });
-
-      const regex = new RegExp(pattern, 'gm');
-      const matches: Array<{ file: string; line: number; match: string; context: string }> = [];
-
-      for (const file of files) {
-        if (matches.length >= maxResults) break;
-
-        try {
-          const content = await fs.readFile(file, 'utf-8');
-          const lines = content.split('\n');
-
-          for (let index = 0; index < lines.length && matches.length < maxResults; index++) {
-            if (regex.test(lines[index])) {
-              matches.push({
-                file: path.relative(cwd || process.cwd(), file),
-                line: index + 1,
-                match: lines[index].trim().slice(0, 200),
-                context: lines.slice(Math.max(0, index - 1), index + 2).join('\n').slice(0, 500)
-              });
-            }
-            regex.lastIndex = 0;
-          }
-        } catch {
-          // Skip unreadable files.
-        }
-      }
-
-      return {
-        success: true,
+      return await searchBoundedCode({
         pattern,
-        matches,
-        totalMatches: matches.length,
-        truncated: matches.length >= maxResults
-      };
+        fileGlob,
+        maxResults,
+        cwd: cwd || process.cwd(),
+        cursor,
+      });
     } catch (error) {
       return {
         success: false,
@@ -581,6 +592,7 @@ export const initializeContextTool = createInternalTool<
     skipContentGeneration?: boolean;
     generateQA?: boolean;
     generateSkills?: boolean;
+    cacheEnabled?: boolean;
   },
   Record<string, unknown>
 >(
@@ -599,6 +611,7 @@ export const initializeContextTool = createInternalTool<
       skipContentGeneration = true,
       generateQA = false,
       generateSkills = true,
+      cacheEnabled = true,
     } = input;
 
     const resolvedRepoPath = path.resolve(repoPath);
@@ -642,12 +655,72 @@ export const initializeContextTool = createInternalTool<
       const fileMapper = new FileMapper(exclude);
       const repoStructure = await fileMapper.mapRepository(resolvedRepoPath, include);
 
+      let semanticBundle: SemanticAnalysisBundle | undefined;
+      let analysisBundle: AnalysisBundle | undefined;
+      let semanticFingerprint: string | undefined;
+      let fingerprintMetrics: Awaited<ReturnType<SemanticSnapshotService['captureRepoFingerprintWithMetrics']>> | undefined;
+      const snapshotService = semantic
+        ? createContextSnapshotService(cacheEnabled)
+        : undefined;
+      if (semantic) {
+        const analyzer = new CodebaseAnalyzer({
+          exclude: [...new Set([...DEFAULT_EXCLUDE_PATTERNS, ...exclude])],
+          cacheEnabled,
+        });
+        try {
+          fingerprintMetrics = await snapshotService!.captureRepoFingerprintWithMetrics(
+            resolvedRepoPath,
+            repoStructure
+          );
+          semanticFingerprint = fingerprintMetrics.fingerprint;
+          semanticBundle = await analyzer.analyzeBundle(
+            resolvedRepoPath,
+            repoStructure
+          );
+        } catch {
+          semanticBundle = undefined;
+          semanticFingerprint = undefined;
+        } finally {
+          await analyzer.shutdown();
+        }
+      }
+
       let classification: ProjectClassification | undefined;
       let projectType: ProjectType = 'unknown';
+      let detectedStackInfo: Awaited<ReturnType<StackDetector['detect']>> | undefined;
+
+      if (!disableFiltering || semantic) {
+        const stackDetector = new StackDetector();
+        detectedStackInfo = await stackDetector.detect(resolvedRepoPath);
+      }
+
+      if (semanticBundle && semanticFingerprint && fingerprintMetrics) {
+        analysisBundle = {
+          repoPath: resolvedRepoPath,
+          discoveredFiles: semanticBundle.files,
+          repoStructure,
+          semanticContext: semanticBundle.context,
+          functionalPatterns: semanticBundle.functionalPatterns,
+          stackInfo: detectedStackInfo,
+          repoFingerprint: semanticFingerprint,
+          limits: semanticBundle.limits,
+          partial: semanticBundle.partial,
+          skipped: semanticBundle.skipped,
+          metrics: {
+            ...semanticBundle.metrics,
+            fingerprint: {
+              files: fingerprintMetrics.files,
+              bytesRead: fingerprintMetrics.bytesRead,
+              contentReads: fingerprintMetrics.contentReads,
+              cacheHits: fingerprintMetrics.cacheHits,
+              discoveries: fingerprintMetrics.discoveries,
+              durationMs: fingerprintMetrics.durationMs,
+            },
+          },
+        };
+      }
 
       if (!disableFiltering) {
-        const stackDetector = new StackDetector();
-        const stackInfo = await stackDetector.detect(resolvedRepoPath);
         if (overrideProjectType) {
           projectType = overrideProjectType;
           classification = {
@@ -657,7 +730,7 @@ export const initializeContextTool = createInternalTool<
             reasoning: ['Project type manually specified'],
           };
         } else {
-          classification = classifyProject(stackInfo);
+          classification = classifyProject(detectedStackInfo!);
           projectType = classification.primaryType;
         }
       }
@@ -672,7 +745,23 @@ export const initializeContextTool = createInternalTool<
         docsGenerated = await docGenerator.generateDocumentation(
           repoStructure,
           outputDir,
-          { semantic, filteredDocs },
+          {
+            semantic,
+            filteredDocs,
+            semanticContext: semanticBundle?.context,
+            functionalPatterns: semanticBundle?.functionalPatterns,
+            stackInfo: detectedStackInfo,
+            repoFingerprint: semanticFingerprint,
+            cacheEnabled,
+            analysisBundle,
+            snapshotService,
+            onSnapshotMetrics: (metrics) => {
+              if (analysisBundle) {
+                analysisBundle.metrics.durationsMs.generation = metrics.generationMs;
+                analysisBundle.metrics.durationsMs.publication = metrics.publicationMs;
+              }
+            },
+          },
           false
         );
       }
@@ -716,7 +805,15 @@ export const initializeContextTool = createInternalTool<
         agentsGenerated = await agentGenerator.generateAgentPrompts(
           repoStructure,
           outputDir,
-          { semantic, filteredAgents, availableSkills },
+          {
+            semantic,
+            filteredAgents,
+            availableSkills,
+            semanticContext: semanticBundle?.context,
+            stackInfo: detectedStackInfo,
+            cacheEnabled,
+            analysisBundle,
+          },
           false
         );
       }
@@ -859,6 +956,14 @@ export const initializeContextTool = createInternalTool<
                 projectType: classification.primaryType,
                 confidence: classification.confidence,
                 reasoning: classification.reasoning,
+              }
+            : undefined,
+          analysis: analysisBundle
+            ? {
+                limits: analysisBundle.limits,
+                partial: analysisBundle.partial,
+                skipped: analysisBundle.skipped,
+                metrics: analysisBundle.metrics,
               }
             : undefined,
         },
@@ -1158,7 +1263,7 @@ export const getCodebaseMapTool = createInternalTool<
 
     const section = input.section || 'all';
     try {
-      const snapshotService = new SemanticSnapshotService();
+      const snapshotService = createContextSnapshotService();
       const result = await snapshotService.ensureFreshSection(input.repoPath, section as any);
       return {
         success: true,

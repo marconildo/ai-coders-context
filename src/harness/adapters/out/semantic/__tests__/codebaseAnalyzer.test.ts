@@ -2,8 +2,10 @@ import * as os from 'os';
 import * as path from 'path';
 import * as fs from 'fs-extra';
 
-import { CodebaseAnalyzer } from '../codebaseAnalyzer';
+import { CodebaseAnalyzer, MAX_FILE_ANALYSIS_CONCURRENCY } from '../codebaseAnalyzer';
 import type { SemanticContext, FileAnalysis, ExtractedSymbol } from '../types';
+
+jest.mock('glob', () => ({ glob: jest.fn() }));
 
 // Mock TreeSitterLayer
 jest.mock('../treeSitter/treeSitterLayer', () => ({
@@ -59,22 +61,6 @@ jest.mock('../lsp/lspLayer', () => ({
   })),
 }));
 
-// Mock glob
-jest.mock('glob', () => ({
-  glob: jest.fn().mockImplementation(async (pattern: string, options: { cwd: string }) => {
-    // Return mock files based on the pattern
-    if (pattern.includes('.ts')) {
-      return [
-        path.join(options.cwd, 'src', 'services', 'userService.ts'),
-        path.join(options.cwd, 'src', 'controllers', 'userController.ts'),
-        path.join(options.cwd, 'src', 'models', 'user.ts'),
-        path.join(options.cwd, 'src', 'utils', 'helper.ts'),
-      ];
-    }
-    return [];
-  }),
-}));
-
 function createTempOutput(prefix: string): Promise<string> {
   return fs.mkdtemp(path.join(os.tmpdir(), prefix));
 }
@@ -84,6 +70,18 @@ describe('CodebaseAnalyzer', () => {
 
   beforeEach(async () => {
     tempDir = await createTempOutput('dotcontext-analyzer-');
+    await Promise.all([
+      'src/services/userService.ts',
+      'src/controllers/userController.ts',
+      'src/models/user.ts',
+      'src/utils/helper.ts',
+      'src/index.ts',
+      'src/main.ts',
+    ].map(async (relativePath) => {
+      const filePath = path.join(tempDir, relativePath);
+      await fs.ensureDir(path.dirname(filePath));
+      await fs.writeFile(filePath, 'export const fixture = true;\n');
+    }));
     jest.clearAllMocks();
   });
 
@@ -121,6 +119,164 @@ describe('CodebaseAnalyzer', () => {
   });
 
   describe('analyze', () => {
+    it('builds semantic context and functional patterns from one file-analysis pass', async () => {
+      const analyzer = new CodebaseAnalyzer({ useLSP: false });
+      const internal = analyzer as unknown as {
+        findCodeFiles(projectPath: string): Promise<string[]>;
+        analyzeFiles(files: string[]): Promise<Map<string, FileAnalysis>>;
+      };
+      const findSpy = jest.spyOn(internal, 'findCodeFiles');
+      const analyzeSpy = jest.spyOn(internal, 'analyzeFiles');
+
+      const bundle = await analyzer.analyzeBundle(tempDir);
+
+      expect(findSpy).toHaveBeenCalledTimes(1);
+      expect(analyzeSpy).toHaveBeenCalledTimes(1);
+      expect(bundle.context.stats.totalFiles).toBeGreaterThan(0);
+      expect(bundle.functionalPatterns).toEqual(expect.objectContaining({
+        patterns: expect.any(Array),
+      }));
+      expect(bundle.files).toHaveLength(bundle.context.stats.totalFiles);
+      expect(bundle.metrics.filesParsed).toBe(bundle.files.length);
+      expect(bundle.metrics.bytesRead).toBeGreaterThan(0);
+      expect(bundle.partial).toBe(false);
+    });
+
+    it('uses the documented default analysis limits', async () => {
+      const bundle = await new CodebaseAnalyzer().analyzeBundle(tempDir);
+
+      expect(bundle.limits).toEqual({
+        maxFiles: 5000,
+        maxTotalBytes: 256 * 1024 * 1024,
+        maxFileBytes: 2 * 1024 * 1024,
+        maxDirectoriesScanned: 10_000,
+        maxEntriesScanned: 100_000,
+        concurrency: 16,
+      });
+    });
+
+    it('absolute-clamps configurable repository scan limits', async () => {
+      const bundle = await new CodebaseAnalyzer({
+        maxDirectoriesScanned: Number.MAX_SAFE_INTEGER,
+        maxEntriesScanned: Number.MAX_SAFE_INTEGER,
+      }).analyzeBundle(tempDir);
+
+      expect(bundle.limits.maxDirectoriesScanned).toBe(50_000);
+      expect(bundle.limits.maxEntriesScanned).toBe(500_000);
+      expect(bundle.metrics.directoriesScanned).toBeGreaterThan(0);
+      expect(bundle.metrics.entriesScanned).toBeGreaterThan(0);
+    });
+
+    it('normalizes invalid concurrency and absolute-clamps extreme direct API values', async () => {
+      const source = path.join(tempDir, 'src', 'index.ts');
+      const cases: Array<{ concurrency: number; expected: number }> = [
+        { concurrency: Number.NaN, expected: 16 },
+        { concurrency: Number.POSITIVE_INFINITY, expected: 16 },
+        { concurrency: 0, expected: 1 },
+        { concurrency: 3.9, expected: 3 },
+        { concurrency: Number.MAX_SAFE_INTEGER, expected: MAX_FILE_ANALYSIS_CONCURRENCY },
+      ];
+
+      for (const testCase of cases) {
+        const bundle = await new CodebaseAnalyzer({ concurrency: testCase.concurrency })
+          .analyzeBundle(tempDir, [source]);
+        expect(bundle.limits.concurrency).toBe(testCase.expected);
+        expect(bundle.metrics.filesParsed).toBe(1);
+        expect(bundle.metrics.maxInFlight).toBeLessThanOrEqual(testCase.expected);
+      }
+    });
+
+    it('bounds a 3000-file-equivalent analysis and reports maximum in-flight work', async () => {
+      const files = Array.from({ length: 3000 }, (_, index) =>
+        path.join(tempDir, 'scale', `file-${index}.ts`)
+      );
+      await fs.ensureDir(path.join(tempDir, 'scale'));
+      for (let index = 0; index < files.length; index += 100) {
+        await Promise.all(files.slice(index, index + 100).map((file) =>
+          fs.writeFile(file, 'export const value = true;\n')
+        ));
+      }
+
+      const { TreeSitterLayer } = require('../treeSitter/treeSitterLayer');
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const analyzeFile = jest.fn().mockImplementation(async (filePath: string): Promise<FileAnalysis> => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await Promise.resolve();
+        inFlight -= 1;
+        return { filePath, language: 'typescript', symbols: [], imports: [], exports: [] };
+      });
+      TreeSitterLayer.mockImplementationOnce(() => ({ analyzeFile, clearCache: jest.fn() }));
+
+      const bundle = await new CodebaseAnalyzer({ concurrency: 16 }).analyzeBundle(tempDir, files);
+
+      expect(bundle.metrics.filesDiscovered).toBe(3000);
+      expect(bundle.metrics.filesParsed).toBe(3000);
+      expect(bundle.metrics.fileReads).toBe(3000);
+      expect(analyzeFile).toHaveBeenCalledTimes(3000);
+      expect(bundle.metrics.maxInFlight).toBeLessThanOrEqual(16);
+      expect(maxInFlight).toBeLessThanOrEqual(16);
+      expect(bundle.metrics.bytesRead).toBeLessThanOrEqual(bundle.limits.maxTotalBytes);
+    }, 20_000);
+
+    it('skips oversized files and reports partial analysis without parsing them', async () => {
+      const small = path.join(tempDir, 'small.ts');
+      const oversized = path.join(tempDir, 'oversized.ts');
+      await fs.writeFile(small, 'ok');
+      await fs.writeFile(oversized, '0123456789');
+      const { TreeSitterLayer } = require('../treeSitter/treeSitterLayer');
+      const analyzeFile = jest.fn().mockImplementation(async (filePath: string): Promise<FileAnalysis> =>
+        ({ filePath, language: 'typescript', symbols: [], imports: [], exports: [] }));
+      TreeSitterLayer.mockImplementationOnce(() => ({ analyzeFile, clearCache: jest.fn() }));
+
+      const bundle = await new CodebaseAnalyzer({ maxFileBytes: 5 }).analyzeBundle(
+        tempDir,
+        [small, oversized]
+      );
+
+      expect(bundle.partial).toBe(true);
+      expect(bundle.skipped).toContainEqual({
+        file: oversized,
+        reason: 'file-too-large',
+        size: 10,
+      });
+      expect(analyzeFile).toHaveBeenCalledTimes(1);
+      expect(analyzeFile).toHaveBeenCalledWith(small);
+    });
+
+    it('honors aggregate byte and file budgets', async () => {
+      const files = await Promise.all([0, 1, 2].map(async (index) => {
+        const file = path.join(tempDir, `budget-${index}.ts`);
+        await fs.writeFile(file, '1234');
+        return file;
+      }));
+
+      const bundle = await new CodebaseAnalyzer({
+        maxFiles: 2,
+        maxTotalBytes: 6,
+      }).analyzeBundle(tempDir, files);
+
+      expect(bundle.metrics.filesParsed).toBe(1);
+      expect(bundle.metrics.bytesRead).toBe(4);
+      expect(bundle.partial).toBe(true);
+      expect(bundle.skipped.map((item) => item.reason)).toEqual([
+        'total-byte-limit',
+        'total-byte-limit',
+      ]);
+    });
+
+    it('does not retain parser cache state when cacheEnabled is false', async () => {
+      const { TreeSitterLayer } = require('../treeSitter/treeSitterLayer');
+      const analyzer = new CodebaseAnalyzer({ cacheEnabled: false });
+      const layer = TreeSitterLayer.mock.results.at(-1).value;
+
+      await analyzer.analyzeBundle(tempDir);
+      await analyzer.shutdown();
+
+      expect(layer.clearCache).toHaveBeenCalledTimes(3);
+    });
+
     it('should analyze files with Tree-sitter by default', async () => {
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
 
@@ -193,19 +349,6 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should find entry points based on file names', async () => {
-      // Override glob to return an entry point file
-      const { glob } = require('glob');
-      glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        if (pattern.includes('.ts')) {
-          return [
-            path.join(options.cwd, 'src', 'index.ts'),
-            path.join(options.cwd, 'src', 'main.ts'),
-            path.join(options.cwd, 'src', 'services', 'userService.ts'),
-          ];
-        }
-        return [];
-      });
-
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
       const context = await analyzer.analyze(tempDir);
 
@@ -389,15 +532,35 @@ describe('CodebaseAnalyzer', () => {
   describe('options handling', () => {
     it('should respect maxFiles option', async () => {
       const { glob } = require('glob');
-      const manyFiles = Array.from({ length: 100 }, (_, i) =>
-        path.join(tempDir, `file${i}.ts`)
-      );
-      glob.mockImplementationOnce(async () => manyFiles);
+      for (let index = 0; index < 30; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'many', `file${index}.ts`), `export const v${index} = ${index};`);
+      }
 
       const analyzer = new CodebaseAnalyzer({ useLSP: false, maxFiles: 10 });
       const context = await analyzer.analyze(tempDir);
 
       expect(context.stats.totalFiles).toBeLessThanOrEqual(10);
+      expect(analyzer.discoveryMetrics()).toMatchObject({ filesSelected: 10, partial: true });
+      expect(glob).not.toHaveBeenCalled();
+    });
+
+    it('should respect the raw directory-entry scan policy before analyzing files', async () => {
+      for (let index = 0; index < 40; index += 1) {
+        await fs.outputFile(path.join(tempDir, 'irrelevant', `${index}.txt`), 'ignored');
+      }
+      const analyzer = new CodebaseAnalyzer({
+        useLSP: false,
+        maxFiles: 100,
+        maxEntriesScanned: 6,
+      });
+
+      await analyzer.analyze(tempDir);
+
+      expect(analyzer.discoveryMetrics()).toMatchObject({
+        entriesScanned: 6,
+        partial: true,
+        stopReason: 'maxEntriesScanned',
+      });
     });
 
     it('should respect languages option', async () => {
@@ -425,25 +588,15 @@ describe('CodebaseAnalyzer', () => {
     });
 
     it('should respect include patterns', async () => {
-      const { glob } = require('glob');
-      glob.mockImplementationOnce(async (pattern: string, options: { cwd: string }) => {
-        return [
-          path.join(options.cwd, 'src', 'services', 'userService.ts'),
-          path.join(options.cwd, 'src', 'controllers', 'userController.ts'),
-          path.join(options.cwd, 'tests', 'testFile.ts'),
-        ];
-      });
-
+      await fs.outputFile(path.join(tempDir, 'tests', 'testFile.ts'), 'export const testOnly = true;');
       const analyzer = new CodebaseAnalyzer({
         useLSP: false,
-        include: ['src'],
+        include: ['services'],
       });
 
       const context = await analyzer.analyze(tempDir);
 
-      // Files should be filtered to only include 'src' paths
-      // Due to mock implementation, we check it doesn't error
-      expect(context).toBeDefined();
+      expect(context.stats.totalFiles).toBe(1);
     });
   });
 });

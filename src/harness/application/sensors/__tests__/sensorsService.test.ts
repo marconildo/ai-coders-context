@@ -42,5 +42,20 @@ describe('HarnessSensorsService', () => {
     expect(storedRuns[0].sensorId).toBe('typecheck');
     expect(service.evaluateBackpressure([run]).blocked).toBe(true);
   });
-});
 
+  it('keeps paginated run history separate from the latest summary', async () => {
+    const session = await stateService.createSession({ name: 'sensor-history' });
+    let index = 0;
+    service.registerSensor({ id: 'tests', name: 'Tests', execute: () => ({ status: index++ === 0 ? 'failed' : 'passed', summary: `run-${index}` }) });
+    await service.runSensor('tests', { sessionId: session.id });
+    await service.runSensor('tests', { sessionId: session.id });
+
+    const first = await service.getSessionSensorRunPage(session.id, { limit: 1, direction: 'oldest' });
+    const second = await service.getSessionSensorRunPage(session.id, { limit: 1, direction: 'oldest', cursor: first.nextCursor });
+    expect(first.items).toHaveLength(1);
+    expect(second.items).toHaveLength(1);
+    expect(await service.getSessionSensorRuns(session.id)).toHaveLength(2);
+    expect(await service.getLatestSessionSensorRuns(session.id)).toHaveLength(1);
+    expect(await service.getSessionSensorRunCount(session.id)).toBe(2);
+  });
+});

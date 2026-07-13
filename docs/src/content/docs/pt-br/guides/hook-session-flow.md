@@ -138,7 +138,10 @@ O dispatch procura a sessão do harness vinculada a `codex-session-123` e anexa 
   "message": "Write",
   "data": {
     "tool_input": {
-      "file_path": "src/feature.ts"
+      "filePath": "src/feature.ts",
+      "contentBytes": 1840,
+      "contentHash": "sha256:...",
+      "contentOmitted": true
     }
   }
 }
@@ -170,7 +173,7 @@ Um `Bash` também vira trace:
 }
 ```
 
-O `trace.jsonl` passa a ter uma linha `tool.use` com `message: "Bash"`, o comando em `data.tool_input` e uma classificação best-effort:
+O `trace.jsonl` passa a ter uma linha `tool.use` com `message: "Bash"`, um preview limitado do comando em `data.tool_input` e uma classificação best-effort:
 
 ```json
 {
@@ -179,13 +182,17 @@ O `trace.jsonl` passa a ter uma linha `tool.use` com `message: "Bash"`, o comand
   "data": {
     "classification": "test",
     "tool_input": {
-      "command": "npm test -- --runInBand"
+      "commandBasename": "npm",
+      "commandBytes": 23,
+      "commandPreview": "npm test -- --runInBand"
     }
   }
 }
 ```
 
 Essa classificação só lê o payload recebido do host; hooks não executam comandos extras.
+
+Corpos de Write/Edit e campos sensíveis nunca entram no trace. O stdin do dispatch, os campos e os eventos serializados têm limites seguros. Quando o `trace.jsonl` ativo chega a 8 MiB, ele é movido para um segmento `trace.*.jsonl` e a escrita continua em um novo arquivo ativo.
 
 ### 4. A sessão termina sem workflow ativo
 

@@ -4,7 +4,7 @@ import * as path from 'path';
 
 import { HarnessRuntimeStateService } from '../../../harness/adapters/out/runtimeState/runtimeStateService';
 import { WorkflowService } from '../../../harness/application/workflow/workflowService';
-import { logMcpAction } from '../actionLogger';
+import { clearMcpActionSessionCache, getMcpActionSessionCacheMetrics, getMcpActionSessionCacheSize, logMcpAction } from '../actionLogger';
 
 describe('logMcpAction', () => {
   let tempDir: string;
@@ -22,6 +22,7 @@ describe('logMcpAction', () => {
   });
 
   afterEach(async () => {
+    clearMcpActionSessionCache();
     await fs.remove(tempDir);
   });
 
@@ -53,6 +54,7 @@ describe('logMcpAction', () => {
     expect((mcpTrace?.data as any).details.nested.content).toBe('[redacted]');
 
     expect(await fs.pathExists(path.join(tempDir, '.context', 'workflow', 'actions.jsonl'))).toBe(false);
+    expect(getMcpActionSessionCacheSize()).toBeLessThanOrEqual(64);
   });
 
   it('reuses the workflow harness session when one is active', async () => {
@@ -85,5 +87,48 @@ describe('logMcpAction', () => {
     const traces = await state.listTraces(after!.session.id);
     expect(traces.some((trace) => trace.event === 'mcp.tool.succeeded')).toBe(true);
     expect(await fs.pathExists(path.join(tempDir, '.context', 'workflow', 'actions.jsonl'))).toBe(false);
+  });
+
+  it('applies the repository MCP session TTL and expires without cross-repo cache keys', async () => {
+    await fs.outputJson(path.join(tempDir, '.context', 'config', 'runtime.json'), {
+      version: 1,
+      caches: { mcpSessions: { maxEntries: 1, ttlMs: 1000 } },
+    });
+    const now = jest.spyOn(Date, 'now').mockReturnValue(1_000);
+    const entry = { tool: 'context', action: 'check', status: 'success' as const };
+    await logMcpAction(tempDir, entry);
+    await logMcpAction(tempDir, entry);
+    expect(getMcpActionSessionCacheMetrics(tempDir)?.hits).toBe(1);
+    now.mockReturnValue(2_001);
+    await logMcpAction(tempDir, entry);
+    expect(getMcpActionSessionCacheMetrics(tempDir)?.evictions.expired).toBe(1);
+    expect(getMcpActionSessionCacheSize()).toBe(1);
+    now.mockRestore();
+    clearMcpActionSessionCache();
+    expect(getMcpActionSessionCacheSize()).toBe(0);
+  });
+
+  it('never reuses a terminal MCP activity session', async () => {
+    const state = new HarnessRuntimeStateService({ repoPath: tempDir });
+    const terminal = await state.createSession({
+      name: 'mcp-activity',
+      metadata: { transport: 'mcp', purpose: 'tool-audit' },
+    });
+    await state.completeSession(terminal.id);
+
+    await logMcpAction(tempDir, {
+      tool: 'context',
+      action: 'check',
+      status: 'success',
+    });
+
+    const sessions = await state.listSessions();
+    const activity = sessions.filter(session => session.name === 'mcp-activity');
+    expect(activity).toHaveLength(2);
+    expect(activity.find(session => session.id === terminal.id)?.status).toBe('completed');
+    const replacement = activity.find(session => session.id !== terminal.id);
+    expect(replacement?.status).toBe('active');
+    expect((await state.listTraces(terminal.id)).some(trace => trace.event === 'mcp.tool.succeeded')).toBe(false);
+    expect((await state.listTraces(replacement!.id)).some(trace => trace.event === 'mcp.tool.succeeded')).toBe(true);
   });
 });

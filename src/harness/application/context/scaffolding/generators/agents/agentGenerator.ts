@@ -15,6 +15,7 @@ import { PrevcPhase } from '../../../../../domain/workflow/types';
 import { getScaffoldStructure, serializeStructureAsMarkdown } from '../shared/structures';
 import { AutoFillService, AutoFillContext } from '../../../intelligence/autoFill';
 import { StackDetector, StackInfo } from '../../../intelligence/stack';
+import type { AnalysisBundle } from '../../../analysisBundle';
 
 interface AgentContext {
   topLevelDirectories: string[];
@@ -40,6 +41,12 @@ interface AgentGenerationConfig {
   autoFill?: boolean;
   /** Available skills that agents can reference */
   availableSkills?: AvailableSkill[];
+  /** Operation-scoped data supplied by context init. */
+  semanticContext?: SemanticContext;
+  stackInfo?: StackInfo;
+  cacheEnabled?: boolean;
+  /** Preferred operation-scoped input from context init. */
+  analysisBundle?: AnalysisBundle;
 }
 
 /**
@@ -116,24 +123,31 @@ export class AgentGenerator {
     await GeneratorUtils.ensureDirectoryAndLog(agentsDir, verbose, 'Generating agent scaffold in');
 
     // Perform semantic analysis if enabled
-    let semantics: SemanticContext | undefined;
-    if (normalizedConfig.semantic) {
+    let semantics = normalizedConfig.analysisBundle?.semanticContext ?? normalizedConfig.semanticContext;
+    if (normalizedConfig.semantic && !semantics) {
       GeneratorUtils.logProgress('Running semantic analysis for agents...', verbose);
-      this.analyzer = new CodebaseAnalyzer();
+      GeneratorUtils.logProgress('[metric] semantic.legacy_bundle_build=1', verbose);
+      this.analyzer = new CodebaseAnalyzer({ cacheEnabled: normalizedConfig.cacheEnabled ?? true });
       try {
-        semantics = await this.analyzer.analyze(repoStructure.rootPath);
+        semantics = (await this.analyzer.analyzeBundle(
+          repoStructure.rootPath,
+          repoStructure
+        )).context;
         GeneratorUtils.logProgress(
           `Analyzed ${semantics.stats.totalFiles} files, found ${semantics.stats.totalSymbols} symbols`,
           verbose
         );
       } catch (error) {
         GeneratorUtils.logError('Semantic analysis failed, continuing without it', error, verbose);
+      } finally {
+        await this.analyzer.shutdown();
+        this.analyzer = undefined;
       }
     }
 
     // Detect stack info for autoFill
-    let stackInfo: StackInfo | undefined;
-    if (normalizedConfig.autoFill) {
+    let stackInfo = normalizedConfig.analysisBundle?.stackInfo ?? normalizedConfig.stackInfo;
+    if (!stackInfo && normalizedConfig.autoFill) {
       try {
         const stackDetector = new StackDetector();
         stackInfo = await stackDetector.detect(repoStructure.rootPath);

@@ -4,3 +4,5 @@ export * as policies from './policies';
 export * as sensors from './sensors';
 export * as collaboration from './collaboration';
 export * as context from './context';
+export * as retention from './retention';
+export * as execution from './execution';

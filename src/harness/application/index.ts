@@ -1,6 +1,7 @@
 export * from './actions';
 export * from './hooks';
 export * from './workflow';
+export * from './retention';
 export * from './context';
 export * from './agents';
 export * from './skills';
@@ -10,6 +11,7 @@ export * from './execution';
 export * from './policies';
 export * from './replay';
 export * from './datasets';
+export * from './history';
 export * from '../adapters/out/runtimeState';
 export * from '../adapters/out/workflowState';
 export * from '../adapters/out/sensors';

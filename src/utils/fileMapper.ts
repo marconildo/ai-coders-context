@@ -1,8 +1,64 @@
 import * as fs from 'fs-extra';
+import { promises as nativeFs, type Stats } from 'fs';
 import * as path from 'path';
-import { glob } from 'glob';
-import { FileInfo, RepoStructure, TopLevelDirectoryStats } from '../types';
+import { minimatch } from 'minimatch';
+import {
+  FileInfo,
+  RepoStructure,
+  TopLevelDirectoryStats,
+  type RepoDiscoverySkip,
+} from '../types';
 import { GitIgnoreManager } from './gitignoreManager';
+
+export interface FileMappingLimits {
+  maxFiles: number;
+  maxTotalBytes: number;
+  maxFileBytes: number;
+  maxDirectoriesScanned: number;
+  maxEntriesScanned: number;
+}
+
+export const DEFAULT_FILE_MAPPING_LIMITS: FileMappingLimits = Object.freeze({
+  maxFiles: 5_000,
+  maxTotalBytes: 256 * 1024 * 1024,
+  maxFileBytes: 2 * 1024 * 1024,
+  maxDirectoriesScanned: 10_000,
+  maxEntriesScanned: 100_000,
+});
+
+/** Hard ceilings that callers cannot raise through configuration. */
+export const ABSOLUTE_FILE_MAPPING_SCAN_LIMITS = Object.freeze({
+  maxDirectoriesScanned: 50_000,
+  maxEntriesScanned: 500_000,
+});
+
+export const REPOSITORY_RELEVANT_EXTENSIONS = [
+  'ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs', 'py', 'pyw', 'pyi',
+  'go', 'json', 'yaml', 'yml', 'toml',
+] as const;
+
+export const REPOSITORY_ROOT_FILES = [
+  'package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb',
+  'tsconfig.json', 'tsconfig.build.json', 'jest.config.js', 'jest.config.ts',
+  'vitest.config.ts', 'vite.config.ts', 'webpack.config.js', 'next.config.js',
+  'next.config.ts', 'nest-cli.json', '.eslintrc', '.eslintrc.js',
+  '.eslintrc.json', '.prettierrc', '.prettierrc.json', '.nvmrc', '.node-version',
+] as const;
+
+export function isRepositoryRelevantFile(relativePath: string): boolean {
+  const normalized = relativePath.split(path.sep).join('/');
+  const basename = path.posix.basename(normalized);
+  const extension = path.posix.extname(normalized).slice(1).toLowerCase();
+  const segments = normalized.split('/');
+  if ((REPOSITORY_ROOT_FILES as readonly string[]).includes(normalized)) return true;
+  if (segments.length === 1 && /^(README|LICENSE|Dockerfile|Makefile)/i.test(basename)) return true;
+  if (segments[0] === '.github' && segments[1] === 'workflows') {
+    return extension === 'yml' || extension === 'yaml';
+  }
+  return (REPOSITORY_RELEVANT_EXTENSIONS as readonly string[]).includes(extension);
+}
+
+const MAX_RECORDED_SKIPS = 1_000;
 
 export class FileMapper {
   private excludePatterns: string[] = [
@@ -10,8 +66,11 @@ export class FileMapper {
     '**/node_modules',
     '**/node_modules/**',
     '.git/**',
+    '.git',
     'dist/**',
     'build/**',
+    '.context/**',
+    '.context',
     '*.log',
     '.env*',
     '*.tmp',
@@ -20,21 +79,41 @@ export class FileMapper {
 
   private readonly gitIgnoreManager: GitIgnoreManager;
 
-  constructor(customExcludes: string[] = []) {
-    this.excludePatterns = [...this.excludePatterns, ...customExcludes];
-    this.gitIgnoreManager = new GitIgnoreManager({ extraPatterns: customExcludes });
-  }
+  private readonly limits: FileMappingLimits;
 
-  private async loadGitignorePatterns(repoPath: string): Promise<string[]> {
-    const gitignorePath = path.join(repoPath, '.gitignore');
-    if (!await fs.pathExists(gitignorePath)) {
-      return [];
-    }
-    const content = await fs.readFile(gitignorePath, 'utf-8');
-    return content
-      .split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0 && !line.startsWith('#'));
+  constructor(
+    customExcludes: string[] = [],
+    limits: Partial<FileMappingLimits> = {}
+  ) {
+    this.excludePatterns = [...this.excludePatterns, ...customExcludes];
+    this.gitIgnoreManager = new GitIgnoreManager({ extraPatterns: this.excludePatterns });
+    this.limits = {
+      maxFiles: Math.max(0, Math.floor(limits.maxFiles ?? DEFAULT_FILE_MAPPING_LIMITS.maxFiles)),
+      maxTotalBytes: Math.max(
+        0,
+        Math.floor(limits.maxTotalBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxTotalBytes)
+      ),
+      maxFileBytes: Math.max(
+        0,
+        Math.floor(limits.maxFileBytes ?? DEFAULT_FILE_MAPPING_LIMITS.maxFileBytes)
+      ),
+      maxDirectoriesScanned: Math.min(
+        ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxDirectoriesScanned,
+        Math.max(
+          0,
+          Math.floor(
+            limits.maxDirectoriesScanned ?? DEFAULT_FILE_MAPPING_LIMITS.maxDirectoriesScanned
+          )
+        )
+      ),
+      maxEntriesScanned: Math.min(
+        ABSOLUTE_FILE_MAPPING_SCAN_LIMITS.maxEntriesScanned,
+        Math.max(
+          0,
+          Math.floor(limits.maxEntriesScanned ?? DEFAULT_FILE_MAPPING_LIMITS.maxEntriesScanned)
+        )
+      ),
+    };
   }
 
   async mapRepository(repoPath: string, includePatterns?: string[]): Promise<RepoStructure> {
@@ -44,66 +123,139 @@ export class FileMapper {
       throw new Error(`Repository path does not exist: ${absolutePath}`);
     }
 
-    const gitignorePatterns = await this.loadGitignorePatterns(absolutePath);
-    const ignorePatterns = [...this.excludePatterns, ...gitignorePatterns];
-
-    const patterns = includePatterns || ['**/*'];
-    const allFiles: string[] = [];
-
-    for (const pattern of patterns) {
-      const files = await glob(pattern, {
-        cwd: absolutePath,
-        ignore: ignorePatterns,
-        dot: false,
-        absolute: false
-      });
-      allFiles.push(...files);
-    }
-
-    // Apply .gitignore filtering on top of glob excludes
-    const filteredFiles = this.gitIgnoreManager.filterPaths(allFiles);
-
-    const uniqueFiles = [...new Set(filteredFiles)];
+    await this.gitIgnoreManager.loadFromRepo(absolutePath);
+    const usesDefaultPatterns = !includePatterns?.length;
+    const patterns = includePatterns ?? [];
     const fileInfos: FileInfo[] = [];
-    const directories: FileInfo[] = [];
+    const skipped: RepoDiscoverySkip[] = [];
     let totalSize = 0;
+    let entriesScanned = 0;
+    let directoriesScanned = 0;
+    let entriesVisited = 0;
+    let statCalls = 0;
+    let stoppedEarly = false;
     const topLevelStats = new Map<string, { fileCount: number; totalSize: number }>();
-    const concurrency = 32;
+    const directoryQueue = [''];
+    let nextDirectory = 0;
 
-    for (let index = 0; index < uniqueFiles.length; index += concurrency) {
-      const slice = uniqueFiles.slice(index, index + concurrency);
-      await Promise.all(
-        slice.map(async relativePath => {
+    discovery: while (nextDirectory < directoryQueue.length) {
+      const relativeDirectory = directoryQueue[nextDirectory];
+      if (directoriesScanned >= this.limits.maxDirectoriesScanned) {
+        this.recordSkip(skipped, {
+          file: path.join(absolutePath, relativeDirectory),
+          reason: 'directory-limit',
+        });
+        stoppedEarly = true;
+        break;
+      }
+      nextDirectory += 1;
+      directoriesScanned += 1;
+
+      let directory;
+      try {
+        directory = await nativeFs.opendir(path.join(absolutePath, relativeDirectory));
+      } catch {
+        this.recordSkip(skipped, {
+          file: path.join(absolutePath, relativeDirectory),
+          reason: 'stat-failed',
+        });
+        continue;
+      }
+
+      try {
+        while (true) {
+          if (entriesScanned >= this.limits.maxEntriesScanned) {
+            this.recordSkip(skipped, {
+              file: path.join(absolutePath, relativeDirectory),
+              reason: 'entry-limit',
+            });
+            stoppedEarly = true;
+            break discovery;
+          }
+          const entry = await directory.read();
+          if (!entry) break;
+          entriesScanned += 1;
+
+          const relativePath = path.posix.join(
+            relativeDirectory.split(path.sep).join('/'),
+            entry.name
+          );
+          if (this.isIgnored(relativePath, entry.isDirectory())) continue;
+
+          if (entry.isDirectory()) {
+            directoryQueue.push(relativePath);
+            continue;
+          }
+          if (!entry.isFile()) continue;
+          if (usesDefaultPatterns
+            ? !isRepositoryRelevantFile(relativePath)
+            : !patterns.some((pattern) => minimatch(relativePath, pattern, { dot: true }))) {
+            continue;
+          }
+
+          entriesVisited += 1;
+          if (entriesVisited > this.limits.maxFiles) {
+            this.recordSkip(skipped, {
+              file: path.join(absolutePath, relativePath),
+              reason: 'file-limit',
+            });
+            stoppedEarly = true;
+            break discovery;
+          }
+
           const fullPath = path.join(absolutePath, relativePath);
-          const stats = await fs.stat(fullPath);
-          const info: FileInfo = {
+          let stats: Stats;
+          try {
+            statCalls += 1;
+            stats = await nativeFs.stat(fullPath);
+          } catch {
+            this.recordSkip(skipped, { file: fullPath, reason: 'stat-failed' });
+            continue;
+          }
+          if (!stats.isFile()) continue;
+
+          const skipMetadata = {
+            file: fullPath,
+            size: stats.size,
+            mtimeMs: stats.mtimeMs,
+            ctimeMs: stats.ctimeMs,
+          };
+          if (stats.size > this.limits.maxFileBytes) {
+            this.recordSkip(skipped, { ...skipMetadata, reason: 'file-too-large' });
+            continue;
+          }
+          if (totalSize + stats.size > this.limits.maxTotalBytes) {
+            this.recordSkip(skipped, { ...skipMetadata, reason: 'total-byte-limit' });
+            stoppedEarly = true;
+            break discovery;
+          }
+
+          fileInfos.push({
             path: fullPath,
             relativePath,
             extension: path.extname(relativePath),
             size: stats.size,
-            type: stats.isDirectory() ? 'directory' : 'file'
-          };
+            mtimeMs: stats.mtimeMs,
+            ctimeMs: stats.ctimeMs,
+            type: 'file',
+          });
+          totalSize += stats.size;
 
           const topLevelSegment = this.extractTopLevelSegment(relativePath);
           if (topLevelSegment) {
             const current = topLevelStats.get(topLevelSegment) ?? { fileCount: 0, totalSize: 0 };
-            if (!stats.isDirectory()) {
-              current.fileCount += 1;
-              current.totalSize += stats.size;
-            }
+            current.fileCount += 1;
+            current.totalSize += stats.size;
             topLevelStats.set(topLevelSegment, current);
           }
-
-          if (stats.isDirectory()) {
-            directories.push(info);
-          } else {
-            fileInfos.push(info);
-            totalSize += stats.size;
-          }
-
-        })
-      );
+        }
+      } finally {
+        await directory.close().catch(() => undefined);
+      }
     }
+
+    fileInfos.sort((left, right) => left.relativePath.localeCompare(right.relativePath));
+    const directories = this.deriveDirectories(absolutePath, fileInfos);
 
     const topLevelDirectoryStats: TopLevelDirectoryStats[] = Array.from(topLevelStats.entries())
       .map(([name, stats]) => ({ name, fileCount: stats.fileCount, totalSize: stats.totalSize }))
@@ -115,8 +267,46 @@ export class FileMapper {
       directories,
       totalFiles: fileInfos.length,
       totalSize,
-      topLevelDirectoryStats
+      topLevelDirectoryStats,
+      partial: skipped.length > 0 || stoppedEarly,
+      skipped,
+      discoveryMetrics: {
+        entriesScanned,
+        directoriesScanned,
+        entriesVisited,
+        statCalls,
+        stoppedEarly,
+      },
     };
+  }
+
+  private isIgnored(relativePath: string, isDirectory: boolean): boolean {
+    return this.gitIgnoreManager.shouldIgnore(relativePath) ||
+      (isDirectory && this.gitIgnoreManager.shouldIgnore(`${relativePath}/`));
+  }
+
+  private recordSkip(skipped: RepoDiscoverySkip[], skip: RepoDiscoverySkip): void {
+    if (skipped.length < MAX_RECORDED_SKIPS) skipped.push(skip);
+  }
+
+  private deriveDirectories(repoPath: string, files: FileInfo[]): FileInfo[] {
+    const relativeDirectories = new Set<string>();
+    for (const file of files) {
+      let directory = path.posix.dirname(file.relativePath);
+      while (directory !== '.') {
+        relativeDirectories.add(directory);
+        directory = path.posix.dirname(directory);
+      }
+    }
+    return [...relativeDirectories]
+      .sort()
+      .map((relativePath) => ({
+        path: path.join(repoPath, relativePath),
+        relativePath,
+        extension: '',
+        size: 0,
+        type: 'directory' as const,
+      }));
   }
 
   async readFileContent(filePath: string): Promise<string> {

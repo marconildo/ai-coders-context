@@ -6,6 +6,7 @@ import { WorkflowService } from '../../workflow';
 import {
   buildHookReadinessSummary,
   buildHookTraceData,
+  DEFAULT_HOOK_TRACE_POLICY,
   consumeWorkflowMissingReminder,
   formatHookReadinessAdditionalContext,
   getHookReadinessSummary,
@@ -185,6 +186,18 @@ describe('hook readiness runtime helpers', () => {
     expect(buildHookTraceData('Bash', { command: 'git diff -- src' }))
       .toMatchObject({ classification: 'inspection' });
     expect(buildHookTraceData('Write', { file_path: 'README.md' }))
-      .toEqual({ tool_input: { file_path: 'README.md' } });
+      .toMatchObject({ tool_input: { filePath: 'README.md' } });
+
+    const bounded = buildHookTraceData('Bash', {
+      command: `npm test ${'large-argument '.repeat(10_000)}`,
+    }, {
+      policy: {
+        ...DEFAULT_HOOK_TRACE_POLICY,
+        maxStringBytes: 4096,
+        maxSerializedTraceBytes: 1024,
+      },
+    });
+    expect(bounded).toMatchObject({ classification: 'test' });
+    expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(1024);
   });
 });

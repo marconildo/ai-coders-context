@@ -41,15 +41,18 @@ Each session owns a folder under `.context/runtime/sessions/<sessionId>/`:
         └── <sessionId>/
             ├── session.json       # the session record
             ├── trace.jsonl        # append-only event log (one JSON per line)
-            └── artifacts/
-                └── <artifactId>.json
+            ├── artifacts/
+            │   └── <artifactId>.json
+            └── checkpoints/
+                └── <checkpointId>.json
 ```
 
 | Path | What it holds |
 | --- | --- |
-| `.context/runtime/sessions/<id>/session.json` | The session record — status, timestamps, activity counters, and inline checkpoints |
+| `.context/runtime/sessions/<id>/session.json` | The bounded session summary — status, timestamps, counters, and latest checkpoint identity |
 | `.context/runtime/sessions/<id>/trace.jsonl` | Append-only event log, one JSON object per line |
 | `.context/runtime/sessions/<id>/artifacts/<artifactId>.json` | One file per recorded artifact |
+| `.context/runtime/sessions/<id>/checkpoints/<checkpointId>.json` | One bounded record per checkpoint |
 
 ::: caution
 Everything under `.context/runtime/` is regenerated as needed and is gitignored. Don't hand-edit these files — go through the harness so counters and the trace stay consistent.
@@ -77,7 +80,7 @@ The session record is stored at `.context/runtime/sessions/<id>/session.json`:
   "checkpointCount": 1,
   "lastTraceAt": "2026-06-05T...",
   "lastCheckpointAt": "2026-06-05T...",
-  "checkpoints": [],
+  "lastCheckpointId": "ckpt_...",
   "metadata": {}
 }
 ```
@@ -120,7 +123,7 @@ Each trace entry looks like this:
 | `message` | Human-readable description |
 | `data` | Optional structured payload (sensor results, context, etc.) |
 
-Because the file is **append-only** (`.jsonl`, one JSON object per line), traces are cheap to write and never rewrite earlier entries. Use the `harness` tool's `appendTrace` action to add an event and `listTraces` to read the timeline.
+Because the file is **append-only** (`.jsonl`, one JSON object per line), traces are cheap to write and never rewrite earlier entries. The harness reads legacy and rotated segments incrementally. `listTraces` returns a bounded page (100 records by default, 1,000 maximum) with an opaque `nextCursor`, `hasMore`, scan-byte, malformed-line, and duration metadata. Pages also have a 1 MiB aggregate UTF-8 budget by default (16 MiB absolute maximum) and stop before materializing the next over-budget item. `returnedBytes`, `byteBudget`, `byteLimited`, and `oversizedRecordsSkipped` make that behavior explicit. A single valid record that cannot fit is skipped with metadata so cursor continuation cannot loop forever. Filters support `event`, `level`, `createdAfter`, and `createdBefore`; point reads remain available through their resource-specific actions.
 
 ::: note
 Trace `event` values like `sensor.run` are how the harness records [sensor](/concepts/sensors/) results into a session. That's what later lets task contracts check whether required sensors passed, and lets [failure datasets](/concepts/replay-and-datasets/) cluster error-level events.
@@ -157,7 +160,9 @@ Add artifacts with the `harness` tool's `addArtifact` action and read them with 
 
 A **checkpoint** is a named waypoint within a session. It bundles a set of artifacts and optional state so you have a meaningful, recoverable point to return to — useful between PREVC phases, before a risky step, or whenever you want a labeled snapshot.
 
-Checkpoints are stored **inline** in the session record's `checkpoints` array (not as separate files):
+Checkpoints are stored as individual records under `.context/runtime/sessions/<id>/checkpoints/`. `session.json` retains only the count and latest checkpoint identity, so normal session reads and writes never load the full checkpoint history. Runtime consumers can page through records with `listCheckpointsPage`; the complete `listCheckpoints` helper remains available for explicit replay-style operations. Legacy inline checkpoints remain readable and migrate on the next checkpoint write.
+
+Each new record is constrained by `checkpoints.maxSerializedBytes`; `data`, `note`, artifact count, and each artifact ID also have independent limits. This prevents a large label or identifier from bypassing the payload budget.
 
 ```json
 {

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Share Semantic Analysis"
+  short_description: "Avoid duplicate repository analysis work"
+  default_prompt: "Use $share-semantic-analysis to consolidate codebase scans, fingerprints, and semantic analysis."

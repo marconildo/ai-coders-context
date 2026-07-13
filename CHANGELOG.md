@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bounded semantic, file-analysis, MCP-session, and host-session retention with TTL/LRU limits, proactive cleanup, raw directory-entry scan budgets, and safe runtime configuration clamps.
+- Moved checkpoint payload history from `session.json` into individually bounded, paginated checkpoint records with summary-only session reads, incremental counts, legacy dual-read, and lazy migration.
+- Made host-session binding mutations atomic across concurrent hooks, with owner-identified inter-process locks that safely recover after a crashed hook, preserve live legacy locks during rolling upgrades, and prevent terminal MCP activity sessions from being reused.
+
+### Added
+
+- Added bounded MCP input schemas, cursor pagination for every growing harness list, compact payload budgets, and content-free `_meta.dotcontext` response metrics.
+- Added configurable, globally clamped hook stdin, field, event, rotation, segment-retention, and per-session trace limits.
+- Added opaque cursor pages for sessions, traces, artifacts, replay summaries, and dataset summaries, including bounded defaults, query-bound cursors, and scan metadata.
+- Added latest-sensor summary indexes, bounded dataset concurrency/failure retention, and dry-run runtime pruning with active workflow protection.
+- Added paginated sensor-run history alongside sharded, byte-capped latest-sensor summaries, plus small replay/dataset retention sidecars.
+
+### Fixed
+
+- Removed MCP response-body reparsing from action logging and replaced oversized response truncation risk with typed smaller-page or artifact-reference responses.
+- Applied the same bounded UTF-8 budget to every MCP resource, rejected oversized files before reading their bodies, enforced action-specific list maxima, and paginated `explore` file listings.
+- Bounded `explore` reads before file materialization and replaced whole-glob/whole-file code search with byte-capped streaming discovery, search, and cursor pages.
+- Bounded `explore.list` traversal even when callers disable default ignores, and isolated caller regex evaluation in a worker with a hard CPU deadline.
+- Prevented Claude Code, Codex, and Pi Write/Edit hooks from retaining source bodies or sensitive fields by persisting bounded metadata summaries instead.
+- Redacted Bash credentials across header, JSON, assignment, camel-case, and flag forms, omitting ambiguous command tails rather than risking secret disclosure.
+- Kept oversized hook stdin non-blocking without concatenating or echoing rejected input, while recording a bounded failure diagnostic.
+- Added a generic serialized trace-event guard and atomic per-session trace rotation with chronological legacy-compatible reads.
+- Made stale trace-lock takeover verify process ownership, token, device, and inode across competing processes, recover both current and legacy orphaned takeover elections after a reaper crash, and preserve live or replaced owners; same-millisecond rotations now use a monotonic segment sequence.
+- Kept the active rotation threshold and individual events within the configured per-session trace quota, including contradictory configurations and a single oversized event.
+- Replaced whole-file trace reads and post-materialization replay limits with rotation-aware streaming and source-level event bounds.
+- Added aggregate UTF-8 page budgets to runtime history so large valid records cannot multiply count limits into unbounded materialization.
+- Made replay use one count/byte budget and one continuation cursor across every source, without persisting duplicate source arrays; datasets now enforce per-failure, aggregate, and on-disk byte limits.
+- Made retention inspect bounded metadata prefixes and include young terminal sessions when enforcing the repository runtime quota.
+
 ## [1.1.1] - 2026-06-27
 
 ### Fixed

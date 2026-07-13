@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bound Subprocess Output"
+  short_description: "Prevent unbounded child-process output"
+  default_prompt: "Use $bound-subprocess-output to implement or review bounded stdout and stderr capture."
