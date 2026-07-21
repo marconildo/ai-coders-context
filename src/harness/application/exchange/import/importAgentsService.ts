@@ -16,13 +16,11 @@ import { AgentsDetector } from './agentsDetector';
 export class ImportAgentsService {
   private readonly ui: CLIInterface;
   private readonly t: TranslateFn;
-  private readonly version: string;
   private readonly detector: AgentsDetector;
 
   constructor(dependencies: ImportServiceDependencies) {
     this.ui = dependencies.ui;
     this.t = dependencies.t;
-    this.version = dependencies.version;
     this.detector = new AgentsDetector();
   }
 

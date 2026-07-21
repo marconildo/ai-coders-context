@@ -7,7 +7,7 @@ import {
   GuideMeta,
   renderIndex,
 } from './templates';
-import { getGuidesByKeys, DOCUMENT_GUIDES } from './guideRegistry';
+import { getGuidesByKeys } from './guideRegistry';
 import {
   CodebaseAnalyzer,
   SemanticContext,
@@ -20,7 +20,7 @@ import {
   serializeFrontmatter,
   DocScaffoldFrontmatter,
 } from '../../../../../../types/scaffoldFrontmatter';
-import { getScaffoldStructure, ScaffoldStructure, serializeStructureAsMarkdown } from '../shared/structures';
+import { getScaffoldStructure, serializeStructureAsMarkdown } from '../shared/structures';
 import { AutoFillService, AutoFillContext } from '../../../intelligence/autoFill';
 import type { AnalysisBundle } from '../../../analysisBundle';
 

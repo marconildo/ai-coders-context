@@ -3,7 +3,7 @@ import * as path from 'path';
 import * as fs from 'fs-extra';
 
 import { CodebaseAnalyzer, MAX_FILE_ANALYSIS_CONCURRENCY } from '../codebaseAnalyzer';
-import type { SemanticContext, FileAnalysis, ExtractedSymbol } from '../types';
+import type { FileAnalysis, ExtractedSymbol } from '../types';
 
 jest.mock('glob', () => ({ glob: jest.fn() }));
 
@@ -368,7 +368,7 @@ describe('CodebaseAnalyzer', () => {
     it('should add type info to exported symbols when LSP is enabled', async () => {
       const analyzer = new CodebaseAnalyzer({ useLSP: true });
 
-      const context = await analyzer.analyze(tempDir);
+      await analyzer.analyze(tempDir);
 
       // LSP enhancement should have been called for exported symbols
       expect(mockGetTypeInfo).toHaveBeenCalled();
@@ -460,7 +460,7 @@ describe('CodebaseAnalyzer', () => {
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
       const context = await analyzer.analyze(tempDir);
 
-      const summary = analyzer.getSummary(context, tempDir);
+      const summary = analyzer.getSummary(context);
 
       expect(summary).toContain('## Codebase Analysis Summary');
       expect(summary).toContain('**Total Files**:');
@@ -472,7 +472,7 @@ describe('CodebaseAnalyzer', () => {
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
       const context = await analyzer.analyze(tempDir);
 
-      const summary = analyzer.getSummary(context, tempDir);
+      const summary = analyzer.getSummary(context);
 
       expect(summary).toContain('### Architecture Layers');
     });
@@ -501,7 +501,7 @@ describe('CodebaseAnalyzer', () => {
       const analyzer = new CodebaseAnalyzer({ useLSP: false });
       const context = await analyzer.analyze(tempDir);
 
-      const summary = analyzer.getSummary(context, tempDir);
+      const summary = analyzer.getSummary(context);
 
       expect(summary).toContain('### Detected Patterns');
     });

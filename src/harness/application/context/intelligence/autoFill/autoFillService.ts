@@ -18,11 +18,6 @@ export interface AutoFillContext {
   topLevelDirectories?: string[];
 }
 
-interface DirectoryStat {
-  name: string;
-  fileCount: number;
-}
-
 const SEMANTIC_SNAPSHOT_REFERENCE =
   'Use `context({ action: "getMap", section: "all" })` to inspect the generated semantic snapshot for stack, architecture, key files, and dependency hotspots.';
 
@@ -119,7 +114,7 @@ export class AutoFillService {
     agentType: string,
     ctx: AutoFillContext
   ): string {
-    const { semantics, stackInfo } = ctx;
+    const { stackInfo } = ctx;
 
     // Fill "Key Files" section
     if (section.heading.toLowerCase().includes('key files') || section.heading.toLowerCase().includes('relevant files')) {
@@ -145,7 +140,7 @@ export class AutoFillService {
   // ===== Project Overview Sections =====
 
   private fillProjectOverviewSection(section: ScaffoldSection, ctx: AutoFillContext): string {
-    const { semantics, stackInfo, repoPath, topLevelDirectories } = ctx;
+    const { semantics, stackInfo, topLevelDirectories } = ctx;
 
     switch (section.heading) {
       case 'Project Overview':

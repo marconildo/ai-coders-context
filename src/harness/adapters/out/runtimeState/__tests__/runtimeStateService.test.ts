@@ -177,7 +177,7 @@ describe('HarnessRuntimeStateService', () => {
   it('lists sessions sorted by recency', async () => {
     const first = await service.createSession({ name: 'first' });
     await service.completeSession(first.id);
-    const second = await service.createSession({ name: 'second' });
+    await service.createSession({ name: 'second' });
 
     const sessions = await service.listSessions();
     expect(sessions.map((item) => item.name)).toEqual(['second', 'first']);

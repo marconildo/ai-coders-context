@@ -84,7 +84,7 @@ class MetricsStore {
   }
 
   getSummary(): MetricsSummary {
-    const { contextQueries, fileReads, tokensEstimate } = this.metrics;
+    const { contextQueries, fileReads } = this.metrics;
 
     // Calculate ratio (higher is better - more context queries, fewer file reads)
     const ratio = fileReads > 0 ? contextQueries / fileReads : contextQueries > 0 ? Infinity : 0;

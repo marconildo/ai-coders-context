@@ -17,13 +17,11 @@ import { RulesDetector } from './rulesDetector';
 export class ImportRulesService {
   private readonly ui: CLIInterface;
   private readonly t: TranslateFn;
-  private readonly version: string;
   private readonly detector: RulesDetector;
 
   constructor(dependencies: ImportServiceDependencies) {
     this.ui = dependencies.ui;
     this.t = dependencies.t;
-    this.version = dependencies.version;
     this.detector = new RulesDetector();
   }
 

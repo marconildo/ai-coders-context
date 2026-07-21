@@ -39,7 +39,7 @@ export class SecurityError extends Error {
 export class PathValidator {
     private readonly normalizedRoot: string;
 
-    constructor(private readonly workspaceRoot: string) {
+    constructor(workspaceRoot: string) {
         this.normalizedRoot = path.resolve(workspaceRoot);
     }
 

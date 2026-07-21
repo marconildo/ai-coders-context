@@ -22,11 +22,9 @@ import {
   ArchitectureLayer,
   DetectedPattern,
   AnalyzerOptions,
-  DependencyInfo,
   DEFAULT_EXCLUDE_PATTERNS,
   LANGUAGE_EXTENSIONS,
   FunctionalPattern,
-  FunctionalPatternType,
   DetectedFunctionalPatterns,
   PatternIndicator,
   FlowNode,
@@ -253,7 +251,7 @@ export class CodebaseAnalyzer {
     metrics.durationsMs.parsing = Date.now() - parsingStartedAt;
 
     // 3. Build base context
-    const context = this.buildBaseContext(fileAnalyses, projectPath);
+    const context = this.buildBaseContext(fileAnalyses);
 
     // 4. Enhance with LSP if enabled (adds type info, references)
     if (this.lspLayer) {
@@ -470,10 +468,7 @@ export class CodebaseAnalyzer {
     return analyses;
   }
 
-  private buildBaseContext(
-    analyses: Map<string, FileAnalysis>,
-    projectPath: string
-  ): SemanticContext {
+  private buildBaseContext(analyses: Map<string, FileAnalysis>): SemanticContext {
     const symbols = {
       classes: [] as ExtractedSymbol[],
       interfaces: [] as ExtractedSymbol[],
@@ -514,7 +509,7 @@ export class CodebaseAnalyzer {
 
       // Build dependency graph
       const importedFiles = analysis.imports
-        .map((imp) => this.resolveImportPath(file, imp.source, projectPath))
+        .map((imp) => this.resolveImportPath(file, imp.source))
         .filter((f): f is string => f !== null);
 
       dependencyGraph.set(file, importedFiles);
@@ -550,8 +545,7 @@ export class CodebaseAnalyzer {
 
   private resolveImportPath(
     fromFile: string,
-    importSource: string,
-    projectPath: string
+    importSource: string
   ): string | null {
     // Skip external packages
     if (!importSource.startsWith('.') && !importSource.startsWith('/')) {
@@ -865,7 +859,7 @@ export class CodebaseAnalyzer {
         if (!analysis) continue;
 
         for (const imp of analysis.imports) {
-          const resolved = this.resolveImportPath(file, imp.source, projectPath);
+          const resolved = this.resolveImportPath(file, imp.source);
           if (resolved) {
             const depLayer = fileToLayer.get(resolved);
             if (depLayer && depLayer !== layer.name) {
@@ -882,8 +876,8 @@ export class CodebaseAnalyzer {
   /**
    * Get a summary suitable for documentation generation
    */
-  getSummary(context: SemanticContext, projectPath: string): string {
-    const { symbols, architecture, stats } = context;
+  getSummary(context: SemanticContext): string {
+    const { architecture, stats } = context;
 
     const lines: string[] = [
       `## Codebase Analysis Summary\n`,
@@ -1069,11 +1063,11 @@ export class CodebaseAnalyzer {
     if (validationPattern) patterns.push(validationPattern);
 
     // Error handling pattern detection
-    const errorPattern = this.detectErrorHandlingPattern(allSymbols, allImports, files);
+    const errorPattern = this.detectErrorHandlingPattern(allSymbols, files);
     if (errorPattern) patterns.push(errorPattern);
 
     // Testing pattern detection
-    const testingPattern = this.detectTestingPattern(allSymbols, allImports, files);
+    const testingPattern = this.detectTestingPattern(allImports, files);
     if (testingPattern) patterns.push(testingPattern);
 
     return {
@@ -1462,7 +1456,6 @@ export class CodebaseAnalyzer {
 
   private detectErrorHandlingPattern(
     symbols: ExtractedSymbol[],
-    imports: Array<{ source: string; specifiers: string[]; file: string }>,
     files: string[]
   ): FunctionalPattern | null {
     const indicators: PatternIndicator[] = [];
@@ -1502,7 +1495,6 @@ export class CodebaseAnalyzer {
   }
 
   private detectTestingPattern(
-    symbols: ExtractedSymbol[],
     imports: Array<{ source: string; specifiers: string[]; file: string }>,
     files: string[]
   ): FunctionalPattern | null {
@@ -1679,7 +1671,7 @@ export class CodebaseAnalyzer {
         // Check if it's an imported symbol
         for (const imp of analysis.imports) {
           if (imp.specifiers.includes(call)) {
-            const resolvedPath = this.resolveImportPath(filePath, imp.source, projectPath);
+            const resolvedPath = this.resolveImportPath(filePath, imp.source);
             if (resolvedPath) {
               const importedAnalysis = await this.treeSitter.analyzeFile(resolvedPath);
               const importedSymbol = importedAnalysis.symbols.find((s) => s.name === call);

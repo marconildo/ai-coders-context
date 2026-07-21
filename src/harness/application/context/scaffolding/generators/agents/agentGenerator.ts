@@ -3,9 +3,7 @@ import { RepoStructure } from '../../../../../../types';
 import { GeneratorUtils } from '../shared';
 import { AGENT_TYPES, AgentType } from './agentTypes';
 import { renderAgentIndex } from './templates';
-import { DOCUMENT_GUIDES } from '../documentation/guideRegistry';
-import { CodebaseAnalyzer, SemanticContext, ExtractedSymbol } from '../../../../../adapters/out/semantic';
-import { KeySymbolInfo } from './templates/types';
+import { CodebaseAnalyzer, SemanticContext } from '../../../../../adapters/out/semantic';
 import { AGENT_RESPONSIBILITIES } from './agentConfig';
 import {
   createAgentFrontmatter,
@@ -93,17 +91,6 @@ function formatAgentTitle(agentType: AgentType): string {
 }
 
 export class AgentGenerator {
-  private readonly docTouchpoints = [
-    {
-      title: 'Documentation Index',
-      path: '../docs/README.md'
-    },
-    ...DOCUMENT_GUIDES.map(guide => ({
-      title: guide.title,
-      path: `../docs/${guide.file}`
-    }))
-  ];
-
   private analyzer?: CodebaseAnalyzer;
 
   constructor(..._legacyArgs: unknown[]) {}
@@ -239,97 +226,6 @@ export class AgentGenerator {
     );
 
     return `\n## Available Skills\n\nThe following skills provide detailed procedures for specific tasks. Activate them when needed:\n\n| Skill | Description |\n|-------|-------------|\n${rows.join('\n')}\n`;
-  }
-
-  private getRelevantSymbolsForAgent(agentType: AgentType, semantics?: SemanticContext): KeySymbolInfo[] {
-    if (!semantics) return [];
-
-    const { symbols } = semantics;
-    let relevantSymbols: ExtractedSymbol[] = [];
-
-    // Filter symbols based on agent type
-    switch (agentType) {
-      case 'test-writer':
-        // Test writer needs test-related symbols
-        relevantSymbols = [
-          ...symbols.functions.filter(s => /test|spec|mock|stub/i.test(s.name)),
-          ...symbols.classes.filter(s => /test|spec/i.test(s.name)),
-        ];
-        break;
-
-      case 'code-reviewer':
-      case 'refactoring-specialist':
-        // These need main classes and interfaces
-        relevantSymbols = [
-          ...symbols.classes.filter(s => s.exported),
-          ...symbols.interfaces.filter(s => s.exported),
-        ];
-        break;
-
-      case 'documentation-writer':
-        // Documentation writer needs exported symbols
-        relevantSymbols = [
-          ...symbols.classes.filter(s => s.exported),
-          ...symbols.interfaces.filter(s => s.exported),
-          ...symbols.functions.filter(s => s.exported),
-          ...symbols.types.filter(s => s.exported),
-        ];
-        break;
-
-      case 'security-auditor':
-        // Security auditor needs auth-related symbols
-        relevantSymbols = [
-          ...symbols.functions.filter(s => /auth|security|crypt|token|password|secret/i.test(s.name)),
-          ...symbols.classes.filter(s => /auth|security|guard|policy/i.test(s.name)),
-        ];
-        break;
-
-      case 'performance-optimizer':
-        // Performance needs cache, async, and data processing symbols
-        relevantSymbols = [
-          ...symbols.functions.filter(s => /cache|async|batch|queue|pool/i.test(s.name)),
-          ...symbols.classes.filter(s => /cache|pool|buffer|queue/i.test(s.name)),
-        ];
-        break;
-
-      case 'database-specialist':
-        // Database specialist needs repository and model symbols
-        relevantSymbols = [
-          ...symbols.classes.filter(s => /repository|model|entity|schema|migration/i.test(s.name)),
-          ...symbols.interfaces.filter(s => /repository|model|entity/i.test(s.name)),
-        ];
-        break;
-
-      case 'backend-specialist':
-        // Backend needs services, controllers, handlers
-        relevantSymbols = [
-          ...symbols.classes.filter(s => /service|controller|handler|middleware/i.test(s.name)),
-        ];
-        break;
-
-      case 'frontend-specialist':
-        // Frontend needs components and hooks
-        relevantSymbols = [
-          ...symbols.functions.filter(s => /^use[A-Z]/i.test(s.name)), // hooks
-          ...symbols.classes.filter(s => /component|view|page|screen/i.test(s.name)),
-        ];
-        break;
-
-      default:
-        // Default: top exported symbols
-        relevantSymbols = [
-          ...symbols.classes.filter(s => s.exported).slice(0, 5),
-          ...symbols.interfaces.filter(s => s.exported).slice(0, 5),
-        ];
-    }
-
-    // Convert to KeySymbolInfo and limit
-    return relevantSymbols.slice(0, 15).map(s => ({
-      name: s.name,
-      kind: s.kind,
-      file: s.location.file,
-      line: s.location.line,
-    }));
   }
 
   private resolveAgentSelection(

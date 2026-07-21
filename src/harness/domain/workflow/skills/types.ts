@@ -66,6 +66,5 @@ export {
   BUILT_IN_SKILLS,
   BuiltInSkillType,
   isBuiltInSkill,
-  PREVC_SKILL_PHASES,
   SKILL_TO_PHASES,
 } from './builtInSkillCatalog';

@@ -62,13 +62,3 @@ export function getGuidesByKeys(keys?: string[]): GuideMeta[] {
   const filtered = DOCUMENT_GUIDES.filter(guide => set.has(guide.key));
   return filtered.length > 0 ? filtered : DOCUMENT_GUIDES;
 }
-
-export function getDocFilesByKeys(keys?: string[]): Set<string> | undefined {
-  if (!keys || keys.length === 0) {
-    return undefined;
-  }
-  const files = DOCUMENT_GUIDES
-    .filter(guide => keys.includes(guide.key))
-    .map(guide => guide.file);
-  return files.length ? new Set(files) : undefined;
-}

@@ -6,45 +6,30 @@
  */
 
 import * as path from 'path';
-import * as fs from 'fs-extra';
-
 import { colors, symbols, typography } from '../../../../utils/theme';
 import type { CLIInterface } from '../../../../utils/cliUI';
-import type { TranslateFn } from '../../../../utils/i18n';
 import type {
   ReverseSyncServiceDependencies,
   ReverseSyncOptions,
   ReverseSyncResult,
   ReverseSyncCommandFlags,
   ToolDetectionResult,
-  MergeStrategy,
-  ImportAction,
 } from './types';
-import type { ImportFormat } from '../import/types';
 import { ToolDetector, formatDetectionSummary } from './toolDetector';
-import { SkillsDetector } from './skillsDetector';
 import { ImportSkillsService } from './importSkillsService';
 import { ImportRulesService } from '../import/importRulesService';
 import { ImportAgentsService } from '../import/importAgentsService';
-import { getToolIdFromPath } from './presets';
-import { VERSION } from '../../../../version';
 
 export class ReverseQuickSyncService {
   private readonly ui: CLIInterface;
-  private readonly t: TranslateFn;
-  private readonly version: string;
   private readonly toolDetector: ToolDetector;
-  private readonly skillsDetector: SkillsDetector;
   private readonly importSkillsService: ImportSkillsService;
   private readonly importRulesService: ImportRulesService;
   private readonly importAgentsService: ImportAgentsService;
 
   constructor(deps: ReverseSyncServiceDependencies) {
     this.ui = deps.ui;
-    this.t = deps.t;
-    this.version = deps.version;
     this.toolDetector = new ToolDetector();
-    this.skillsDetector = new SkillsDetector();
     this.importSkillsService = new ImportSkillsService(deps);
     this.importRulesService = new ImportRulesService(deps);
     this.importAgentsService = new ImportAgentsService(deps);

@@ -20,12 +20,10 @@ import { createMarkdownReferences } from './markdownReferenceHandler';
 export class SyncService {
   private readonly ui: CLIInterface;
   private readonly t: TranslateFn;
-  private readonly version: string;
 
   constructor(dependencies: SyncServiceDependencies) {
     this.ui = dependencies.ui;
     this.t = dependencies.t;
-    this.version = dependencies.version;
   }
 
   async run(rawOptions: SyncCommandFlags): Promise<SyncRunResult> {
@@ -193,7 +191,7 @@ export class SyncService {
       const preset = getPresetByPath(targetPath);
       const handlerResult =
         options.mode === 'symlink'
-          ? await createSymlinks(agentFiles, targetPath, options.sourcePath, {
+          ? await createSymlinks(agentFiles, targetPath, {
               force: options.force,
               dryRun: options.dryRun,
               verbose: options.verbose,

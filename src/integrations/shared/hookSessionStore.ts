@@ -72,10 +72,6 @@ export interface HookSessionAdapter {
   }): Promise<HarnessHookResponse>;
 }
 
-function storeKey(source: ShellHookSource, hostSessionId: string): string {
-  return `${source}:${hostSessionId}`;
-}
-
 async function getStorePath(repoPath: string): Promise<string> {
   const contextRoot = await getContextRootPath(repoPath);
   return path.join(contextRoot, 'runtime', 'hooks', 'host-sessions.json');
@@ -420,8 +416,4 @@ export async function ensureHookHarnessSession(
   });
 
   return harnessSessionId;
-}
-
-export function hookSessionStoreKey(source: ShellHookSource, hostSessionId: string): string {
-  return storeKey(source, hostSessionId);
 }

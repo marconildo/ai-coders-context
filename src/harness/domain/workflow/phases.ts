@@ -1,4 +1,4 @@
-import { PrevcPhase, PhaseDefinition, PhaseStatus } from './types';
+import { PrevcPhase, PhaseDefinition } from './types';
 import {
   PREVC_PHASE_MODEL,
   PREVC_PHASE_SEQUENCE,

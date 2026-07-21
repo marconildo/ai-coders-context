@@ -97,8 +97,7 @@ export class QAService {
           absolutePath,
           topic,
           stack,
-          patterns,
-          topicDetection
+          patterns
         );
         if (entry) {
           generated.push(entry);
@@ -220,8 +219,7 @@ export class QAService {
     repoPath: string,
     topic: QATopic,
     stack: StackInfo,
-    patterns: DetectedFunctionalPatterns,
-    topicResult: TopicDetectionResult
+    patterns: DetectedFunctionalPatterns
   ): Promise<QAEntry | null> {
     const relevantFiles: string[] = [];
     let answer = '';
@@ -251,7 +249,7 @@ export class QAService {
         break;
 
       case 'middleware':
-        answer = await this.generateMiddlewareAnswer(repoPath, patterns);
+        answer = this.generateMiddlewareAnswer(patterns);
         relevantFiles.push(...(await this.findRelevantFiles(repoPath, ['middleware/', 'middlewares/'])));
         break;
 
@@ -271,7 +269,7 @@ export class QAService {
         break;
 
       case 'testing':
-        answer = this.generateTestingAnswer(stack, patterns);
+        answer = this.generateTestingAnswer(stack);
         relevantFiles.push(...(await this.findRelevantFiles(repoPath, ['test/', 'tests/', '__tests__/', '*.test.', '*.spec.'])));
         break;
 
@@ -535,10 +533,7 @@ export class QAService {
     return lines.join('\n');
   }
 
-  private async generateMiddlewareAnswer(
-    repoPath: string,
-    patterns: DetectedFunctionalPatterns
-  ): Promise<string> {
+  private generateMiddlewareAnswer(patterns: DetectedFunctionalPatterns): string {
     const lines: string[] = [];
     lines.push('## Middleware\n');
     lines.push('Middleware functions process requests before they reach route handlers.\n');
@@ -620,7 +615,7 @@ export class QAService {
     return lines.join('\n');
   }
 
-  private generateTestingAnswer(stack: StackInfo, patterns: DetectedFunctionalPatterns): string {
+  private generateTestingAnswer(stack: StackInfo): string {
     const lines: string[] = [];
     lines.push('## Testing\n');
 

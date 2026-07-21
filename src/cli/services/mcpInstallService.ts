@@ -15,7 +15,7 @@ import {
   createEmptyResult,
   addError,
 } from '../../shared/system/types';
-import { TOOL_REGISTRY, getToolById, ToolDefinition } from '../../shared/registry/toolRegistry';
+import { getToolById, ToolDefinition } from '../../shared/registry/toolRegistry';
 import type { TranslateFn } from '../../utils/i18n';
 
 // ============================================================================

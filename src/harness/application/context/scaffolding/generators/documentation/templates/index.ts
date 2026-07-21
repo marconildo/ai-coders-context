@@ -1,2 +1,2 @@
 export { renderIndex } from './indexTemplate';
-export type { DocumentationTemplateContext, GuideMeta, DirectoryStat } from './types';
+export type { DocumentationTemplateContext, GuideMeta } from './types';

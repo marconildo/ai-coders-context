@@ -9,7 +9,6 @@ import { randomUUID } from 'crypto';
 import type {
   AppendTraceInput,
   HarnessRuntimeStatePort,
-  HarnessTraceRecord,
 } from '../../adapters/out/runtimeState/runtimeStateService';
 import type { RuntimeHistoryPage, RuntimeHistoryQuery } from '../history/runtimeHistory';
 

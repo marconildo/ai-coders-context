@@ -9,7 +9,6 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   Skill,
-  SkillMetadata,
   DiscoveredSkills,
   BUILT_IN_SKILLS,
   BuiltInSkillType,

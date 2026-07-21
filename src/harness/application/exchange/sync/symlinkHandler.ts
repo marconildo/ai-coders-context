@@ -10,7 +10,6 @@ function getTargetFilename(agent: AgentFileInfo, options: HandlerOptions): strin
 export async function createSymlinks(
   agentFiles: AgentFileInfo[],
   targetPath: string,
-  sourcePath: string,
   options: HandlerOptions
 ): Promise<HandlerResult> {
   const result: HandlerResult = {

@@ -7,7 +7,7 @@
 
 import { load as loadYaml } from 'js-yaml';
 import { PrevcPhase } from '../harness/domain/workflow/types';
-import type { ScaffoldFrontmatter, ScaffoldFileType, ScaffoldStatus } from '../types/scaffoldFrontmatter';
+import type { ScaffoldFileType, ScaffoldStatus } from '../types/scaffoldFrontmatter';
 import type { RequiredArtifactInput, RequiredArtifactSpec } from '../harness/application/contracts/taskContractsService';
 
 /**

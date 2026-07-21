@@ -12,8 +12,6 @@ import { AgentsDetector } from '../import/agentsDetector';
 import { SkillsDetector } from './skillsDetector';
 import {
   ALL_TOOL_IDS,
-  TOOL_DISPLAY_NAMES,
-  TOOL_CAPABILITIES,
   getToolIdFromPath,
   getToolDisplayName,
 } from './presets';
@@ -81,12 +79,6 @@ export class ToolDetector {
     const toolMap = new Map<string, ToolPresence>();
 
     for (const toolId of ALL_TOOL_IDS) {
-      const capabilities = TOOL_CAPABILITIES[toolId] || {
-        rules: false,
-        agents: false,
-        skills: false,
-      };
-
       toolMap.set(toolId, {
         id: toolId,
         displayName: getToolDisplayName(toolId),

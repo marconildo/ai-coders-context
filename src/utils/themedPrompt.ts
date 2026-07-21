@@ -7,7 +7,7 @@
 type ClackPrompts = typeof import('@clack/prompts');
 type ClackPromptModule = Pick<
   ClackPrompts,
-  'select' | 'confirm' | 'text' | 'password' | 'multiselect' | 'isCancel' | 'cancel'
+  'select' | 'confirm' | 'multiselect' | 'isCancel' | 'cancel'
 >;
 
 const importEsm = new Function(
@@ -51,9 +51,6 @@ type ClackPromptOption<Value> = Value extends PrimitiveChoiceValue
       disabled?: boolean;
     };
 
-type LegacyValidateResult = boolean | string;
-type LegacyValidate = (value: string) => LegacyValidateResult | Promise<LegacyValidateResult>;
-type ClackValidate = (value: string | undefined) => string | Error | undefined;
 type SelectOptions<Value> = Parameters<typeof import('@clack/prompts').select<Value>>[0]['options'];
 type MultiselectOptions<Value> = Parameters<typeof import('@clack/prompts').multiselect<Value>>[0]['options'];
 
@@ -131,42 +128,6 @@ function mapCheckedValues<Value>(
   });
 }
 
-function mapValidateResult(result: LegacyValidateResult): string | undefined {
-  if (result === true) {
-    return undefined;
-  }
-
-  if (result === false) {
-    return 'Invalid value';
-  }
-
-  return result;
-}
-
-function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { then?: unknown }).then === 'function'
-  );
-}
-
-function mapValidate(validate?: LegacyValidate): ClackValidate | undefined {
-  if (!validate) {
-    return undefined;
-  }
-
-  return (value) => {
-    const result = validate(value ?? '');
-
-    if (isPromiseLike(result)) {
-      throw new Error('Async prompt validation is not supported by @clack/prompts');
-    }
-
-    return mapValidateResult(result);
-  };
-}
-
 function unwrapPromptResult<Value>(
   clack: Pick<ClackPromptModule, 'isCancel' | 'cancel'>,
   result: Value | symbol
@@ -210,36 +171,6 @@ export async function themedConfirm(config: {
   return unwrapPromptResult(clack, result);
 }
 
-export async function themedInput(config: {
-  message: string;
-  default?: string;
-  validate?: LegacyValidate;
-}): Promise<string> {
-  const clack = await loadClack();
-  const result = await clack.text({
-    message: config.message,
-    defaultValue: config.default,
-    validate: mapValidate(config.validate),
-  });
-
-  return unwrapPromptResult(clack, result);
-}
-
-export async function themedPassword(config: {
-  message: string;
-  mask?: string;
-  validate?: LegacyValidate;
-}): Promise<string> {
-  const clack = await loadClack();
-  const result = await clack.password({
-    message: config.message,
-    mask: config.mask,
-    validate: mapValidate(config.validate),
-  });
-
-  return unwrapPromptResult(clack, result);
-}
-
 export async function themedCheckbox<Value>(config: {
   message: string;
   choices: ReadonlyArray<PromptChoice<Value> | Separator>;
@@ -268,6 +199,5 @@ export const themedPromptTestHooks = {
   },
   mapChoicesToOptions,
   mapCheckedValues,
-  mapValidateResult,
   unwrapPromptResult,
 };

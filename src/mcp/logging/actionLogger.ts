@@ -45,7 +45,6 @@ const MCP_ACTIVITY_NAME = 'mcp-activity';
 const sessionCaches = new Map<string, {
   cache: BoundedLruCache<string, string>;
   signature: string;
-  diagnostics: string[];
 }>();
 
 function normalizeRepoPath(repoPath: string): string {
@@ -77,7 +76,7 @@ async function sessionCacheForRepo(repoPath: string): Promise<BoundedLruCache<st
     ttlMs: limits.ttlMs,
     estimateBytes: (sessionId, key) => Buffer.byteLength(sessionId) + Buffer.byteLength(key),
   });
-  sessionCaches.set(normalized, { cache, signature, diagnostics: loaded.diagnostics });
+  sessionCaches.set(normalized, { cache, signature });
   while (sessionCaches.size > limits.maxEntries) {
     const oldest = sessionCaches.keys().next().value as string | undefined;
     if (!oldest) break;
@@ -94,10 +93,6 @@ export function clearMcpActionSessionCache(): void {
 
 export function getMcpActionSessionCacheSize(): number {
   return [...sessionCaches.values()].reduce((total, owner) => total + owner.cache.size, 0);
-}
-
-export function getMcpActionSessionCacheDiagnostics(repoPath: string): string[] {
-  return [...(sessionCaches.get(normalizeRepoPath(repoPath))?.diagnostics ?? [])];
 }
 
 export function getMcpActionSessionCacheMetrics(repoPath: string): BoundedLruCacheMetrics | undefined {

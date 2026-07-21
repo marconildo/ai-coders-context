@@ -4,8 +4,6 @@ import {
   isPromptCancelled,
   themedCheckbox,
   themedConfirm,
-  themedInput,
-  themedPassword,
   themedPromptTestHooks,
   themedSelect,
 } from '../themedPrompt';
@@ -17,8 +15,6 @@ describe('themedPrompt', () => {
     return {
       select: jest.fn(),
       confirm: jest.fn(),
-      text: jest.fn(),
-      password: jest.fn(),
       multiselect: jest.fn(),
       isCancel: jest.fn((value: unknown) => value === cancelSymbol),
       cancel: jest.fn(),
@@ -108,43 +104,6 @@ describe('themedPrompt', () => {
     expect(clack.confirm).toHaveBeenCalledWith({
       message: 'Proceed?',
       initialValue: true,
-    });
-  });
-
-  it('maps input and password validation for Clack', async () => {
-    const clack = createClackModule();
-    clack.text.mockImplementation(async (options) => {
-      expect(options.validate?.('')).toBe('Required');
-      expect(options.validate?.('ok')).toBeUndefined();
-      return 'typed';
-    });
-    clack.password.mockImplementation(async (options) => {
-      expect(options.validate?.('short')).toBe('Too short');
-      expect(options.validate?.('long-enough')).toBeUndefined();
-      return 'secret';
-    });
-    installClackModule(clack);
-
-    await expect(themedInput({
-      message: 'Name',
-      default: 'dotcontext',
-      validate: (value) => value.length > 0 || 'Required',
-    })).resolves.toBe('typed');
-    await expect(themedPassword({
-      message: 'Token',
-      mask: '*',
-      validate: (value) => value.length >= 8 || 'Too short',
-    })).resolves.toBe('secret');
-
-    expect(clack.text).toHaveBeenCalledWith({
-      message: 'Name',
-      defaultValue: 'dotcontext',
-      validate: expect.any(Function),
-    });
-    expect(clack.password).toHaveBeenCalledWith({
-      message: 'Token',
-      mask: '*',
-      validate: expect.any(Function),
     });
   });
 
